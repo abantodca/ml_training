@@ -1,0 +1,33 @@
+# Secretos / config local
+.env
+.env.infra
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*.so
+.venv/
+venv/
+.eggs/
+*.egg-info/
+
+# Datos (los reales viven en S3)
+data/*.xlsx
+data/training/*.xlsx
+data/processed/
+
+# Salidas del pipeline
+artifacts/
+reports/
+mlruns/
+logs/
+
+# Editores
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Claude Code (config local del agente)
+.claude/

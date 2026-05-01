@@ -1,0 +1,422 @@
+# =============================================================================
+# ml_training/Taskfile.yml
+# =============================================================================
+#
+# Pipeline de etapas (src/):
+#   step_01_load       → carga del acumulado
+#   step_02_clean      → limpieza
+#   step_03_features   → feature engineering por variedad
+#   step_04_train      → entrenamiento (XGB / LGB) + Optuna
+#   step_05_evaluate   → metricas + reportes
+#   step_06_track      → MLflow logging
+#
+# DOS ENTORNOS, AISLADOS:
+#   LOCAL  -> corre en Windows. MLflow file:// en ./mlruns. NO toca AWS.
+#   AWS    -> corre en EC2. MLflow remoto + S3. Codigo viaja via S3.
+#
+# Variables CLI (sobrescribibles):
+#   VARIETIES=POP|POP,VENTURA|all   PARALLEL=1..N
+#   TUNING=smoke|dev|prod           (presupuesto Optuna; NO es entorno)
+#
+# Avanzadas (raras veces se tocan):
+#   MODEL=auto|xgb|lgb|xgb,lgb|all  (default 'auto' = entrena XGB y LGB cada uno
+#                                     con Optuna independiente y elige campeon
+#                                     por variedad. 'xgb' o 'lgb' fuerza un solo
+#                                     backend, ~50% mas rapido, sin comparacion)
+#   STAGE=Staging|Production        (registra campeon en MLflow Registry)
+#
+# ─── LOCAL (Windows) ─────────────────────────────────────────────────────────
+#   task setup                                        Instala deps Python
+#   task smoke                                        Pipeline smoke (~1 min)
+#   task train:local VARIETIES=POP                    Entrena 1 variedad
+#   task train:local VARIETIES=all PARALLEL=4         Entrena todas (4 en paralelo)
+#   task train:local VARIETIES=POP STAGE=Staging      Entrena + promueve en MLflow local
+#
+# ─── AWS (EC2 + MLflow remoto) ───────────────────────────────────────────────
+#   task run VARIETIES=all                            TODO-EN-UNO (power+deploy+train)
+#
+#   Manual paso a paso (debug / fine-grained):
+#   task power:on                                     [1/4] Prende EC2 (training+mlflow)
+#   task deploy:upload-code                           [2/4] tar.gz src/ -> S3 (EC2 lo baja)
+#   task deploy:upload-data                           [3/4] sync data/*.xlsx -> S3
+#   task train:remote VARIETIES=POP                   [4/4] entrena (CSV o 'all')
+#   task power:off                                    Apaga EC2 (cuida costo)
+#
+# Nota: artifacts (modelos, reportes, summaries) se persisten automaticamente
+# en MLflow remoto (S3 via tracking server). Para descargar uno especifico:
+#   mlflow.artifacts.download_artifacts(run_id="...", artifact_path="...")
+# o desde la UI: task mlflow:open
+#
+# ─── MONITOREO ───────────────────────────────────────────────────────────────
+#   task power:status                                 Estado EC2 (running/stopped)
+#   task logs:remote                                  tail al log training en EC2
+#   task logs:local                                   tail al log orquestador local
+#   task logs:variety VARIETY=POP                     tail al log de UNA variedad
+#   task logs:mlflow                                  systemd journal MLflow
+#   task logs:postgres                                log Postgres self-hosted
+#   task logs:cloud-init-training                     log boot training node
+#   task logs:cloud-init-mlflow                       log boot MLflow server
+#   task mlflow:open                                  Abre UI MLflow remota
+#   task mlflow:status                                Health check MLflow
+#   task ssh:training                                 SSH al EC2 training
+#   task ssh:mlflow                                   SSH al EC2 MLflow
+#   task audit:compare                                Tabla comparativa entre runs (KG/JR)
+#   task audit:compare -- --variety POP --last 5      Filtra por variedad y limita historial
+#
+# ─── INFRA (Terraform) ───────────────────────────────────────────────────────
+#   task infra:init / infra:fmt / infra:validate
+#   task infra:plan                                   Genera tfplan
+#   task infra:apply                                  Aplica + regenera .env.infra
+#   task infra:up                                     plan + apply en uno
+#   task infra:output                                 URLs, IPs, env_block
+#   task infra:env-export                             Regenera .env.infra manual
+#   task infra:destroy                                CUIDADO: borra todo (con prompt)
+# =============================================================================
+
+version: "3"
+
+# .env       = manual (overrides del usuario; vacio o con tus valores)
+# .env.infra = auto-generado por `task infra:env-export` (TRAINING_HOST,
+#              MLFLOW_HOST, MLFLOW_TRACKING_URI, S3_BUCKET, SSH_KEY,
+#              LAMBDA_POWER_NAME). Si no existe, Task lo ignora.
+dotenv: ['.env', '.env.infra']
+
+vars:
+  # Rutas y defaults
+  DATA_DIR: data
+  PY: '{{.PYTHON | default "python"}}'
+  TF_DIR: infra
+  ENV_INFRA: .env.infra
+
+  # BASH: forzamos Git Bash (no WSL). En Windows, 'bash' del PATH suele ser
+  # el launcher de WSL en System32, que no comparte filesystem/home con el
+  # resto del proyecto. Git Bash usa el mismo $HOME que el resto del sistema.
+  # Las comillas dobles internas manejan el espacio en "Program Files".
+  BASH: '"C:/Program Files/Git/usr/bin/bash.exe"'
+
+  # Sobrescribe cualquiera desde la CLI, ej:
+  #   task train:local VARIETIES=VENTURA
+  #   task train:local VARIETIES=VENTURA,BIANCA,ATLAS  MODEL=xgb  TUNING=prod
+  #   task train:local VARIETIES=all  PARALLEL=4   # 4 variedades en paralelo
+  TUNING: '{{.TUNING | default "dev"}}'   # presupuesto Optuna (smoke|dev|prod)
+  # MODEL=auto -> entrena XGB y LGB independientes y elige campeon por variedad.
+  # Pasa "xgb" o "lgb" para forzar UN solo backend (~50% mas rapido).
+  MODEL: '{{.MODEL | default "auto"}}'
+  VARIETIES: '{{.VARIETIES | default "POP"}}'
+  PARALLEL: '{{.PARALLEL | default "1"}}'
+  STAGE: '{{.STAGE | default ""}}'   # vacio=no registra; "Staging"|"Production" promueve en MLflow Registry
+
+tasks:
+
+  # ═══ Ayuda ══════════════════════════════════════════════════════════════
+
+  default:
+    desc: Indice navegable por seccion (usa `task --list` para listado plano)
+    silent: true
+    cmds:
+      - '{{.BASH}} scripts/sh/help.sh'
+
+  setup:
+    desc: Instala deps Python desde requirements.txt
+    cmds:
+      - "{{.PY}} -m pip install -r requirements.txt"
+
+  smoke:
+    desc: 'Pipeline smoke local (~2 min con MODEL=auto, ~1 min con MODEL=xgb). VARIETIES=POP'
+    # Smoke es local-only por definicion: no debe tocar MLflow remoto.
+    env:
+      MLFLOW_TRACKING_URI: ""
+    cmds:
+      - '{{.BASH}} scripts/sh/smoke.sh {{.MODEL}} {{.VARIETIES}}'
+
+  # ═══ 1. Infraestructura (Terraform) ═════════════════════════════════════
+
+  infra:init:
+    desc: terraform init
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - terraform init -upgrade
+
+  infra:fmt:
+    desc: terraform fmt -recursive
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - terraform fmt -recursive
+
+  infra:validate:
+    desc: terraform validate
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - terraform validate
+
+  infra:plan:
+    desc: terraform plan -out=tfplan
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - terraform init -upgrade
+      - terraform plan -out=tfplan
+
+  infra:apply:
+    desc: 'terraform apply (EC2s + MLflow + S3 + Lambda + IAM). Refresca .env.infra al final.'
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - terraform apply tfplan
+      - task: infra:env-export
+
+  infra:up:
+    desc: 'Plan + apply en una sola tarea (regenera .env.infra al final)'
+    cmds:
+      - task: infra:plan
+      - task: infra:apply
+
+  infra:output:
+    desc: Outputs (URLs, IPs, env_block)
+    dir: "{{.TF_DIR}}"
+    cmds:
+      - terraform output
+
+  infra:env-export:
+    desc: 'Exporta outputs Terraform -> .env.infra (Taskfile lo carga auto)'
+    cmds:
+      - '{{.BASH}} scripts/sh/infra_export_env.sh'
+
+  infra:destroy:
+    desc: 'CUIDADO: destruye toda la infra (EC2s + Lambda + IAM + S3 data + backups MLflow)'
+    prompt: "Esto destruira EC2/Lambda/IAM + S3 data + backups MLflow. Confirmar?"
+    cmds:
+      - '{{.BASH}} scripts/sh/infra_destroy.sh'
+      - rm -f {{.ENV_INFRA}}
+
+  _envinfra:ensure:
+    # Verifica que .env.infra exista (lo crea si la infra esta levantada).
+    # Se corre como dep antes de cualquier task que necesite TRAINING_HOST,
+    # MLFLOW_HOST, etc. run: once -> evita race con deps paralelas.
+    internal: true
+    run: once
+    cmds:
+      - |
+        if [ ! -f "{{.ENV_INFRA}}" ]; then
+          echo ">> {{.ENV_INFRA}} no existe; intentando regenerarlo..."
+          {{.BASH}} scripts/sh/infra_export_env.sh || {
+            echo "ERROR: no se pudo generar {{.ENV_INFRA}} (infra no levantada?)." >&2
+            echo "  Corre: task infra:up" >&2
+            exit 1
+          }
+        fi
+
+  # ═══ 2. Encender / apagar EC2 (via Lambda power-manager) ════════════════
+
+  power:on:
+    desc: 'Prende las EC2 (Postgres + MLflow + Training)'
+    deps: [_envinfra:ensure]
+    cmds:
+      - '{{.BASH}} scripts/sh/power.sh start'
+
+  power:off:
+    desc: 'Apaga las EC2 (Postgres + MLflow + Training)'
+    deps: [_envinfra:ensure]
+    cmds:
+      - '{{.BASH}} scripts/sh/power.sh stop'
+
+  power:status:
+    desc: 'Estado de las EC2 (running/stopped/other)'
+    deps: [_envinfra:ensure]
+    cmds:
+      - '{{.BASH}} scripts/sh/power.sh status'
+
+  # ═══ 3. Datos (S3 + split por variedad) ═════════════════════════════════
+
+  data:fetch:
+    desc: 'Baja el acumulado desde S3 (corre en EC2 al iniciar training)'
+    cmds:
+      - '{{.BASH}} scripts/sh/data_fetch.sh'
+
+  data:split:
+    desc: 'Split del acumulado por VARIEDAD'
+    cmds:
+      - '{{.BASH}} scripts/sh/data_split.sh'
+
+  clean:outputs:
+    desc: 'Borra artifacts/, logs/, reports/ y __pycache__/ locales (NO toca data/)'
+    cmds:
+      - '{{.BASH}} scripts/sh/clean_outputs.sh'
+
+  clean:artifacts:
+    desc: 'Borra artifacts/ viejos (conserva los ultimos N runs por variety+model). Args: KEEP=10 [--dry-run]'
+    vars:
+      KEEP: '{{.KEEP | default "10"}}'
+    cmds:
+      - '{{.BASH}} scripts/sh/clean_artifacts.sh {{.KEEP}} {{.CLI_ARGS}}'
+
+  data:prepare:
+    desc: 'fetch + split (lo que corre la EC2 al iniciar un training)'
+    cmds:
+      - task: data:fetch
+      - task: data:split
+
+  # ═══ 4. Deploy (codigo + datos a EC2/S3) ════════════════════════════════
+
+  deploy:upload-data:
+    desc: 'Sube acumulado a S3 (1 vez + despues de cada infra:destroy)'
+    deps: [_envinfra:ensure]
+    cmds:
+      - '{{.BASH}} scripts/sh/deploy_upload_data.sh'
+
+  deploy:upload-code:
+    desc: 'Empaqueta src/ + scripts/ + requirements y sube tar.gz a S3 (la EC2 lo descarga al inicio de train:remote)'
+    deps: [_envinfra:ensure]
+    run: once
+    cmds:
+      - '{{.BASH}} scripts/sh/deploy_upload_code.sh'
+
+  deploy:
+    desc: 'Atajo: upload-code + upload-data'
+    cmds:
+      - task: deploy:upload-code
+      - task: deploy:upload-data
+
+  # ═══ 5. Training ════════════════════════════════════════════════════════
+  # TUNING    acepta:  smoke | dev | prod   (presupuesto Optuna; NO es entorno)
+  # MODEL     acepta:  auto (default) | xgb | lgb | xgb,lgb | all
+  #                    auto = entrena XGB y LGB cada uno con Optuna independiente
+  #                    y elige campeon por variedad (composite_score).
+  #                    "xgb" o "lgb" fuerza UN solo backend, ~50% mas rapido.
+  # VARIETIES acepta:  VENTURA | VENTURA,BIANCA,ATLAS | all  (CSV de hojas)
+  # PARALLEL  numero de variedades a entrenar en PARALELO (default 1)
+  # STAGE     vacio (default) | Staging | Production -> promueve en MLflow Registry
+  # Ejemplos:
+  #   task train:local   VARIETIES=VENTURA                          # auto: XGB+LGB
+  #   task train:local   VARIETIES=POP   MODEL=xgb                  # solo XGB (rapido)
+  #   task train:local   VARIETIES=all   PARALLEL=4  TUNING=prod
+  #   task train:local   VARIETIES=POP   STAGE=Staging              # registra en MLflow
+  #   task train:remote  VARIETIES=all   PARALLEL=4  TUNING=prod
+
+  train:local:
+    desc: 'Entrena LOCAL en Windows (MLflow file://, NO toca AWS)'
+    # Aislamiento: aunque .env.infra tenga MLFLOW_TRACKING_URI=http://... apuntando
+    # al MLflow remoto del EC2, aqui forzamos vacio. config.py:115 cae a file://
+    # local. Garantia de que un training local nunca contamine el server remoto.
+    # OJO: este override aplica a CUALQUIER caller del task (incluso si esta
+    # corriendo en EC2). Por eso `train:remote` invoca `train:_exec` (abajo),
+    # que NO tiene este override y respeta el MLFLOW_TRACKING_URI del .env.
+    env:
+      MLFLOW_TRACKING_URI: ""
+    cmds:
+      - '{{.BASH}} scripts/sh/train_local.sh {{.TUNING}} {{.MODEL}} {{.VARIETIES}} {{.PARALLEL}} {{if .STAGE}}"--registry-stage {{.STAGE}}"{{end}}'
+
+  train:_exec:
+    # Ejecutor "low-level": corre el mismo script que train:local pero SIN
+    # sobrescribir MLFLOW_TRACKING_URI. Pensado para invocarse desde la EC2
+    # de training (donde .env apunta al MLflow remoto y SI queremos contactarlo).
+    # No marcamos `internal: true` porque train_remote.sh lo llama via CLI
+    # tras el SSH; el guion bajo en el nombre indica "uso interno, no llamar
+    # a mano desde el dev local" (en local usar `train:local`).
+    desc: '(EC2 only) train sin override de MLFLOW; respeta el URI del .env'
+    cmds:
+      - '{{.BASH}} scripts/sh/train_local.sh {{.TUNING}} {{.MODEL}} {{.VARIETIES}} {{.PARALLEL}} {{if .STAGE}}"--registry-stage {{.STAGE}}"{{end}}'
+
+  train:remote:
+    desc: 'Lanza training en la EC2 via SSH (sube codigo + corre paralelo)'
+    deps: [_envinfra:ensure, deploy:upload-code]
+    cmds:
+      - '{{.BASH}} scripts/sh/train_remote.sh {{.TUNING}} {{.MODEL}} {{.VARIETIES}} {{.PARALLEL}}'
+
+  run:
+    desc: 'TODO-EN-UNO: power:on + wait-ready + deploy + train:remote'
+    deps: [_envinfra:ensure]
+    cmds:
+      - task: power:on
+      - '{{.BASH}} scripts/sh/wait_ready.sh'
+      - task: deploy:upload-data
+      - task: train:remote
+        vars:
+          TUNING: '{{.TUNING}}'
+          MODEL: '{{.MODEL}}'
+          VARIETIES: '{{.VARIETIES}}'
+          PARALLEL: '{{.PARALLEL}}'
+      - |
+        echo ""
+        echo ">> Training lanzado en EC2."
+        echo ">> task logs:remote   -> tail al log remoto"
+        echo ">> task power:off     -> apaga EC2 cuando termine (cuida el costo)"
+
+  # ═══ 6. MLflow ══════════════════════════════════════════════════════════
+
+  mlflow:status:
+    desc: 'Health check del MLflow server'
+    deps: [_envinfra:ensure]
+    cmds:
+      - '{{.BASH}} scripts/sh/mlflow_status.sh'
+
+  mlflow:open:
+    desc: 'Abre la UI de MLflow remota'
+    deps: [_envinfra:ensure]
+    cmds:
+      - '{{.BASH}} scripts/sh/mlflow_open.sh'
+
+  # (SSH a MLflow vive en `ssh:mlflow` — abajo, junto a `ssh:training`)
+
+  # ═══ 7. Logs / Debug ════════════════════════════════════════════════════
+
+  logs:variety:
+    desc: 'tail al log de UNA variedad (VARIETY=POP)'
+    vars:
+      VARIETY: '{{default "" .VARIETY}}'
+    cmds:
+      - tail -f logs/variety_{{.VARIETY}}.log
+
+  logs:local:
+    desc: 'tail al log orquestador local'
+    cmds:
+      - '{{.BASH}} scripts/sh/logs_local.sh'
+
+  logs:remote:
+    desc: 'tail al log de la EC2 training'
+    deps: [_envinfra:ensure]
+    cmds:
+      - '{{.BASH}} scripts/sh/logs_remote.sh'
+
+  logs:mlflow:
+    desc: 'systemd journal del MLflow server'
+    deps: [_envinfra:ensure]
+    cmds:
+      - '{{.BASH}} scripts/sh/logs_mlflow.sh'
+
+  logs:postgres:
+    desc: 'log de Postgres self-hosted'
+    deps: [_envinfra:ensure]
+    cmds:
+      - '{{.BASH}} scripts/sh/logs_postgres.sh'
+
+  logs:cloud-init-mlflow:
+    desc: 'log de boot del MLflow server'
+    deps: [_envinfra:ensure]
+    cmds:
+      - '{{.BASH}} scripts/sh/logs_cloud_init.sh mlflow'
+
+  logs:cloud-init-training:
+    desc: 'log de boot del training node'
+    deps: [_envinfra:ensure]
+    cmds:
+      - '{{.BASH}} scripts/sh/logs_cloud_init.sh training'
+
+  # ═══ 7b. Auditoria entre runs (comparacion KG/JR) ═══════════════════════
+
+  audit:compare:
+    desc: 'Tabla comparativa entre runs (lee logs/business_audit.jsonl). Args: -- --variety POP --last 5'
+    cmds:
+      - '{{.BASH}} scripts/sh/audit_compare.sh {{.CLI_ARGS}}'
+
+  # ═══ 8. SSH directo ═════════════════════════════════════════════════════
+
+  ssh:training:
+    desc: SSH a training EC2
+    deps: [_envinfra:ensure]
+    cmds:
+      - ssh -i $SSH_KEY ubuntu@$TRAINING_HOST
+
+  ssh:mlflow:
+    desc: SSH a MLflow EC2
+    deps: [_envinfra:ensure]
+    cmds:
+      - ssh -i $SSH_KEY ubuntu@$MLFLOW_HOST

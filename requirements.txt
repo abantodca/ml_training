@@ -1,0 +1,19 @@
+# Runtime dependencies (training service)
+# Versiones pineadas para reproducibilidad. Regenerar con:
+#   pip freeze | grep -iE "^(pandas|numpy|scikit-learn|lightgbm|xgboost|openpyxl|optuna|mlflow|matplotlib|plotly|joblib)=="
+#
+# Nota: boto3 NO se incluye aqui. El MLflow tracking server remoto
+# maneja los artifacts (S3/Postgres) server-side; el cliente solo habla HTTP.
+# Si en el futuro se sube directo a S3 desde el cliente, agregar boto3.
+
+pandas==2.2.3
+numpy==2.2.3
+scikit-learn==1.6.1
+lightgbm==4.5.0
+xgboost==3.2.0
+openpyxl==3.1.5
+optuna==4.8.0
+mlflow==2.19.0
+matplotlib==3.10.6
+plotly==6.3.0
+joblib==1.5.2
