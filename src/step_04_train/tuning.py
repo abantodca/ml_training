@@ -35,9 +35,15 @@ from sklearn.pipeline import Pipeline
 
 warnings.filterwarnings("ignore", category=ExperimentalWarning)
 
-from src.config import INNER_CV_FOLDS, OUTER_CV_FOLDS, RANDOM_STATE
+from src.config import (
+    INNER_CV_FOLDS,
+    OOF_ENSEMBLE_K,
+    OUTER_CV_FOLDS,
+    RANDOM_STATE,
+)
 from src.step_04_train.model_lgb import get_lgb_model
 from src.step_04_train.model_xgb import get_xgb_model
+from src.step_04_train.oof_ensemble import OOFEnsembleRegressor
 from src.step_04_train.search_spaces import suggest_full_params
 
 # Logger inerte hasta que el caller configure handlers (idem data_loader).
@@ -265,7 +271,11 @@ def perform_nested_cv(
 
     Returns
     -------
-    final_pipeline   : Pipeline reentrenado con TODO el dataset.
+    final_pipeline   : `OOFEnsembleRegressor` con K pipelines refiteados
+                        sobre folds del KFold (K = `config.OOF_ENSEMBLE_K`).
+                        `.predict(X)` promedia las K predicciones.
+                        Si K=1 wrap-ea un unico refit sobre todo el dataset
+                        (modo legacy).
     best_params      : dict con los hiperparametros del modelo de produccion.
     nested_metrics   : dict con MAE/R2 mean y std (test, train, gap).
     oof              : dict con `y_true`, `y_pred` y `fold_id` (predicciones
@@ -278,8 +288,22 @@ def perform_nested_cv(
     # CV adaptativo: estratifica por FUNDO/FORMATO si la variedad lo permite,
     # cae a KFold normal si no hay variabilidad util (1 FUNDO + 1 FORMATO,
     # variedad muy chica, columnas ausentes). Decision por variedad.
+    #
+    # Calculo de `min_count`: tras el outer split, el train fold contiene
+    # ~N*(outer-1)/outer miembros de cada clase. El inner StratifiedKFold
+    # necesita >= inner_folds en cada clase, asi que el minimo seguro a
+    # nivel de dataset completo es ceil(inner * outer / (outer-1)). Se
+    # toma el max con outer_folds para no quedar por debajo del requisito
+    # del propio outer. Antes usabamos max(outer, inner) -> suficiente
+    # para el outer pero el inner emitia "least populated class has only
+    # 1 members" cuando una clase con n=2 caia 1+1 entre train/val.
+    import math
+    strat_min_count = max(
+        outer_folds,
+        math.ceil(inner_folds * outer_folds / max(outer_folds - 1, 1)),
+    )
     strat_label, strat_strategy = _build_strat_label(
-        X, min_count=max(outer_folds, inner_folds),
+        X, min_count=strat_min_count,
     )
     if strat_label is not None:
         outer_cv = StratifiedKFold(
@@ -443,14 +467,19 @@ def perform_nested_cv(
         )
         best_params = final_study.best_params
 
-    final_pipeline = _build_pipeline(preprocessor, model_type)
-    final_pipeline.set_params(**best_params)
-    _fit_pipeline(final_pipeline, X, y, sample_weight=sample_weights)
+    base_pipeline = _build_pipeline(preprocessor, model_type)
+    base_pipeline.set_params(**best_params)
+    final_pipeline = OOFEnsembleRegressor(
+        base_pipeline=base_pipeline,
+        n_models=OOF_ENSEMBLE_K,
+        random_state=random_state,
+    )
+    final_pipeline.fit(X, y, sample_weight=sample_weights)
 
     total_dt = time.perf_counter() - t0
     logger.info(
-        f"Pipeline final entrenado | tiempo_total={_format_eta(total_dt)} | "
-        f"best_params={best_params}"
+        f"Pipeline final entrenado | K={OOF_ENSEMBLE_K} pipelines promediados | "
+        f"tiempo_total={_format_eta(total_dt)} | best_params={best_params}"
     )
 
     oof = {

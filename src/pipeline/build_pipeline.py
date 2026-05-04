@@ -1,6 +1,7 @@
 """Construccion del pipeline de preprocesamiento."""
 from __future__ import annotations
 
+from sklearn.feature_selection import VarianceThreshold
 from sklearn.pipeline import Pipeline
 
 from src.step_02_clean.imputers import CustomKNNImputer
@@ -10,13 +11,18 @@ from src.step_03_features.feature_engineering import FeatureGenerator
 
 
 def create_preprocessing_pipeline() -> Pipeline:
-    """Encadena: missing flags -> imputacion KNN -> capping -> one-hot.
+    """Encadena: missing flags -> imputacion KNN -> capping -> one-hot -> filtro varianza.
 
     Los lag features se calculan ANTES del pipeline, en `data_loader.py`.
     Esto deja la signature MLflow con 40 columnas (raw + lags) y traslada
     al backend la responsabilidad de reproducir el feature engineering en
     inferencia. La clase `LagFeatureTransformer` existe por si se decide a
     futuro encapsular los lags dentro del Pipeline (ver lag_features.py).
+
+    El `variance_filter` final descarta dummies constantes que aparecen
+    cuando una variedad no observa todos los niveles de FUNDO/FORMATO
+    (la dummy queda en 0 para todas las filas). `set_output('pandas')`
+    preserva el DataFrame para mantener nombres de columna hacia XGB/LGB.
     """
     return Pipeline(
         steps=[
@@ -24,5 +30,9 @@ def create_preprocessing_pipeline() -> Pipeline:
             ("imputer", CustomKNNImputer()),
             ("outliers", OutlierCapper()),
             ("feature_engineering", FeatureGenerator()),
+            (
+                "variance_filter",
+                VarianceThreshold(threshold=0.0).set_output(transform="pandas"),
+            ),
         ]
     )

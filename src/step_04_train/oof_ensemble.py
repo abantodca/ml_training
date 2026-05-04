@@ -1,0 +1,107 @@
+"""OOF Ensemble: K pipelines refiteados sobre folds del KFold.
+
+`predict(X)` promedia las K predicciones. Reduce varianza del modelo
+final sin cambiar el tuning (cada pipeline ve ~(K-1)/K del dataset; al
+promediar, el ruido de cada estimador parcial se cancela parcialmente).
+
+K=1 degenera al comportamiento legacy (refit unico sobre todo X). Esto
+da rollback trivial: cambiar `OOF_ENSEMBLE_K=1` en config y los numeros
+vuelven a ser bit-for-bit identicos a la version anterior.
+
+La clase es sklearn-compatible (BaseEstimator + RegressorMixin) para
+que joblib la serialice y `mlflow.sklearn.log_model` la trate como un
+modelo opaco mas, sin necesidad de un flavor custom.
+"""
+from __future__ import annotations
+
+from typing import List, Optional
+
+import numpy as np
+import pandas as pd
+from sklearn.base import BaseEstimator, RegressorMixin, clone
+from sklearn.model_selection import KFold
+from sklearn.pipeline import Pipeline
+
+
+class OOFEnsembleRegressor(BaseEstimator, RegressorMixin):
+    """K pipelines refiteados; predict() promedia.
+
+    Parametros
+    ----------
+    base_pipeline : Pipeline ya configurado con `set_params(**best_params)`.
+                    Se clona K veces (una por fold). NO debe estar fiteado:
+                    `clone` requiere un estimador unfitted.
+    n_models : K. Si 1, hace refit unico sobre todo X (legacy).
+    random_state : seed del KFold.
+
+    Notas
+    -----
+    - Usa KFold (NO StratifiedKFold) en el refit final: el objetivo aqui
+      es reducir varianza del predictor, no validacion insesgada. KFold
+      tambien evita el riesgo de que la etiqueta de stratificacion del
+      outer CV (max FUNDO/FORMATO) no soporte K splits si la variedad
+      tiene pocos estratos.
+    - `sample_weight` se splitea por fold (igual que en `_objective` del
+      nested CV): cada pipeline recibe los pesos de SUS filas de train.
+    """
+
+    def __init__(
+        self,
+        base_pipeline: Pipeline,
+        n_models: int = 5,
+        random_state: int = 42,
+    ):
+        self.base_pipeline = base_pipeline
+        self.n_models = n_models
+        self.random_state = random_state
+
+    def fit(
+        self,
+        X: pd.DataFrame,
+        y: pd.Series,
+        sample_weight: Optional[np.ndarray] = None,
+    ) -> "OOFEnsembleRegressor":
+        if self.n_models < 1:
+            raise ValueError(
+                f"n_models debe ser >=1, recibido {self.n_models}"
+            )
+
+        if self.n_models == 1:
+            pipe = clone(self.base_pipeline)
+            self._fit_one(pipe, X, y, sample_weight)
+            self.models_ = [pipe]
+            return self
+
+        cv = KFold(
+            n_splits=self.n_models,
+            shuffle=True,
+            random_state=self.random_state,
+        )
+        models: List[Pipeline] = []
+        for tr_idx, _ in cv.split(X):
+            pipe = clone(self.base_pipeline)
+            X_tr = X.iloc[tr_idx]
+            y_tr = y.iloc[tr_idx]
+            sw_tr = (
+                sample_weight[tr_idx] if sample_weight is not None else None
+            )
+            self._fit_one(pipe, X_tr, y_tr, sw_tr)
+            models.append(pipe)
+        self.models_ = models
+        return self
+
+    def predict(self, X) -> np.ndarray:
+        preds = np.column_stack([m.predict(X) for m in self.models_])
+        return preds.mean(axis=1)
+
+    @staticmethod
+    def _fit_one(
+        pipe: Pipeline,
+        X: pd.DataFrame,
+        y: pd.Series,
+        sample_weight: Optional[np.ndarray],
+    ) -> None:
+        if sample_weight is not None:
+            pipe.fit(X, y, regressor__sample_weight=sample_weight)
+        else:
+            pipe.fit(X, y)

@@ -120,6 +120,12 @@ DEFAULT_TUNING: str = "dev"
 OUTER_CV_FOLDS: int = TUNING_PROFILES[DEFAULT_TUNING]["outer_folds"]
 INNER_CV_FOLDS: int = TUNING_PROFILES[DEFAULT_TUNING]["inner_folds"]
 
+# Refit final: K pipelines en folds del KFold; predict promedia las K.
+# Reduce varianza del modelo de produccion (~5-10%) a costa de +(K-1)x
+# tiempo del refit final, que es despreciable vs el nested CV.
+# K=1 = legacy (refit unico sobre todo el dataset).
+OOF_ENSEMBLE_K: int = 5
+
 # ---------------------------------------------------------------------------
 # MLflow
 # ---------------------------------------------------------------------------

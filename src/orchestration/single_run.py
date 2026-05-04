@@ -207,6 +207,14 @@ def train_model(
 
         logger.info(f"[{variety}/{model_type}] [5/6] Persistiendo pipeline...")
         X_sample = X.head(min(50, len(X))).copy()
+        # MLflow infiere la firma desde los dtypes de X_sample. Cols int no
+        # pueden representar NaN: en inferencia con missing values el runtime
+        # las promueve a float y rompe el schema enforcement. Casteamos a
+        # float64 SOLO para la firma; los datos de entrenamiento ya pasaron
+        # por el pipeline tal cual (los arboles tratan int/float igual).
+        int_cols = X_sample.select_dtypes(include=["integer"]).columns
+        if len(int_cols) > 0:
+            X_sample[int_cols] = X_sample[int_cols].astype("float64")
         try:
             y_sample = final_pipeline.predict(X_sample)
         except Exception:

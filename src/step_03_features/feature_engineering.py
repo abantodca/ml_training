@@ -5,14 +5,22 @@
 para el modelo:
 
     1. Deriva features ciclicas y `ANIO` desde la columna de fecha.
-    2. Aplica one-hot encoding a las categoricas, memorizando categorias
+    2. Calcula ratios estructurales intra-fila (sin tiempo, sin target):
+       KG_TOTAL, INDUS_KG_HA, KG_PER_BAYA, KG_HA_PER_DPC.
+    3. Aplica one-hot encoding a las categoricas, memorizando categorias
        en `fit` para que `transform` produzca SIEMPRE las mismas columnas.
-    3. Descarta la columna de fecha original.
-    4. Devuelve un DataFrame con orden de columnas estable.
+    4. Descarta la columna de fecha original.
+    5. Devuelve un DataFrame con orden de columnas estable.
 
 Codificacion ciclica de tiempo:
     sin(2*pi * x / period), cos(2*pi * x / period)
 para que el modelo perciba que diciembre y enero estan adyacentes.
+
+Ratios estructurales: combinaciones intra-fila que los lag features (que
+operan a nivel grupo+temporal) no capturan. Son determinísticas por fila
+y NO usan target ni H-EF, asi que no hay riesgo de leakage. Las divisiones
+usan np.where(den > 0, num/den, NaN) y dejan que XGB/LGB redirijan los NaN
+a su rama default por loss (tratamiento nativo de NaN en gradient boosting).
 """
 from __future__ import annotations
 
@@ -66,6 +74,38 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
     def _resolve_date_col(self, X: pd.DataFrame) -> Optional[str]:
         col = self.date_col if self.date_col is not None else DATE_COLUMN
         return col if col in X.columns else None
+
+    @staticmethod
+    def _resolve_structural(X: pd.DataFrame) -> List[str]:
+        """Decide que ratios se pueden calcular dado X. Defensivo: si una
+        columna raw falta, su ratio simplemente no se genera."""
+        names: List[str] = []
+        if "KG/HA" in X.columns and "HA" in X.columns:
+            names.append("KG_TOTAL")
+        if "%INDUS" in X.columns and "KG/HA" in X.columns:
+            names.append("INDUS_KG_HA")
+        if "KG/HA" in X.columns and "P/BAYA" in X.columns:
+            names.append("KG_PER_BAYA")
+        if "KG/HA" in X.columns and "DPC" in X.columns:
+            names.append("KG_HA_PER_DPC")
+        return names
+
+    @staticmethod
+    def _structural_ratios(X: pd.DataFrame, names: List[str]) -> pd.DataFrame:
+        out = pd.DataFrame(index=X.index)
+        if "KG_TOTAL" in names:
+            out["KG_TOTAL"] = (X["KG/HA"].astype(float) * X["HA"].astype(float))
+        if "INDUS_KG_HA" in names:
+            out["INDUS_KG_HA"] = (X["%INDUS"].astype(float) * X["KG/HA"].astype(float))
+        if "KG_PER_BAYA" in names:
+            den = X["P/BAYA"].astype(float).to_numpy()
+            num = X["KG/HA"].astype(float).to_numpy()
+            out["KG_PER_BAYA"] = np.where(den > 0, num / np.where(den > 0, den, 1.0), np.nan)
+        if "KG_HA_PER_DPC" in names:
+            den = X["DPC"].astype(float).to_numpy()
+            num = X["KG/HA"].astype(float).to_numpy()
+            out["KG_HA_PER_DPC"] = np.where(den > 0, num / np.where(den > 0, den, 1.0), np.nan)
+        return out
 
     @staticmethod
     def _date_features(series: pd.Series, add_year: bool) -> pd.DataFrame:
@@ -125,6 +165,11 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
         ]
         self.passthrough_cols_ = passthrough
 
+        # Ratios estructurales: cuales se pueden calcular dadas las columnas
+        # disponibles. Memorizado para que transform() produzca el mismo
+        # set sin re-evaluar.
+        self.structural_feature_names_ = self._resolve_structural(X)
+
         # Derivadas de fecha
         if date_col is not None:
             self.date_feature_names_ = (
@@ -146,7 +191,10 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
             f"{c}__{cat}" for c in cat_cols for cat in self.categories_[c]
         ]
         self.feature_names_out_ = (
-            passthrough + self.date_feature_names_ + dummy_cols
+            passthrough
+            + self.structural_feature_names_
+            + self.date_feature_names_
+            + dummy_cols
         )
         return self
 
@@ -154,6 +202,7 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
         X = X.copy().reset_index(drop=True)
 
         passthrough_part = X[self.passthrough_cols_].copy()
+        structural_part = self._structural_ratios(X, self.structural_feature_names_)
 
         if self.date_col_ is not None:
             date_part = self._date_features(X[self.date_col_], self.add_year)
@@ -172,7 +221,7 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
             dummy_frames.append(dummies[keep].astype(int))
 
         out = pd.concat(
-            [passthrough_part, date_part, *dummy_frames],
+            [passthrough_part, structural_part, date_part, *dummy_frames],
             axis=1,
         )
         return out.loc[:, self.feature_names_out_]
