@@ -2,26 +2,38 @@
 
 main.py es THIN: parse args -> bootstrap -> delega en `src/orchestration/`.
 
-Ver `src/orchestration/cli.py` para los flags soportados, y los modulos
-`single_run`, `variety_runner`, `runners` para la logica de ejecucion.
+Uso normal (via Taskfile):
+    task train VARIETIES=POP
+    task train VARIETIES=POP,VENTURA
+    task train VARIETIES=all
 
-CLI:
-    python main.py --tuning prod                          --varieties POP,JUPITER
-        # default --model=auto -> entrena XGB y LGB; campeon por variedad
-    python main.py --tuning prod --model xgb              --varieties POP
-        # fuerza UN solo backend (ahorra ~50% de tiempo, pierde la comparacion)
-    python main.py --tuning prod --model all              --varieties all
-        # equivalente a --model auto
+Uso directo (CLI avanzado):
+    python main.py --varieties POP
+    python main.py --varieties POP,JUPITER
+    python main.py --varieties all --tuning prod_xl
+    python main.py --varieties POP --model xgb   # fuerza un solo backend
+
+Defaults: --tuning prod | --model auto (entrena XGB y LGB, elige campeon por
+variedad). Cada variedad es independiente: si una falla, las demas continuan.
 """
+
 from __future__ import annotations
 
-import json
 import os
 import sys
 import time
 from datetime import datetime
 
-from src.config import ARTIFACTS_DIR, MLFLOW_TRACKING_URI, TRAINING_FILE, init_dirs
+from src.config import (
+    ARTIFACTS_DIR,
+    MLFLOW_TRACKING_URI,
+    REPORTS_DIR,
+    S3_ARTIFACTS_BUCKET,
+    S3_ARTIFACTS_PREFIX,
+    S3_REPORTS_PREFIX,
+    TRAINING_FILE,
+    init_dirs,
+)
 from src.orchestration.cli import (
     parse_args,
     resolve_models,
@@ -31,6 +43,7 @@ from src.orchestration.cli import (
 from src.orchestration.runners import run_parallel, run_sequential
 from src.step_06_track.mlflow_registry import init_mlflow
 from src.utils.logger import setup_logging
+from src.utils.sklearn_helpers import dump_json_artifact
 
 
 def _resolve_parallelism(args, settings: dict) -> int:
@@ -52,28 +65,23 @@ def _write_aggregate_summary(
     models: list[str],
     elapsed_seconds: float,
 ) -> "ARTIFACTS_DIR.__class__":  # path-like
-    aggregate_path = ARTIFACTS_DIR / "run_summary_AGGREGATE.json"
-    aggregate_path.write_text(
-        json.dumps(
-            {
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-                "elapsed_seconds_total": round(elapsed_seconds, 2),
-                "n_varieties": len(varieties),
-                "n_failed_varieties": len(failed_varieties),
-                "failed_varieties": failed_varieties,
-                "models_trained": models,
-                "champions": {
-                    v: data.get("champion", {}).get("champion_model")
-                    for v, data in aggregate.items()
-                    if isinstance(data, dict) and "champion" in data
-                },
-                "per_variety": aggregate,
+    return dump_json_artifact(
+        ARTIFACTS_DIR / "run_summary_AGGREGATE.json",
+        {
+            "timestamp": datetime.now().isoformat(timespec="seconds"),
+            "elapsed_seconds_total": round(elapsed_seconds, 2),
+            "n_varieties": len(varieties),
+            "n_failed_varieties": len(failed_varieties),
+            "failed_varieties": failed_varieties,
+            "models_trained": models,
+            "champions": {
+                v: data.get("champion", {}).get("champion_model")
+                for v, data in aggregate.items()
+                if isinstance(data, dict) and data.get("champion") is not None
             },
-            indent=2, ensure_ascii=False, default=str,
-        ),
-        encoding="utf-8",
+            "per_variety": aggregate,
+        },
     )
-    return aggregate_path
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -118,17 +126,29 @@ def main(argv: list[str] | None = None) -> int:
 
     if parallel > 1 and len(varieties) > 1:
         aggregate, failed_varieties = run_parallel(
-            varieties, models, args, settings, logger,
+            varieties,
+            models,
+            args,
+            settings,
+            logger,
             n_workers=min(parallel, len(varieties)),
         )
     else:
         aggregate, failed_varieties = run_sequential(
-            varieties, models, args, settings, logger,
+            varieties,
+            models,
+            args,
+            settings,
+            logger,
         )
 
     total_dt = time.perf_counter() - t_total
     aggregate_path = _write_aggregate_summary(
-        aggregate, failed_varieties, varieties, models, total_dt,
+        aggregate,
+        failed_varieties,
+        varieties,
+        models,
+        total_dt,
     )
 
     logger.info("=" * 78)
@@ -146,6 +166,20 @@ def main(argv: list[str] | None = None) -> int:
             )
     logger.info(f"Resumen agregado: {aggregate_path}")
     logger.info("=" * 78)
+
+    # S3 sync: solo si S3_ARTIFACTS_BUCKET esta configurado (EC2/CI).
+    # En local el bucket esta vacio -> se omite silenciosamente.
+    if S3_ARTIFACTS_BUCKET:
+        from scripts.s3_sync import sync_to_s3
+
+        sync_to_s3(
+            artifacts_dir=ARTIFACTS_DIR,
+            reports_dir=REPORTS_DIR,
+            bucket=S3_ARTIFACTS_BUCKET,
+            artifacts_prefix=S3_ARTIFACTS_PREFIX,
+            reports_prefix=S3_REPORTS_PREFIX,
+        )
+
     return 0 if not failed_varieties else 1
 
 

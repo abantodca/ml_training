@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import time
 import warnings
-from typing import Callable, Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import optuna
@@ -40,31 +40,35 @@ from src.config import (
     OOF_ENSEMBLE_K,
     OUTER_CV_FOLDS,
     RANDOM_STATE,
+    STACKING_AUTO_FALLBACK,
+    STACKING_GAM_LAM,
+    STACKING_GAM_N_SPLINES,
+    STACKING_META_INNER_FOLDS,
+    STACKING_META_TRIALS_DEFAULT,
+    STACKING_NAN_FLAG_THRESHOLD,
+    STACKING_OOF_FOLDS,
+    STACKING_X_SUBSET,
 )
-from src.step_04_train.model_lgb import get_lgb_model
-from src.step_04_train.model_xgb import get_xgb_model
 from src.step_04_train.oof_ensemble import OOFEnsembleRegressor
+from src.step_04_train.registry import get_backend
 from src.step_04_train.search_spaces import suggest_full_params
+from src.step_04_train.stacking import StackedRegressor
+from src.utils.sklearn_helpers import (
+    fit_with_optional_sample_weight,
+    index_or_none,
+)
 
 # Logger inerte hasta que el caller configure handlers (idem data_loader).
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Factories de modelos (los search spaces viven en search_spaces.py)
+# Factory: delega al BACKEND_REGISTRY (single source of truth)
 # ---------------------------------------------------------------------------
-
-_MODEL_FACTORIES: Dict[str, Callable] = {
-    "xgb": get_xgb_model,
-    "lgb": get_lgb_model,
-}
 
 
 def _build_model(model_type: str):
-    if model_type not in _MODEL_FACTORIES:
-        raise ValueError(
-            f"model_type '{model_type}' no soportado. Usa: {list(_MODEL_FACTORIES)}"
-        )
-    return _MODEL_FACTORIES[model_type]()
+    """Construye el regressor envuelto (TTR + base) para `model_type`."""
+    return get_backend(model_type).factory()
 
 
 # ---------------------------------------------------------------------------
@@ -163,24 +167,6 @@ def compute_sample_weights(
     return weights
 
 
-def _fit_pipeline(
-    pipeline: Pipeline,
-    X: pd.DataFrame,
-    y: pd.Series,
-    sample_weight: Optional[np.ndarray] = None,
-) -> None:
-    """Fit con sample_weight opcional sobre el regressor del pipeline.
-
-    Helper para evitar repetir el if/else sample_weight=None en los 3 sitios
-    donde reentrenamos: inner CV (`_objective`), refit del fold ganador
-    (outer loop) y refit final sobre todo el dataset.
-    """
-    if sample_weight is not None:
-        pipeline.fit(X, y, regressor__sample_weight=sample_weight)
-    else:
-        pipeline.fit(X, y)
-
-
 def _objective(
     trial: optuna.Trial,
     X_train: pd.DataFrame,
@@ -217,10 +203,8 @@ def _objective(
         yv = y_train.iloc[te_i]
         pipe_local = _build_pipeline(preprocessor, model_type)
         pipe_local.set_params(**params)
-        sw_fold = (
-            sample_weights_train[tr_i] if sample_weights_train is not None else None
-        )
-        _fit_pipeline(pipe_local, Xt, yt, sample_weight=sw_fold)
+        sw_fold = index_or_none(sample_weights_train, tr_i)
+        fit_with_optional_sample_weight(pipe_local, Xt, yt, sample_weight=sw_fold)
         pred = pipe_local.predict(Xv)
         scores.append(float(mean_absolute_error(yv, pred)))
     return float(np.mean(scores))
@@ -252,6 +236,8 @@ def perform_nested_cv(
     skip_final_tuning: bool = False,
     inner_cv_n_jobs: int = -1,
     use_sample_weights: bool = True,
+    stacking_meta: Optional[str] = None,
+    meta_trials: int = STACKING_META_TRIALS_DEFAULT,
     logger=logger,
 ) -> Tuple[Pipeline, Dict[str, object], Dict[str, float], Dict[str, np.ndarray]]:
     """Ejecuta Nested CV y devuelve:
@@ -268,6 +254,16 @@ def perform_nested_cv(
                       (fold a fold) para soportar sample_weight. Aceptamos
                       el flag para no romper la CLI/settings. La paralelizacion
                       real ahora es por variedad (`--parallel-varieties`).
+    stacking_meta : None | "gam". Si "gam", el refit final envuelve el
+                    `OOFEnsembleRegressor` en `StackedRegressor` con un
+                    pyGAM como meta-learner. El nested CV se mantiene SOBRE
+                    EL BASE puro (no incluye al meta) para que las metricas
+                    de gap/MAE_test/R2 sigan comparables con runs historicos.
+                    None (default) = comportamiento legacy bit-for-bit.
+    meta_trials : trials de Optuna para tunear (gam_n_splines, gam_lam) sobre
+                  las OOF preds del propio Stacked. 0 (default) = sin tuning.
+                  Solo aplica si stacking_meta == "gam". El presupuesto por
+                  perfil esta en TUNING_PROFILES[<perfil>]["meta_trials"].
 
     Returns
     -------
@@ -372,7 +368,9 @@ def perform_nested_cv(
 
         X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
         y_tr, y_te = y.iloc[train_idx], y.iloc[test_idx]
-        sw_tr = sample_weights[train_idx] if sample_weights is not None else None
+        sw_tr = index_or_none(sample_weights, train_idx)
+        # strat_label es pd.Series: requiere .iloc, no encaja en index_or_none
+        # (que asume numpy array). Mantenemos el if/else explicito.
         strat_tr = (
             strat_label.iloc[train_idx] if strat_label is not None else None
         )
@@ -391,7 +389,7 @@ def perform_nested_cv(
 
         best_pipeline = _build_pipeline(preprocessor, model_type)
         best_pipeline.set_params(**study.best_params)
-        _fit_pipeline(best_pipeline, X_tr, y_tr, sample_weight=sw_tr)
+        fit_with_optional_sample_weight(best_pipeline, X_tr, y_tr, sample_weight=sw_tr)
 
         # Test (generalizacion)
         y_pred_te = best_pipeline.predict(X_te)
@@ -469,18 +467,55 @@ def perform_nested_cv(
 
     base_pipeline = _build_pipeline(preprocessor, model_type)
     base_pipeline.set_params(**best_params)
-    final_pipeline = OOFEnsembleRegressor(
+    base_estimator = OOFEnsembleRegressor(
         base_pipeline=base_pipeline,
         n_models=OOF_ENSEMBLE_K,
         random_state=random_state,
     )
-    final_pipeline.fit(X, y, sample_weight=sample_weights)
 
-    total_dt = time.perf_counter() - t0
-    logger.info(
-        f"Pipeline final entrenado | K={OOF_ENSEMBLE_K} pipelines promediados | "
-        f"tiempo_total={_format_eta(total_dt)} | best_params={best_params}"
-    )
+    # Envoltorio opcional de stacking. El nested CV de arriba ya midio el
+    # base puro (gap/MAE/R2), asi que esas metricas siguen siendo
+    # comparables historicamente. El meta-learner solo afecta lo que se
+    # promueve a produccion y lo que se mide post-hoc en business_validation.
+    if stacking_meta is None:
+        final_pipeline = base_estimator
+        final_pipeline.fit(X, y, sample_weight=sample_weights)
+        logger.info(
+            f"Pipeline final entrenado | K={OOF_ENSEMBLE_K} pipelines promediados | "
+            f"tiempo_total={_format_eta(time.perf_counter() - t0)} | "
+            f"best_params={best_params}"
+        )
+    elif stacking_meta == "gam":
+        logger.info(
+            f"Stacking ON (meta=gam) | x_subset={STACKING_X_SUBSET} | "
+            f"n_oof_folds={STACKING_OOF_FOLDS} | "
+            f"n_splines={STACKING_GAM_N_SPLINES} | lam={STACKING_GAM_LAM} | "
+            f"meta_trials={meta_trials} | meta_inner_folds={STACKING_META_INNER_FOLDS} | "
+            f"auto_fallback={STACKING_AUTO_FALLBACK} | "
+            f"nan_flag_threshold={STACKING_NAN_FLAG_THRESHOLD}"
+        )
+        final_pipeline = StackedRegressor(
+            base_pipeline=base_estimator,
+            x_subset_cols=list(STACKING_X_SUBSET),
+            n_oof_folds=STACKING_OOF_FOLDS,
+            gam_n_splines=STACKING_GAM_N_SPLINES,
+            gam_lam=STACKING_GAM_LAM,
+            nan_flag_threshold=STACKING_NAN_FLAG_THRESHOLD,
+            auto_fallback=STACKING_AUTO_FALLBACK,
+            tune_meta_trials=meta_trials,
+            tune_meta_inner_folds=STACKING_META_INNER_FOLDS,
+            random_state=random_state,
+        )
+        final_pipeline.fit(X, y, sample_weight=sample_weights)
+        logger.info(
+            f"Stacked pipeline entrenado | base=OOFEnsembleRegressor(K={OOF_ENSEMBLE_K}) | "
+            f"meta=LinearGAM | tiempo_total={_format_eta(time.perf_counter() - t0)} | "
+            f"best_params={best_params}"
+        )
+    else:
+        raise ValueError(
+            f"stacking_meta '{stacking_meta}' no soportado. Validos: None, 'gam'."
+        )
 
     oof = {
         "y_true": np.asarray(y, dtype=float),

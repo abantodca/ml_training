@@ -138,7 +138,6 @@ def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
     df_work = df.copy()
 
     new_cols: list[str] = []
-    cold_flag_cols: list[str] = []
 
     for alias, group_cols in GROUP_DEFS:
         df_sorted = df_work.sort_values(group_cols + [DATE_COLUMN])
@@ -149,12 +148,10 @@ def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
                     df_sorted, value_col, group_cols, w
                 )
                 new_cols.append(name)
-        # Flag cold-start solo para el grupo mas especifico (FF)
-        if alias == "FF":
-            ff_cols = [c for c in new_cols if "_lag_FF_" in c]
-            cold_mask = df_work[ff_cols].isna().all(axis=1)
-            df_work["LAG_FF_COLD"] = cold_mask.astype(int)
-            cold_flag_cols.append("LAG_FF_COLD")
+    # NOTA: las flags LAG_FF_COLD y LAG_FF_SEASONAL_COLD existian aqui para
+    # marcar filas sin historia. Se eliminaron tras permutation_importance
+    # (mayo 2026) que mostro importance ~0 / negativa: el sentinel -1 ya
+    # comunica el cold-start a los arboles, la flag binaria era redundante.
 
     # Lag estacional (mismo periodo del año anterior, ventana +/-15d). Solo
     # para grupo FF. Captura ciclo agronómico anual que rolling 90d no ve.
@@ -173,9 +170,9 @@ def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
         seasonal_cols.append(name)
         new_cols.append(name)
 
-    seasonal_cold_mask = df_work[seasonal_cols].isna().all(axis=1)
-    df_work["LAG_FF_SEASONAL_COLD"] = seasonal_cold_mask.astype(int)
-    cold_flag_cols.append("LAG_FF_SEASONAL_COLD")
+    # Conteo de filas con cold-start (solo informativo para el log).
+    n_cold_pre = int(df_work[[c for c in new_cols if "_lag_FF_" in c]].isna().all(axis=1).sum())
+    n_cold_seasonal_pre = int(df_work[seasonal_cols].isna().all(axis=1).sum())
 
     # Ratios actual vs lag (solo KG_HA: NO usa el target)
     a30, a90 = "KG_HA_lag_FF_30", "KG_HA_lag_FF_90"
@@ -192,13 +189,15 @@ def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
     for c in new_cols:
         df_work[c] = df_work[c].fillna(COLD_START_FILL_VALUE)
 
-    n_cold = int(df_work["LAG_FF_COLD"].sum())
-    n_cold_seasonal = int(df_work["LAG_FF_SEASONAL_COLD"].sum())
-    logger.info(
+    # Bajado a DEBUG porque ahora se llama POR cada pipeline.fit() dentro
+    # de Optuna nested CV (~4500 veces para tuning prod), antes era 1 vez
+    # en data_loader. Para verlo, configurar `logger.setLevel(DEBUG)` en
+    # el caller, o subir a INFO temporalmente para diagnostico.
+    logger.debug(
         f"Lag features agregadas | grupos={[g[0] for g in GROUP_DEFS]} | "
-        f"cold_start_FF={n_cold} ({n_cold/len(df_work)*100:.1f}%) | "
-        f"cold_seasonal={n_cold_seasonal} ({n_cold_seasonal/len(df_work)*100:.1f}%) | "
-        f"n_nuevas_cols={len(new_cols)+len(cold_flag_cols)}"
+        f"cold_start_FF={n_cold_pre} ({n_cold_pre/len(df_work)*100:.1f}%) | "
+        f"cold_seasonal={n_cold_seasonal_pre} ({n_cold_seasonal_pre/len(df_work)*100:.1f}%) | "
+        f"n_nuevas_cols={len(new_cols)}"
     )
 
     return df_work
@@ -213,10 +212,8 @@ LAG_OUTPUT_COLUMNS: List[str] = [
     for vname in ("KG_JR_H", "KG_HA")
     for w in WINDOWS
 ] + [
-    "LAG_FF_COLD",
     "KG_JR_H_lag_FF_seasonal",
     "KG_HA_lag_FF_seasonal",
-    "LAG_FF_SEASONAL_COLD",
     "KG_HA_ratio_FF_30",
     "KG_HA_ratio_FF_90",
     "delta_KG_JR_H_30_90",

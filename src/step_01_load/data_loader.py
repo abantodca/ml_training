@@ -25,7 +25,7 @@ from src.config import (
     TRAINING_FILE,
     USELESS_COLUMNS,
 )
-from src.step_03_features.lag_features import add_lag_features
+from src.step_01_load.validation import validate_dataset
 
 # Logger inerte hasta que el caller (main.py) configure handlers via
 # `setup_logging()`. Usar `getLogger(__name__)` evita side-effects al
@@ -169,10 +169,18 @@ def load_data(
     if n_no_date:
         logger.warning(f"{n_no_date} filas sin fecha valida (se imputaran al transformar)")
 
-    # Lag features por FUNDO+FORMATO. Se calcula aqui (pre-CV) para que el
-    # modelo serializado tenga signature de 40 columnas (raw + lags) y el
-    # backend reproduzca el mismo feature engineering antes de invocarlo.
-    df = add_lag_features(df)
+    # Validacion de schema antes de pasar al Pipeline. Detecta tipos
+    # incorrectos, rangos imposibles, duplicados estructurales, etc.
+    # Critico (raise): columnas requeridas faltantes, duplicados.
+    # Blando (warning): rangos, varianza cero, tipos recuperables.
+    validate_dataset(df, strict=True)
+
+    # NOTA: las lag features se calculan AHORA dentro del Pipeline via
+    # `LagFeatureTransformer` (step 0 de `build_preprocessing_pipeline`).
+    # Esto elimina el leakage moderado que existia cuando los lags se
+    # calculaban aqui sobre el dataset completo antes del CV split.
+    # `data_loader` deja X con las 9 columnas raw; el transformer las
+    # expande a ~38 dentro del fold de cada modelo.
 
     X = df.drop(columns=[TARGET])
     y = df[TARGET].astype(float)
@@ -184,9 +192,8 @@ def load_data(
     )
     logger.info(f"X (features raw) = {list(X.columns)}")
     logger.info(
-        f"y (target) = '{TARGET}' | FECHA se expande downstream a "
-        f"MES_SIN/COS (orden 1-3), SEMANA_SIN/COS, DIA_SEM_SIN/COS, "
-        f"TEMPORADA_ALTA/BAJA, ANIO"
+        f"y (target) = '{TARGET}' | lags FF/F/FMT y ciclicas de FECHA se "
+        f"computan dentro del Pipeline (LagFeatureTransformer + FeatureGenerator)"
     )
     return X, y
 

@@ -1,66 +1,46 @@
 #!/usr/bin/env bash
 # Indice navegable de tasks. Lo imprime `task` (sin args) via la tarea `default`.
-# Mantener sincronizado con el header de Taskfile.yml.
+# Mantener sincronizado con Taskfile.yml.
 
 cat <<'EOF'
 
 =============================================================================
- ml_training — tasks
+ ml_training — tasks (LOCAL-ONLY)
 =============================================================================
 
-DOS ENTORNOS, AISLADOS:
-  LOCAL  -> corre en Windows. MLflow file:// en ./mlruns. No toca AWS.
-  AWS    -> corre en EC2. MLflow remoto + S3. Codigo viaja via S3.
+ENTORNO:
+  Local (Windows / Linux). MLflow file:// en ./mlruns. Sin AWS.
 
-VARIABLES (sobrescribibles):
-  VARIETIES=POP|POP,VENTURA|all   PARALLEL=N   (variedades a entrenar)
-  TUNING=smoke|dev|prod           (presupuesto Optuna; NO es entorno)
+--- SETUP & DATA -----------------------------------------------------------
+   task setup                    Instala deps Python (pip install -r requirements.txt)
+   task data:split               Genera data/training/DB-HISTORICA.xlsx
+                                   (split por variedad desde el acumulado)
 
-  Avanzadas (raras veces se tocan):
-    MODEL=auto|xgb|lgb|xgb,lgb|all   (default 'auto' = entrena XGB y LGB
-                                      con Optuna independiente y elige
-                                      campeon por variedad. 'xgb' o 'lgb'
-                                      fuerza un solo backend, ~50% mas rapido)
-    STAGE=Staging|Production         (registra el campeon en MLflow Registry)
+--- TRAINING ---------------------------------------------------------------
+   task train VARIETIES=POP               Entrena 1 variedad
+   task train VARIETIES=POP,VENTURA       Entrena varias variedades
+   task train VARIETIES=all               Entrena todas las variedades
 
---- LOCAL (Windows) ---------------------------------------------------------
-   task setup                        Instala deps Python
-   task data:split                   Regenera data/training/DB-HISTORICA.xlsx
-                                       (split por variedad desde el acumulado)
-   task smoke                        Pipeline smoke (~1 min)
-   task train:local VARIETIES=POP    Entrena (acepta CSV o 'all')
-                                       Si DB-HISTORICA.xlsx no existe, hace split auto
+   Cada variedad es independiente: si una falla, las demas continuan.
+   Pipeline siempre:  XGB vs LGB  →  campeon  →  GAM ajusta errores del campeon
+   GAM es el default. Auto-fallback incluido: si GAM no mejora, se desactiva
+   solo y el modelo entrega la prediccion del base puro sin intervencion.
+   Si DB-HISTORICA.xlsx no existe, se genera automaticamente.
 
---- AWS (EC2 + MLflow remoto) -----------------------------------------------
-   task run VARIETIES=all PARALLEL=4 TODO-EN-UNO (power+deploy+train)
+   Para desactivar GAM (solo base XGB/LGB):
+   task train VARIETIES=POP STACKING=none
 
-   Manual paso a paso:
-   task power:on                                 [1/4] Prende EC2 (training+mlflow)
-   task deploy:upload-code                       [2/4] tar.gz src/ -> S3 (EC2 lo baja)
-   task deploy:upload-data                       [3/4] sync data/*.xlsx -> S3
-   task train:remote VARIETIES=POP               [4/4] entrena (CSV o 'all')
-   task power:off                                Apaga EC2 (cuida costo)
-   task power:status                             Estado EC2 (running/stopped)
-   task ssh:training / ssh:mlflow                SSH directo
+--- MLFLOW (UI local) -------------------------------------------------------
+   task mlflow:ui                Abre la UI en http://localhost:5000
 
-ARTIFACTS + MLFLOW (solo entorno AWS)
-   task mlflow:open                              UI (modelos, reportes, summaries)
-   task mlflow:status                            Health check MLflow
-   task audit:compare -- --variety POP --last 5  Comparativa entre runs (KG/JR)
+--- LOGS / AUDITORIA --------------------------------------------------------
+   task logs:local                              tail al log del orquestador
+   task logs:variety VARIETY=POP                tail al log de UNA variedad
+   task audit:compare -- --variety POP --last 5 Comparativa entre runs (KG/JR)
 
-LOGS
-   task logs:{local,remote,mlflow,postgres}
-   task logs:variety VARIETY=POP
-   task logs:cloud-init-{training,mlflow}
-
---- INFRA (Terraform) -------------------------------------------------------
-   task infra:init / infra:fmt / infra:validate
-   task infra:plan                               Genera tfplan
-   task infra:apply                              Aplica + regenera .env.infra
-   task infra:up                                 plan + apply en uno
-   task infra:output                             URLs, IPs, env_block
-   task infra:env-export                         Regenera .env.infra manual
-   task infra:destroy                            CUIDADO: borra todo (con prompt)
+--- CLEANUP ---------------------------------------------------------------
+   task clean:outputs                  Borra artifacts/, logs/, reports/, __pycache__/
+   task clean:artifacts KEEP=10        Conserva los ultimos 10 runs por (variety, model)
 
 Pipeline en src/: step_01..06 (load > clean > features > train > evaluate > track)
 

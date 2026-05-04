@@ -15,6 +15,25 @@ _FORMAT = "%(asctime)s | %(levelname)-7s | %(name)s | %(filename)s:%(lineno)d:%(
 _BUSINESS_AUDIT_FILE = LOGS_DIR / "business_audit.jsonl"
 
 
+class PrefixAdapter(logging.LoggerAdapter):
+    """LoggerAdapter que antepone un prefijo fijo a cada mensaje.
+
+    Uso tipico (single_run.py):
+        log = PrefixAdapter(logger, prefix=f"[{variety}/{model_type}]")
+        log.info("[1/6] Cargando datos...")
+        # -> "[POP/xgb] [1/6] Cargando datos..."
+
+    Centraliza el prefijo en una sola variable -- antes aparecia repetido
+    en ~12 f-strings dentro de train_model.
+    """
+
+    def __init__(self, logger: logging.Logger, prefix: str):
+        super().__init__(logger, extra={"prefix": prefix})
+
+    def process(self, msg, kwargs):
+        return f"{self.extra['prefix']} {msg}", kwargs
+
+
 def setup_logging(
     name: str = _DEFAULT_NAME,
     level: int = logging.INFO,

@@ -37,8 +37,11 @@ from src.config import (
     REPORT_VERDICT_THRESHOLDS,
 )
 
+from src.step_05_evaluate.stacking_diagnostics import StackingDiagnostics
+
 if TYPE_CHECKING:
     from src.step_05_evaluate.champion import ModelResult
+    from src.step_05_evaluate.feature_importance import FeatureImportanceResult
 
 
 # -----------------------------------------------------------------------------
@@ -513,6 +516,25 @@ GLOSSARY: Dict[str, str] = {
         "el promedio). Si un modelo no es mejor que el baseline, no "
         "aporta valor."
     ),
+    "Stacking (capa meta)": (
+        "Técnica que combina dos modelos: uno base (XGBoost o LightGBM) "
+        "que predice primero, y uno meta (un modelo aditivo simple) que "
+        "ajusta esa predicción usando un puñado de variables clave. La idea "
+        "es que el meta corrija sesgos del base sin re-aprender desde cero."
+    ),
+    "GAM (Modelo Aditivo)": (
+        "Modelo simple e interpretable usado como capa meta. Aprende una "
+        "curva suave por cada variable y suma las contribuciones — a "
+        "diferencia de los árboles, no descubre interacciones nuevas, sólo "
+        "afina la predicción del modelo base."
+    ),
+    "Auto-fallback": (
+        "Mecanismo de seguridad del stacking: tras entrenar, el sistema "
+        "compara el error del modelo base solo vs el del base+meta. Si la "
+        "capa meta no mejora al base por al menos un margen mínimo, se "
+        "desactiva automáticamente y la predicción de producción es la del "
+        "base puro. Activar stacking nunca empeora el resultado."
+    ),
 }
 
 
@@ -544,6 +566,9 @@ class WinnerKit:
     verdict             : Verdict ejecutivo (icon + headline + body).
     context             : TrainingContext (filas, fechas, fundos, formatos).
     actions             : Lista de Action auto-generadas.
+    stacking            : StackingDiagnostics si el campeón usa capa meta;
+                          None en caso contrario. Se propaga al hero (pill)
+                          y a la sección técnica (panel "Capa Meta").
     """
 
     real: np.ndarray
@@ -556,6 +581,8 @@ class WinnerKit:
     verdict: Verdict
     context: TrainingContext
     actions: List[Action]
+    stacking: Optional[StackingDiagnostics] = None
+    feature_importance: Optional["FeatureImportanceResult"] = None
 
 
 def _abs_errors_aligned(
@@ -589,6 +616,7 @@ def build_winner_kit(
     variety: str,
     champion: "ModelResult",
     X_raw: Optional[pd.DataFrame] = None,
+    feature_importance: Optional["FeatureImportanceResult"] = None,
 ) -> WinnerKit:
     """Construye el kit ejecutivo del campeon en una sola pasada.
 
@@ -611,8 +639,11 @@ def build_winner_kit(
         abs_errors=abs_err, real=real, X_aligned=X_aligned,
         global_mape=oof_mape, abs_gap=abs_gap, full_mape=oof_mape,
     )
+    stacking = getattr(champion, "stacking_diagnostics", None)
     return WinnerKit(
         real=real, pred=pred, abs_err=abs_err, X_aligned=X_aligned,
         oof_mape=oof_mape, oof_r2=oof_r2, abs_gap=abs_gap,
         verdict=verdict, context=context, actions=actions,
+        stacking=stacking,
+        feature_importance=feature_importance,
     )

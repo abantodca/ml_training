@@ -2,19 +2,22 @@
 
 Para Data Science: justificacion del campeon, panel comparativo
 Train/Test/Full por modelo, scatters Drift & Overfitting (OOF vs refit) y
-boxplots del error por FORMATO/FUNDO con GLOBAL como referencia.
+panel tabular (boxplot + tabla con n/p50/p90/MAPE/desviacion) del error
+por subgrupo (FORMATO, FUNDO, AÑO, MES, HA, KG/HA, %INDUS) con tabs.
 """
 from __future__ import annotations
 
 from html import escape
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
 
+from src.config import DATE_COLUMN
 from src.step_05_evaluate.champion import ModelResult
 from src.step_05_evaluate.diagnostics import plot_pred_vs_actual_plotly
 from src.step_05_evaluate.html.helpers import fmt, kpi_card
+from src.step_05_evaluate.stacking_diagnostics import StackingDiagnostics
 
 
 def _kpi_panel_for_model(r: ModelResult, *, is_winner: bool, rank: int) -> str:
@@ -95,9 +98,12 @@ def _model_charts(r: ModelResult, *, is_winner: bool) -> str:
     )
 
 
+_SUBGRP_MIN_N = 5
+
+
 def _build_boxplot(
     abs_err: np.ndarray, groups: pd.Series,
-    title: str, group_label: str, min_n: int = 5,
+    title: str, group_label: str, min_n: int = _SUBGRP_MIN_N,
 ) -> str:
     try:
         import plotly.graph_objects as go
@@ -117,7 +123,7 @@ def _build_boxplot(
                "#2d6a4f", "#bf812d"]
     cats = []
     for cat in groups.unique():
-        if pd.isna(cat):
+        if pd.isna(cat) or str(cat) in ("", "nan", "<NA>", "None"):
             continue
         mask = (groups == cat).to_numpy()
         if mask.sum() < min_n:
@@ -138,9 +144,9 @@ def _build_boxplot(
     p50 = float(np.percentile(abs_err, 50))
     p90 = float(np.percentile(abs_err, 90))
     fig.update_layout(
-        title=dict(text=title, font=dict(size=14, color="#0c2a4d")),
+        title=dict(text=title, font=dict(size=13, color="#0c2a4d")),
         yaxis_title="Error absoluto (kg/jornal)", height=380,
-        margin=dict(l=60, r=20, t=50, b=70),
+        margin=dict(l=60, r=20, t=44, b=72),
         plot_bgcolor="white", paper_bgcolor="white",
         font=dict(family="-apple-system, Segoe UI, Roboto, sans-serif", size=11),
         showlegend=False,
@@ -149,7 +155,7 @@ def _build_boxplot(
                 f"<b>Lectura:</b> 50% del error ≤ {p50:.2f} · 90% ≤ {p90:.2f} kg/jornal · "
                 "ordenados de peor (izq) a mejor (der)"
             ),
-            xref="paper", yref="paper", x=0, y=-0.18,
+            xref="paper", yref="paper", x=0, y=-0.20,
             showarrow=False, align="left", font=dict(size=10.5, color="#555"),
         )],
     )
@@ -161,42 +167,392 @@ def _build_boxplot(
         return ""
 
 
-def _build_boxplot_block(
-    X_aligned: Optional[pd.DataFrame], abs_errors: np.ndarray,
+def _build_grouping_options(
+    X_aligned: pd.DataFrame,
+) -> List[Tuple[str, str, pd.Series]]:
+    """Devuelve [(id, label, series_categorica)] para cada agrupacion disponible.
+
+    Combina categoricas directas (FORMATO, FUNDO), derivadas de fecha
+    (AÑO, MES) y bineadas de numericas (HA, KG/HA, %INDUS).
+    """
+    options: List[Tuple[str, str, pd.Series]] = []
+
+    if "FORMATO" in X_aligned.columns:
+        options.append(("formato", "FORMATO",
+                        X_aligned["FORMATO"].astype(str).reset_index(drop=True)))
+    if "FUNDO" in X_aligned.columns:
+        options.append(("fundo", "FUNDO",
+                        X_aligned["FUNDO"].astype(str).reset_index(drop=True)))
+
+    if DATE_COLUMN in X_aligned.columns:
+        d = pd.to_datetime(X_aligned[DATE_COLUMN], errors="coerce").reset_index(drop=True)
+        if d.notna().any():
+            anio = d.dt.year.astype("Int64").astype(str).replace({"<NA>": ""})
+            options.append(("anio", "AÑO", anio))
+            month_names = ["Ene", "Feb", "Mar", "Abr", "May", "Jun",
+                           "Jul", "Ago", "Sep", "Oct", "Nov", "Dic"]
+            mes = d.dt.month.map(
+                lambda m: f"{int(m):02d}-{month_names[int(m) - 1]}"
+                if pd.notna(m) else ""
+            )
+            options.append(("mes", "MES", mes.astype(str)))
+
+    def _bin_numeric(col: str, gid: str, label: str,
+                     fixed: Optional[List[Tuple[float, str]]] = None) -> None:
+        if col not in X_aligned.columns:
+            return
+        s = pd.to_numeric(X_aligned[col], errors="coerce").reset_index(drop=True)
+        if s.notna().sum() < _SUBGRP_MIN_N * 2:
+            return
+        try:
+            if fixed is not None:
+                edges = [-np.inf] + [e for e, _ in fixed] + [np.inf]
+                lbls = [lbl for _, lbl in fixed] + [fixed[-1][1]]
+                # use cut with edges (last bin label is reused for >max)
+                edges_cut = [-np.inf] + [e for e, _ in fixed[:-1]] + [np.inf]
+                lbls_cut = [lbl for _, lbl in fixed]
+                bins = pd.cut(s, bins=edges_cut, labels=lbls_cut, include_lowest=True)
+            else:
+                bins = pd.qcut(s, q=4, labels=["Q1 bajo", "Q2", "Q3", "Q4 alto"],
+                               duplicates="drop")
+        except Exception:
+            return
+        options.append((gid, label, bins.astype(str).replace({"nan": ""})))
+
+    _bin_numeric("HA", "ha", "HA (tamaño)",
+                 fixed=[(1, "≤1 ha"), (3, "1-3 ha"), (6, "3-6 ha"), (np.inf, ">6 ha")])
+    _bin_numeric("KG/HA", "kgha", "KG/HA (rendimiento)")
+    _bin_numeric("%INDUS", "indus", "%INDUS (calidad)")
+
+    return options
+
+
+def _ratio_pill(ratio: float) -> str:
+    if not np.isfinite(ratio):
+        return '<span class="ratio-pill neutral">—</span>'
+    if ratio < 0.85:
+        return f'<span class="ratio-pill good">{(ratio - 1) * 100:+.0f}%</span>'
+    if ratio <= 1.15:
+        return f'<span class="ratio-pill neutral">{(ratio - 1) * 100:+.0f}%</span>'
+    if ratio <= 1.5:
+        return f'<span class="ratio-pill warn">{(ratio - 1) * 100:+.0f}%</span>'
+    return f'<span class="ratio-pill bad">×{ratio:.1f}</span>'
+
+
+def _build_subgroup_table(
+    abs_err: np.ndarray, real: np.ndarray, groups: pd.Series,
+    min_n: int = _SUBGRP_MIN_N,
 ) -> str:
+    """Tabla por subgrupo: n / p50 / p90 / MAE / MAPE / desviacion vs global."""
+    p50_g = float(np.percentile(abs_err, 50))
+    p90_g = float(np.percentile(abs_err, 90))
+    mae_g = float(np.mean(abs_err))
+    nz_g = real != 0
+    mape_g = (float(np.mean(abs_err[nz_g] / np.abs(real[nz_g])) * 100)
+              if nz_g.any() else float("nan"))
+
+    rows: List[dict] = [{
+        "label": "GLOBAL", "is_global": True, "n": int(abs_err.size),
+        "p50": p50_g, "p90": p90_g, "mae": mae_g, "mape": mape_g, "ratio": 1.0,
+    }]
+    seen = set()
+    for cat in groups.unique():
+        if pd.isna(cat) or str(cat) in ("", "nan", "<NA>", "None") or cat in seen:
+            continue
+        seen.add(cat)
+        mask = (groups == cat).to_numpy()
+        if mask.sum() < min_n:
+            continue
+        cat_err = abs_err[mask]
+        cat_real = real[mask] if real.size == abs_err.size else np.array([])
+        nz = cat_real != 0 if cat_real.size else np.array([], dtype=bool)
+        cat_mape = (float(np.mean(cat_err[nz] / np.abs(cat_real[nz])) * 100)
+                    if nz.any() else float("nan"))
+        rows.append({
+            "label": str(cat), "is_global": False, "n": int(mask.sum()),
+            "p50": float(np.percentile(cat_err, 50)),
+            "p90": float(np.percentile(cat_err, 90)),
+            "mae": float(np.mean(cat_err)),
+            "mape": cat_mape,
+            "ratio": (cat_mape / mape_g) if (np.isfinite(mape_g) and mape_g > 0
+                                              and np.isfinite(cat_mape)) else float("nan"),
+        })
+    rows[1:] = sorted(
+        rows[1:],
+        key=lambda r: r["mape"] if np.isfinite(r["mape"]) else -1.0,
+        reverse=True,
+    )
+
+    parts: List[str] = [
+        '<table class="subgrp-table">',
+        '<thead><tr>',
+        '<th>Grupo</th>',
+        '<th class="num">n</th>',
+        '<th class="num">MAE</th>',
+        '<th class="num">p50</th>',
+        '<th class="num">p90</th>',
+        '<th class="num">MAPE</th>',
+        '<th class="num">vs global</th>',
+        '</tr></thead><tbody>',
+    ]
+    for r in rows:
+        cls = "subgrp-row global" if r["is_global"] else "subgrp-row"
+        ratio_cell = ('<span class="ratio-pill ref">ref</span>'
+                      if r["is_global"] else _ratio_pill(r["ratio"]))
+        mape_txt = f'{r["mape"]:.1f}%' if np.isfinite(r["mape"]) else "—"
+        parts.append(
+            f'<tr class="{cls}">'
+            f'<td><span class="grp-name" title="{escape(r["label"])}">{escape(r["label"])}</span></td>'
+            f'<td class="num">{r["n"]:,}</td>'
+            f'<td class="num">{r["mae"]:.2f}</td>'
+            f'<td class="num">{r["p50"]:.2f}</td>'
+            f'<td class="num">{r["p90"]:.2f}</td>'
+            f'<td class="num">{mape_txt}</td>'
+            f'<td class="num">{ratio_cell}</td>'
+            f'</tr>'
+        )
+    parts.append('</tbody></table>')
+    return "".join(parts)
+
+
+_SUBGRP_TAB_JS = """
+<script>
+function showSubgrpTab(rootId, tabId) {
+  var root = document.getElementById(rootId);
+  if (!root) return;
+  root.querySelectorAll('.subgrp-tab-btn').forEach(function(b){ b.classList.remove('active'); });
+  root.querySelectorAll('.subgrp-panel').forEach(function(p){ p.classList.remove('active'); });
+  var btn = document.getElementById(rootId + '-btn-' + tabId);
+  var panel = document.getElementById(rootId + '-panel-' + tabId);
+  if (btn) btn.classList.add('active');
+  if (panel) {
+    panel.classList.add('active');
+    panel.querySelectorAll('.plotly-graph-div').forEach(function(g){
+      if (window.Plotly && Plotly.Plots && Plotly.Plots.resize) {
+        try { Plotly.Plots.resize(g); } catch(e) {}
+      }
+    });
+  }
+}
+</script>
+"""
+
+
+def _build_subgroup_block(
+    X_aligned: Optional[pd.DataFrame], abs_errors: np.ndarray, real: np.ndarray,
+) -> str:
+    """Panel de errores por subgrupo: stats globales + tabs (boxplot + tabla)."""
     if abs_errors.size == 0:
-        return '<div class="legend">No hay datos OOF para boxplots.</div>'
+        return '<div class="legend">No hay datos OOF para análisis de subgrupos.</div>'
+
     p50 = float(np.percentile(abs_errors, 50))
     p90 = float(np.percentile(abs_errors, 90))
     p99 = float(np.percentile(abs_errors, 99))
+    mae = float(np.mean(abs_errors))
+    nz = real != 0 if real.size == abs_errors.size else np.array([], dtype=bool)
+    mape_g = (float(np.mean(abs_errors[nz] / np.abs(real[nz])) * 100)
+              if nz.any() else float("nan"))
+    mape_txt = f'{mape_g:.1f}%' if np.isfinite(mape_g) else "—"
+
     stats = (
         '<div class="boxplot-stats">'
+        f'<div class="stat-pill"><div class="label">N total</div>'
+        f'<div class="val">{int(abs_errors.size):,}</div></div>'
+        f'<div class="stat-pill"><div class="label">MAE (media)</div>'
+        f'<div class="val">{mae:.2f}<span class="unit"> kg/jr</span></div></div>'
+        f'<div class="stat-pill"><div class="label">MAPE global</div>'
+        f'<div class="val">{mape_txt}</div></div>'
         f'<div class="stat-pill"><div class="label">Mediana (p50)</div>'
-        f'<div class="val">{p50:.2f} <span style="font-size:11px;color:var(--gray-500)">kg/jr</span></div></div>'
+        f'<div class="val">{p50:.2f}<span class="unit"> kg/jr</span></div></div>'
         f'<div class="stat-pill"><div class="label">p90 (severos)</div>'
-        f'<div class="val amber">{p90:.2f} <span style="font-size:11px;color:var(--gray-500)">kg/jr</span></div></div>'
+        f'<div class="val amber">{p90:.2f}<span class="unit"> kg/jr</span></div></div>'
         f'<div class="stat-pill"><div class="label">p99 (cola)</div>'
-        f'<div class="val red">{p99:.2f} <span style="font-size:11px;color:var(--gray-500)">kg/jr</span></div></div>'
+        f'<div class="val red">{p99:.2f}<span class="unit"> kg/jr</span></div></div>'
         '</div>'
     )
-    cf = cu = ""
-    if X_aligned is not None and len(X_aligned) == abs_errors.size:
-        if "FORMATO" in X_aligned.columns:
-            cf = _build_boxplot(abs_errors, X_aligned["FORMATO"].astype(str),
-                                "Error por FORMATO (con GLOBAL como referencia)", "FORMATO")
-        if "FUNDO" in X_aligned.columns:
-            cu = _build_boxplot(abs_errors, X_aligned["FUNDO"].astype(str),
-                                "Error por FUNDO (con GLOBAL como referencia)", "FUNDO")
-    blocks = ""
-    if cf:
-        blocks += f'<div class="chart-block">{cf}</div>'
-    if cu:
-        blocks += f'<div class="chart-block">{cu}</div>'
-    if not blocks:
+
+    if (X_aligned is None or len(X_aligned) != abs_errors.size
+            or real.size != abs_errors.size):
         empty = pd.Series([""] * abs_errors.size)
-        single = _build_boxplot(abs_errors, empty, "Distribución global del error", "GLOBAL")
-        blocks = f'<div class="chart-block">{single}</div>'
-    return f'{stats}<div class="charts-grid">{blocks}</div>'
+        single = _build_boxplot(abs_errors, empty,
+                                "Distribución global del error", "GLOBAL")
+        return f'{stats}<div class="chart-block">{single}</div>'
+
+    options = _build_grouping_options(X_aligned)
+    if not options:
+        empty = pd.Series([""] * abs_errors.size)
+        single = _build_boxplot(abs_errors, empty,
+                                "Distribución global del error", "GLOBAL")
+        return f'{stats}<div class="chart-block">{single}</div>'
+
+    root_id = "subgrp"
+    btns: List[str] = []
+    panels: List[str] = []
+    for i, (gid, glabel, gseries) in enumerate(options):
+        active = " active" if i == 0 else ""
+        btns.append(
+            f'<button type="button" class="subgrp-tab-btn{active}" '
+            f'id="{root_id}-btn-{gid}" '
+            f'onclick="showSubgrpTab(\'{root_id}\', \'{gid}\')">'
+            f'{escape(glabel)}</button>'
+        )
+        boxplot = _build_boxplot(
+            abs_errors, gseries,
+            f"Error por {glabel} (con GLOBAL como referencia)", glabel,
+        )
+        table = _build_subgroup_table(abs_errors, real, gseries)
+        panels.append(
+            f'<div class="subgrp-panel{active}" id="{root_id}-panel-{gid}">'
+            f'<div class="subgrp-grid">'
+            f'<div class="subgrp-chart">{boxplot}</div>'
+            f'<div class="subgrp-table-wrap">'
+            f'<div class="subgrp-table-title">Detalle por {escape(glabel)}'
+            f'<span class="subgrp-table-hint">ordenado por MAPE descendente · '
+            f'mín {_SUBGRP_MIN_N} obs.</span></div>'
+            f'{table}</div></div></div>'
+        )
+
+    nav = '<div class="subgrp-tabs-nav" role="tablist">' + "".join(btns) + '</div>'
+    body = '<div class="subgrp-tabs-body">' + "".join(panels) + '</div>'
+    return f'{stats}<div class="subgrp-tabs" id="{root_id}">{nav}{body}</div>{_SUBGRP_TAB_JS}'
+
+
+def _build_stacking_block(stacking: Optional[StackingDiagnostics]) -> str:
+    """Sección 'Capa Meta (GAM)' del detalle técnico.
+
+    Muestra:
+      1. Banner de estado (ACTIVA verde / FALLBACK gris) + headline en
+         lenguaje natural para gerencia.
+      2. KPIs comparativos: MAE base OOF · MAE meta OOF · Δ% · estado.
+      3. Tabla de features que vio el GAM (con tipo: spline / factor / flag).
+      4. Hiperparámetros y log de tuning si hubo Optuna sobre el meta.
+
+    Si no hay stacking devuelve "" (sección invisible).
+    """
+    if stacking is None:
+        return ""
+
+    # ---- Banner ----
+    if not stacking.active:
+        banner_cls = "stacking-banner fallback"
+        banner_icon = "🛡"
+    elif stacking.improves_base:
+        banner_cls = "stacking-banner good"
+        banner_icon = "✅"
+    else:
+        banner_cls = "stacking-banner neutral"
+        banner_icon = "ℹ"
+    banner = (
+        f'<div class="{banner_cls}">'
+        f'<span class="banner-icon">{banner_icon}</span>'
+        f'<span class="banner-text">{escape(stacking.headline)}</span>'
+        f'</div>'
+    )
+
+    # ---- KPI cards: base vs meta ----
+    delta_cls = "good" if stacking.improves_base else (
+        "neutral" if stacking.delta_pct >= 0 and stacking.delta_pct < 0.5 else "warn"
+    )
+    kpis = (
+        '<div class="meta-kpi-grid">'
+        f'<div class="meta-kpi"><div class="label">MAE base (OOF)</div>'
+        f'<div class="value">{stacking.mae_base_oof:.4f}</div>'
+        f'<div class="sub">modelo base puro</div></div>'
+        f'<div class="meta-kpi"><div class="label">MAE base+meta (OOF)</div>'
+        f'<div class="value">{stacking.mae_meta_oof:.4f}</div>'
+        f'<div class="sub">tras la capa meta</div></div>'
+        f'<div class="meta-kpi {delta_cls}"><div class="label">Δ vs base</div>'
+        f'<div class="value">{stacking.delta_pct:+.2f}%</div>'
+        f'<div class="sub">negativo = mejora</div></div>'
+        f'<div class="meta-kpi {("good" if stacking.active else "warn")}">'
+        f'<div class="label">Estado en producción</div>'
+        f'<div class="value">{escape(stacking.status_label)}</div>'
+        f'<div class="sub">'
+        f'{"usa cascada base→meta" if stacking.active else "fallback → solo base"}'
+        f'</div></div>'
+        '</div>'
+    )
+
+    # ---- Features que vio el GAM ----
+    cat_set = set(stacking.cat_features)
+    flag_set = set(stacking.nan_flag_features)
+    feat_rows: List[str] = []
+    for name in stacking.feature_names:
+        if name == "pred_base":
+            ftype = "Predicción del modelo base"
+            ftype_cls = "ftype-pred"
+        elif name in flag_set:
+            ftype = "Indicador de dato faltante (factor)"
+            ftype_cls = "ftype-flag"
+        elif name in cat_set:
+            ftype = "Categórica (factor)"
+            ftype_cls = "ftype-cat"
+        else:
+            ftype = "Continua (spline)"
+            ftype_cls = "ftype-cont"
+        feat_rows.append(
+            f'<tr><td><code>{escape(name)}</code></td>'
+            f'<td><span class="ftype-pill {ftype_cls}">{escape(ftype)}</span></td></tr>'
+        )
+    features_table = (
+        '<div class="meta-features">'
+        '<div class="meta-features-title">Variables que ajusta la capa meta '
+        f'<span class="hint">{len(stacking.feature_names)} en total</span></div>'
+        '<table class="meta-features-table"><thead><tr>'
+        '<th>Variable</th><th>Tipo</th>'
+        '</tr></thead><tbody>'
+        + "".join(feat_rows) +
+        '</tbody></table></div>'
+    )
+
+    # ---- Tuning info (si hubo Optuna sobre el meta) ----
+    tuning_html = ""
+    if stacking.tuned and stacking.tuning_log:
+        tlog = stacking.tuning_log
+        n_splines = stacking.tuned_params.get("gam_n_splines", float("nan"))
+        lam = stacking.tuned_params.get("gam_lam", float("nan"))
+        n_trials_v = tlog.get("n_trials")
+        inner_v = tlog.get("inner_folds")
+        score_v = tlog.get("best_score_mae", float("nan"))
+        elapsed_v = tlog.get("elapsed_s", float("nan"))
+        n_trials_txt = f"{int(n_trials_v)}" if n_trials_v is not None else "—"
+        inner_txt = f"{int(inner_v)}" if inner_v is not None else "—"
+        tuning_html = (
+            '<div class="meta-tuning">'
+            '<div class="meta-tuning-title">Hiperparámetros tuneados (Optuna)</div>'
+            '<div class="meta-tuning-grid">'
+            f'<div><span class="k">n_splines</span><span class="v">{int(n_splines) if np.isfinite(n_splines) else "—"}</span></div>'
+            f'<div><span class="k">lam</span><span class="v">{lam:.4f}</span></div>'
+            f'<div><span class="k">trials</span><span class="v">{n_trials_txt}</span></div>'
+            f'<div><span class="k">inner folds</span><span class="v">{inner_txt}</span></div>'
+            f'<div><span class="k">best MAE</span><span class="v">{score_v:.4f}</span></div>'
+            f'<div><span class="k">tiempo</span><span class="v">{elapsed_v:.1f}s</span></div>'
+            '</div></div>'
+        )
+    elif stacking.tuned_params:
+        n_splines = stacking.tuned_params.get("gam_n_splines", float("nan"))
+        lam = stacking.tuned_params.get("gam_lam", float("nan"))
+        tuning_html = (
+            '<div class="meta-tuning">'
+            '<div class="meta-tuning-title">Hiperparámetros (defaults de configuración)</div>'
+            '<div class="meta-tuning-grid">'
+            f'<div><span class="k">n_splines</span><span class="v">{int(n_splines) if np.isfinite(n_splines) else "—"}</span></div>'
+            f'<div><span class="k">lam</span><span class="v">{lam:.4f}</span></div>'
+            '</div></div>'
+        )
+
+    return f"""
+    <div class="tech-block">
+      <div class="eyebrow">Capa meta · {escape(stacking.meta_type.upper())} (stacking)</div>
+      <h3>¿Está la capa meta ayudando al modelo base?</h3>
+      <p class="lead">El modelo de producción combina un modelo base (XGB/LGB) y una capa meta (un modelo aditivo simple) que ajusta la predicción. El sistema sólo activa la capa meta si supera al base por al menos {stacking.fallback_threshold_pct:.1f}% en datos no vistos — si no, automáticamente cae al modelo base puro.</p>
+      {banner}
+      {kpis}
+      {features_table}
+      {tuning_html}
+      <p class="meta-tech-line">{escape(stacking.technical_line)}</p>
+    </div>
+    """
 
 
 def build_technical_section(
@@ -206,6 +562,8 @@ def build_technical_section(
     decision: dict,
     X_aligned: Optional[pd.DataFrame],
     abs_errors: np.ndarray,
+    real: np.ndarray,
+    stacking: Optional[StackingDiagnostics] = None,
 ) -> str:
     n_models = len(results)
     grid_cls = "models-grid"
@@ -225,7 +583,8 @@ def build_technical_section(
         _model_charts(r, is_winner=(r.model_type == champion.model_type))
         for r in ordered
     )
-    boxplots = _build_boxplot_block(X_aligned, abs_errors)
+    subgroup_block = _build_subgroup_block(X_aligned, abs_errors, real)
+    stacking_block = _build_stacking_block(stacking)
     justification = decision.get("justification", "")
     criteria = " → ".join(decision.get("decision_criteria", []))
 
@@ -242,6 +601,8 @@ def build_technical_section(
           <p class="lead">Criterio aplicado (orden estricto): {escape(criteria)}</p>
           <div class="justify-text">{escape(justification)}</div>
         </div>
+
+        {stacking_block}
 
         <div class="tech-block">
           <div class="eyebrow">Panel comparativo · KPIs por modelo</div>
@@ -260,8 +621,8 @@ def build_technical_section(
         <div class="tech-block">
           <div class="eyebrow">Errores por subgrupo · Campeón</div>
           <h3>¿Dónde se equivoca el modelo ganador?</h3>
-          <p class="lead">Distribución del error absoluto (KG/JR, OOF) del campeón <b>{escape(champion.model_type.upper())}</b>. Compara cada FORMATO y FUNDO contra el GLOBAL: los grupos con mediana mayor son los más problemáticos.</p>
-          {boxplots}
+          <p class="lead">Distribución del error absoluto (KG/JR, OOF) del campeón <b>{escape(champion.model_type.upper())}</b>. Cambia de pestaña para analizar cada dimensión: cada panel muestra el boxplot y una tabla con n, MAE, p50, p90, MAPE y desviación vs el global. Los grupos con MAPE más alto son los más problemáticos.</p>
+          {subgroup_block}
         </div>
       </div>
     </details>

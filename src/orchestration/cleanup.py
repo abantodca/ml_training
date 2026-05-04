@@ -10,13 +10,14 @@ import gc
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-import matplotlib
+import matplotlib.pyplot as plt
 import mlflow
 
 from src.config import REPORTS_DIR
 
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
+# matplotlib backend ya esta forzado a 'Agg' en src/__init__.py (side-effect
+# del paquete raiz). Importar pyplot aqui es seguro porque cualquier
+# `import src.*` carga primero el __init__ del paquete.
 
 
 def cleanup_state(logger, label: str) -> None:

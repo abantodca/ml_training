@@ -27,9 +27,11 @@ import pandas as pd
 from src.config import REPORT_PROJECT_NAME, REPORTS_DIR
 from src.step_05_evaluate.champion import ModelResult
 from src.step_05_evaluate.explainability import build_winner_kit
+from src.step_05_evaluate.feature_importance import FeatureImportanceResult
 from src.step_05_evaluate.html.sections import (
     build_actions_section,
     build_context_section,
+    build_feature_importance_section,
     build_guide_section,
     build_hero,
     build_mega_kpis,
@@ -47,6 +49,7 @@ def render_winner_dashboard(
     output_dir: Optional[Path] = None,
     excel_path: Optional[str] = None,
     X_raw: Optional[pd.DataFrame] = None,
+    feature_importance: Optional[FeatureImportanceResult] = None,
 ) -> Path:
     """Genera `reports/Winner_{variety}.html` y devuelve la ruta."""
     out_dir = Path(output_dir) if output_dir else REPORTS_DIR
@@ -54,21 +57,27 @@ def render_winner_dashboard(
     out_path = out_dir / f"Winner_{variety}.html"
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    kit = build_winner_kit(variety=variety, champion=champion, X_raw=X_raw)
+    kit = build_winner_kit(
+        variety=variety, champion=champion, X_raw=X_raw,
+        feature_importance=feature_importance,
+    )
 
     hero = build_hero(
         variety=variety, champion=champion, verdict=kit.verdict,
-        excel_path=excel_path, timestamp=ts,
+        excel_path=excel_path, timestamp=ts, stacking=kit.stacking,
     )
-    context_html = build_context_section(kit.context, champion)
+    context_html = build_context_section(kit.context, champion, stacking=kit.stacking)
     mega_kpis = build_mega_kpis(
         kit.abs_err, kit.real, kit.pred, kit.oof_mape, kit.oof_r2,
+        stacking=kit.stacking,
     )
     guide = build_guide_section()
     actions_html = build_actions_section(kit.actions)
+    fi_html = build_feature_importance_section(kit.feature_importance)
     technical = build_technical_section(
         results=results, champion=champion, decision=decision,
-        X_aligned=kit.X_aligned, abs_errors=kit.abs_err,
+        X_aligned=kit.X_aligned, abs_errors=kit.abs_err, real=kit.real,
+        stacking=kit.stacking,
     )
 
     html = f"""<!doctype html>
@@ -84,6 +93,7 @@ def render_winner_dashboard(
 {mega_kpis}
 {guide}
 {actions_html}
+{fi_html}
 {technical}
 <footer>Generado automáticamente por el pipeline de entrenamiento ML · {escape(ts)}</footer>
 </div>

@@ -1,12 +1,13 @@
 """Wrappers thin sobre MLflow para mantener `main.py` legible.
 
-Soporta tres modos:
-    1. Backend LOCAL (file://mlruns/)        - default cuando no hay env var.
-    2. Backend REMOTO (http://host:5000)     - via MLFLOW_TRACKING_URI.
-    3. Model Registry                        - al promover un modelo a "produccion".
+Modos soportados:
+    1. Backend LOCAL (file://mlruns/)         - default del proyecto.
+    2. Backend EXTERNO (http://host:5000)     - via MLFLOW_TRACKING_URI.
+    3. Model Registry                         - solo con backend SQL (no file://).
 
 El URI se resuelve UNA SOLA VEZ desde `src.config`, donde se lee la env var
-si existe.
+si existe; si no, file://mlruns/ local. La promocion al Model Registry
+requiere un backend SQL (file:// retorna None silenciosamente).
 """
 from __future__ import annotations
 
@@ -15,6 +16,7 @@ from typing import Dict, Optional
 
 import mlflow
 import mlflow.sklearn
+from mlflow.models import infer_signature
 
 from src.config import MLFLOW_TRACKING_URI, MODEL_REGISTRY_PREFIX
 
@@ -113,8 +115,6 @@ def log_pipeline(
     kwargs: Dict[str, object] = {}
     if X_sample is not None and y_sample is not None:
         try:
-            from mlflow.models import infer_signature
-
             kwargs["signature"] = infer_signature(X_sample, y_sample)
             kwargs["input_example"] = (
                 X_sample.head(3) if hasattr(X_sample, "head") else X_sample[:3]
@@ -147,7 +147,8 @@ def register_model(
 ) -> Optional[str]:
     """Registra el modelo del run en MLflow Model Registry con metadata rica.
 
-    Devuelve el nombre completo + version registrada (None si falla).
+    Devuelve el nombre completo + version registrada (None si falla o si
+    el backend no soporta Registry).
 
     Adicionalmente:
     - Setea description del Model Version con un resumen humano
@@ -156,13 +157,12 @@ def register_model(
     - Si `stage` esta en {Staging, Production}, transiciona y archiva las
       versiones anteriores en Production.
 
-    Backend file:// NO soporta registry: devuelve None silenciosamente
-    para que el pipeline no aborte cuando se corre en local.
-
-    Backend http:// (EC2 + Postgres): cualquier MlflowException es un
-    problema real (auth, schema, red), asi que la dejamos PROPAGAR para
-    que el caller la logue y el operador se entere. Antes la atrapabamos
-    silenciosamente y eso enmascaraba fallos en produccion.
+    Backend file:// NO soporta Registry (caso default del proyecto local):
+    devuelve None silenciosamente para que el pipeline no aborte. Para
+    versionado real apuntar MLFLOW_TRACKING_URI a un MLflow server con
+    backend SQL (sqlite:///, postgresql://, etc.) y dejar que `register_model`
+    transicione versiones; cualquier MlflowException en ese caso PROPAGA
+    al caller (auth/red/schema son fallos reales que deben verse).
     """
     model_name = f"{MODEL_REGISTRY_PREFIX}{variety}".strip("_")
     model_uri = f"runs:/{run_id}/{artifact_name}"
@@ -215,9 +215,9 @@ def register_model(
 
         return f"{model_name} v{mv.version}"
     except mlflow.exceptions.MlflowException:
-        # file://: no soporta registry, retorno silencioso esperado.
-        # http://: error real (auth/red/schema) -> propagar para que
-        # variety_runner lo capture y lo logue como excepcion.
+        # file://: no soporta Registry, retorno silencioso esperado (caso
+        # local-only default). Backend SQL: error real (auth/red/schema)
+        # -> propagar para que variety_runner lo capture y logue.
         if is_file_backend:
             return None
         raise

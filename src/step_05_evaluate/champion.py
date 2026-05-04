@@ -26,19 +26,15 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 
+from src.config import (
+    FULL_MAPE_TIE_TOLERANCE,
+    GAP_TIE_TOLERANCE,
+    META_PREFERENCE_DELTA_PCT,
+)
+
 if TYPE_CHECKING:
+    from src.step_05_evaluate.stacking_diagnostics import StackingDiagnostics
     from src.step_06_track.business_validation import BusinessValidation
-
-
-# Tolerancia "practica" sobre el |gap|. Dos modelos cuyo |gap| difiere en
-# menos de esto se consideran empate en estabilidad y se desempata por el
-# siguiente criterio. 0.5 pp del KG/JR_H suele estar dentro del ruido de CV
-# para datasets de 1k-10k filas.
-GAP_TIE_TOLERANCE: float = 0.005
-
-# Tolerancia sobre MAPE total (en %). Empate de rendimiento -> desempata por
-# tiempo. 0.5 pp de MAPE es ruido tipico entre seeds distintas.
-FULL_MAPE_TIE_TOLERANCE: float = 0.5
 
 
 @dataclass
@@ -75,6 +71,10 @@ class ModelResult:
     full_metrics_h: Optional[Dict[str, float]] = None  # KG/JR_H in-sample
     oof_y_true: Optional[np.ndarray] = None
     oof_y_pred: Optional[np.ndarray] = None
+    # Diagnóstico de la capa meta (stacking). None si el pipeline no es
+    # un StackedRegressor. Lo extrae `single_run` con duck typing para que
+    # el dashboard / Excel lo consuman sin reabrir el joblib.
+    stacking_diagnostics: Optional["StackingDiagnostics"] = None
     composite_score: float = field(init=False)
 
     def __post_init__(self) -> None:
@@ -123,16 +123,38 @@ def composite_score(
     return mae + 0.5 * gap
 
 
+def _meta_value_bucket(r: "ModelResult") -> int:
+    """Bucket de "valor real del stacking" para desempate.
+
+    Devuelve un entero menor (= mejor) cuando el modelo tiene la capa
+    meta activa Y mejora al base por mas de META_PREFERENCE_DELTA_PCT.
+    Si no hay stacking, fallback, o la mejora es ruido, todos comparten
+    el mismo bucket (sin preferencia). Asi el lex-order solo prefiere
+    stacking cuando aporta valor empiricamente.
+    """
+    diag = getattr(r, "stacking_diagnostics", None)
+    if diag is None or not diag.active:
+        return 0
+    if diag.delta_pct < META_PREFERENCE_DELTA_PCT:
+        return -1  # mejor (preferido)
+    return 0
+
+
 def _decision_key(r: "ModelResult") -> tuple:
     """Llave lex-order para `min(...)`. Aplica las tolerancias por bucket.
 
-    Bucket por gap: redondeamos a multiplos de GAP_TIE_TOLERANCE para que
-    diferencias por debajo del ruido caigan en el mismo bucket. Idem MAPE.
-    Cuando dos modelos comparten bucket, el siguiente criterio decide.
+    Orden de prioridad:
+      1. Bucket de |gap| (overfitting; empata si difiere < GAP_TIE_TOLERANCE).
+      2. Bucket de MAPE total (estabilidad; idem FULL_MAPE_TIE_TOLERANCE).
+      3. Bucket de "valor del stacking" (prefiere meta activo SOLO si aporta
+         > -META_PREFERENCE_DELTA_PCT de mejora real). Sin esto el ranking
+         seria insensible al stacking.
+      4. Tiempo de entrenamiento (eficiencia).
     """
     gap_bucket = round(r.abs_gap / GAP_TIE_TOLERANCE)
     mape_bucket = round(r.full_mape / FULL_MAPE_TIE_TOLERANCE)
-    return (gap_bucket, mape_bucket, r.elapsed_seconds)
+    meta_bucket = _meta_value_bucket(r)
+    return (gap_bucket, mape_bucket, meta_bucket, r.elapsed_seconds)
 
 
 def select_champion(results: List[ModelResult]) -> ModelResult:
@@ -211,11 +233,13 @@ def champion_summary(
         "decision_criteria": [
             "1_min_abs_gap (overfitting)",
             "2_min_full_mape (estabilidad data total)",
-            "3_min_elapsed_seconds (eficiencia)",
+            "3_meta_value (stacking activo con mejora real)",
+            "4_min_elapsed_seconds (eficiencia)",
         ],
         "tolerances": {
             "gap": GAP_TIE_TOLERANCE,
             "full_mape_pp": FULL_MAPE_TIE_TOLERANCE,
+            "meta_preference_delta_pct": META_PREFERENCE_DELTA_PCT,
         },
         "justification": _justification(champion, rivals),
         "ranking": [

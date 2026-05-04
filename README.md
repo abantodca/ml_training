@@ -11,10 +11,9 @@ Implementado con **scikit-learn** (Pipeline + transformers `BaseEstimator`),
 servidor remoto) para tracking + Model Registry, y un **dashboard HTML
 ejecutivo** autocontenido por variedad.
 
-**Despliegue:** `Taskfile.yml` orquesta todo (data → S3 → infra → train →
-fetch). **Infra:** Terraform provisiona VPC + 2 EC2 (MLflow t3.medium +
-training t3.large) + S3 privado con versioning + IAM/SG estrictos + Lambda
-power-manager para encender/apagar las EC2.
+**Entorno:** local-only (Windows / Linux). MLflow `file://mlruns/` por
+default. `Taskfile.yml` orquesta data split, smoke, training, MLflow UI
+local, logs y auditoría entre runs.
 
 > **Nota sobre el nombre del repo:** se llama `ml_random_forest` por razones
 > históricas. El pipeline actual entrena **XGBoost + LightGBM** (no Random
@@ -27,28 +26,12 @@ power-manager para encender/apagar las EC2.
 ```bash
 task setup                                                # instala deps
 task data:split                                           # split por VARIEDAD
-task smoke                                                # smoke (~2 min, POP, XGB+LGB)
-task train:local TUNING=dev VARIETIES=POP,JUPITER         # multi-variety
-task train:local TUNING=prod VARIETIES=all PARALLEL=4 STAGE=Staging
-mlflow ui --backend-store-uri file:./mlruns               # UI local
-```
-
-## Quick start (AWS, producción)
-
-```bash
-# 1) sube tu data al bucket
-task deploy:upload-data
-
-# 2) provisiona infra (lee infra/terraform.tfvars)
-task infra:up                                             # = infra:plan + infra:apply
-task infra:output                                         # bloque listo para .env
-
-# 3) one-shot: prende EC2 + sube código + entrena en paralelo
-task run TUNING=prod VARIETIES=all PARALLEL=4
-
-# 4) ve resultados (artifacts viven en S3 vía el MLflow tracking server)
-task mlflow:open
-task power:off                                            # apaga EC2 al terminar
+task smoke                                                # smoke (~1-2 min, POP, XGB+LGB)
+task train:local VARIETIES=POP,JUPITER                    # multi-variety
+task train:local VARIETIES=all PARALLEL=4 TUNING=prod     # paralelo
+task train:local VARIETIES=POP STACKING=gam               # con meta GAM
+task mlflow:ui                                            # UI MLflow en :5000
+task audit:compare -- --variety POP --last 5              # comparativa runs
 ```
 
 ## CLI directa (sin Taskfile)
@@ -76,6 +59,9 @@ python main.py --tuning prod --skip-final-tuning           # ahorra ~1/(outer+1)
 # registra campeón en Model Registry (requiere MLflow remoto con backend DB)
 python main.py --tuning prod --varieties POP --registry-stage Staging
 python main.py --tuning prod --varieties POP --no-register # desactiva el registry
+
+# stacking opt-in: envuelve el campeón en GAM como meta-learner
+python main.py --tuning dev --varieties POP --stacking gam
 ```
 
 ### Tuning profiles (`src/config.py`)
@@ -128,18 +114,14 @@ sobrescribir entre re-entrenamientos:
 ```
 ml_training/
 ├── main.py                                 # Entrypoint thin (parse + delega en orchestration/)
-├── Taskfile.yml                            # Tareas deploy / data / train / mlflow / infra / logs
-├── .env.example                            # Variables de entorno (S3, MLflow, SSH)
+├── Taskfile.yml                            # Tareas locales: setup / data / train / mlflow:ui / logs
+├── .env.example                            # Variables de entorno opcionales
 ├── requirements.txt, requirements-dev.txt
-├── infra/                                  # Terraform modular
-│   ├── main.tf, versions.tf, variables.tf, outputs.tf, terraform.tfvars.example
-│   ├── cloud-init/{mlflow_server,training_node}.sh
-│   └── modules/{network,storage,security,iam,ec2_instance,lambda_power}/
 ├── scripts/
 │   ├── prepare_data.py                     # split del acumulado por VARIEDAD
 │   ├── audit_compare.py                    # comparativa entre runs (lee logs/business_audit.jsonl)
 │   ├── clean_artifacts.py                  # GC de artifacts/ viejos (KEEP por variety+model)
-│   └── sh/                                  # 19 scripts .sh con la lógica del Taskfile
+│   └── sh/                                  # scripts .sh con la lógica del Taskfile
 └── src/
     ├── config.py                            # Esquema, rutas, seeds, MLflow URI, branding del reporte
     ├── utils/logger.py                      # setup_logging() archivo + consola
@@ -156,10 +138,12 @@ ml_training/
     ├── step_04_train/
     │   ├── model_xgb.py                     # get_xgb_model() — XGBRegressor envuelto en TTR
     │   ├── model_lgb.py                     # get_lgb_model() — LGBMRegressor (objective=quantile α=0.5)
-    │   ├── search_spaces.py                 # Espacios Optuna por backend (registry extensible)
+    │   ├── model_gam.py                     # get_gam_meta_model() — LinearGAM (pyGAM) para stacking
+    │   ├── search_spaces.py                 # Espacios Optuna por backend + meta (registries extensibles)
     │   ├── target_transform.py              # log1p + cap p99.5 vía TransformedTargetRegressor (CV-safe)
     │   ├── oof_ensemble.py                  # K refits sobre folds; predict promedia las K
-    │   └── tuning.py                        # perform_nested_cv() + sample_weights + CV adaptativo
+    │   ├── stacking.py                      # StackedRegressor — campeón → GAM (opt-in via --stacking gam)
+    │   └── tuning.py                        # perform_nested_cv() + sample_weights + CV adaptativo + stacking_meta
     ├── step_05_evaluate/
     │   ├── metrics.py                       # MAE, RMSE, R², MAPE
     │   ├── diagnostics.py                   # gráficos matplotlib → base64 PNG
@@ -295,6 +279,34 @@ Las divisiones usan `np.where(den > 0, num/den, NaN)`; los NaN resultantes son t
 - **Sample weights** (`tuning.compute_sample_weights`): pesos inversos a la densidad del target con bins de IGUAL ANCHO (no qcut), cap=5×, normalizados a media=1. Compensa el sesgo "regresión a la media" de los árboles dando más peso a deciles raros (target alto/bajo).
 - **`OOFEnsembleRegressor`** (`oof_ensemble.py`): refit final = K=5 pipelines clonados, cada uno entrenado en `(K−1)/K` del dataset según un `KFold`; `predict()` promedia las K predicciones. Reduce varianza ~5–10% del modelo de producción a costa de 5× el tiempo del refit final (despreciable vs nested CV). `K=1` degenera al modo legacy bit-for-bit.
 
+### Stacking (capa GAM, opt-in)
+
+Activado con `--stacking gam` (default `none` → comportamiento bit-for-bit idéntico al actual). Envuelve el campeón XGB/LGB en `StackedRegressor`, que en cascada hace:
+
+```
+fit(X, y):
+    1. KFold(STACKING_OOF_FOLDS) sobre X → oof_pred (predicciones honestas del base)
+    2. meta_features = [oof_pred, X[STACKING_X_SUBSET] imputado por mediana]
+    3. LinearGAM (pyGAM) fit(meta_features, y, weights=sample_weight)
+    4. base.fit(X, y) sobre TODO X (lo que se usa en inferencia)
+
+predict(X):
+    pred_base = base.predict(X)
+    return gam.predict([pred_base, X[STACKING_X_SUBSET] imputado])
+```
+
+**Por qué GAM y no Ridge / red neuronal**: con 3-4 features de entrada al meta y N≈10k filas, el GAM aporta no-linealidad suave por término (`s(pred_base) + s(KG/HA) + s(%INDUS) + s(DIA_COSECHA)`) que los árboles aproximan con escalones; un ridge sería demasiado rígido y una red neuronal sufriría con N tan chico. La interpretabilidad de los splines es un bonus para el dashboard.
+
+**Por qué SOLO un subset de features al meta**: pasarle al GAM las ~50 columnas que ve el base (raw + lags + ratios + dummies) sería curse-of-dim — el GAM diverge. El subset por default (`config.STACKING_X_SUBSET = ["KG/HA", "%INDUS", "DIA_COSECHA"]`) son las 3 features continuas con MI más alta y efectos típicamente suaves no capturados por splits.
+
+**Por qué los lags `KG_JR_H_lag_*` no van al meta**: ya cumplen función de target encoding temporal multi-window dentro del base. Pasarlos al GAM además duplicaría señal y complicaría el OOF del meta (riesgo de leakage cruzado entre el lag CV y el stacking CV).
+
+**OOF doble + paridad**: el nested CV (outer 5 × inner 3) sigue midiendo el **base puro**. Las métricas `nested_cv_mae_mean`, `nested_cv_gap_mean`, `nested_cv_r2_mean` quedan comparables con runs históricos. La capa GAM solo afecta el `final_pipeline.predict()` y la `business_validation` (KG/JR refit + predict all). Si querés evaluar el stacking de forma honesta, comparalo via `task audit:compare` filtrando por `tag.stacked=true` en MLflow.
+
+**Backend**: cero cambios. `mlflow.pyfunc.load_model("rnd-forest-{variety}").predict(X_raw)` carga el `StackedRegressor` y la cascada base→meta es interna al wrapper. La signature de MLflow es la misma porque las features de entrada son idénticas.
+
+**MLflow tags**: cada run loguea `stacked=true|false` y `meta_model=gam` cuando aplica. Filtrable directo en la UI.
+
 ### Validación en unidad de negocio
 
 `KG/JR_H` (kg/jornal-hora) es la unidad del modelo, pero la unidad
@@ -365,6 +377,7 @@ así por:
 |---|---|
 | Overfitting | Cada outer fold reporta `MAE_train`, `MAE_test`, `gap`. El reporte HTML agrega "Análisis de overfitting" con verdict (verde/amarillo/rojo) según gap. El selector de campeón usa `|gap|` como **primer** criterio. |
 | Selección multi-modelo | `select_champion` con lex-order estricto + tolerancias por bucket. Justificación textual auto-generada. |
+| Stacking opcional | `--stacking gam` envuelve el campeón en `StackedRegressor` con pyGAM como meta. OOF interno via `cross_val_predict` (K=5). Default off → paridad bit-for-bit. Backend sin cambios. |
 | Estabilidad varianza | `TransformedTargetRegressor` (log1p + cap p99.5 CV-safe) + `OOFEnsembleRegressor` (K=5 refits promediados). |
 | Compensación cola | `compute_sample_weights` por bins de igual ancho del target (cap=5×). |
 | MLflow run | Tags clave (`r2_mean`, `mae_test_mean`, `mae_train_mean`, `overfit_gap`, `composite_score`) → filtros directos en la UI. |
@@ -377,9 +390,4 @@ así por:
 | Group-rare | `RARE_MIN_COUNT=50` en FORMATO: categorías con `n<50` se colapsan a `OTROS` antes del one-hot. |
 | Auditoría JSONL | `logs/business_audit.jsonl` (1 línea por run); `task audit:compare -- --variety POP --last 5` para comparativas. |
 | Cleanup artifacts | `task clean:artifacts KEEP=10` conserva los últimos N runs por variety+model. |
-| Infra estable | **Elastic IPs** en ambas EC2 → DNS no cambia tras stop/start. |
-| Costo S3 | Lifecycle: versiones viejas de `mlflow-artifacts/` expiran a 30d, `code/` a 14d, multipart abortados a 7d. |
-| Encriptación | EBS y S3 con AES256, S3 con `public_access_block` total. |
-| Lambda power-manager | `task power:on/off/status` enciende/apaga las EC2 sin tocar la consola AWS (cuida costo). |
-| Venv en remoto | `.env` de la EC2 expone `PYTHON=/opt/.../venv/bin/python`; el Taskfile usa `{{.PYTHON}}` → `task` corre con el intérprete correcto incluso vía SSH no-interactivo. |
-| Outputs Terraform | Bloque `env_block_for_dotenv` listo para pegar — un solo paso para conectar tu `.env` local con la infra recién provisionada. |
+| Venv portátil | `.env` (opcional) puede exponer `PYTHON=/path/a/venv/bin/python`; el Taskfile usa `{{.PY}}` → corre con el intérprete correcto sin necesidad de activar el venv. |

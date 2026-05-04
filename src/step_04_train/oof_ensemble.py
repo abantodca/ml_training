@@ -22,6 +22,11 @@ from sklearn.base import BaseEstimator, RegressorMixin, clone
 from sklearn.model_selection import KFold
 from sklearn.pipeline import Pipeline
 
+from src.utils.sklearn_helpers import (
+    fit_with_optional_sample_weight,
+    index_or_none,
+)
+
 
 class OOFEnsembleRegressor(BaseEstimator, RegressorMixin):
     """K pipelines refiteados; predict() promedia.
@@ -68,7 +73,7 @@ class OOFEnsembleRegressor(BaseEstimator, RegressorMixin):
 
         if self.n_models == 1:
             pipe = clone(self.base_pipeline)
-            self._fit_one(pipe, X, y, sample_weight)
+            fit_with_optional_sample_weight(pipe, X, y, sample_weight)
             self.models_ = [pipe]
             return self
 
@@ -82,10 +87,8 @@ class OOFEnsembleRegressor(BaseEstimator, RegressorMixin):
             pipe = clone(self.base_pipeline)
             X_tr = X.iloc[tr_idx]
             y_tr = y.iloc[tr_idx]
-            sw_tr = (
-                sample_weight[tr_idx] if sample_weight is not None else None
-            )
-            self._fit_one(pipe, X_tr, y_tr, sw_tr)
+            sw_tr = index_or_none(sample_weight, tr_idx)
+            fit_with_optional_sample_weight(pipe, X_tr, y_tr, sw_tr)
             models.append(pipe)
         self.models_ = models
         return self
@@ -93,15 +96,3 @@ class OOFEnsembleRegressor(BaseEstimator, RegressorMixin):
     def predict(self, X) -> np.ndarray:
         preds = np.column_stack([m.predict(X) for m in self.models_])
         return preds.mean(axis=1)
-
-    @staticmethod
-    def _fit_one(
-        pipe: Pipeline,
-        X: pd.DataFrame,
-        y: pd.Series,
-        sample_weight: Optional[np.ndarray],
-    ) -> None:
-        if sample_weight is not None:
-            pipe.fit(X, y, regressor__sample_weight=sample_weight)
-        else:
-            pipe.fit(X, y)

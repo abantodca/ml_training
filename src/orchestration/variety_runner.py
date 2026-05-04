@@ -13,18 +13,19 @@ Logica:
   7. Registra UNICAMENTE el campeon en MLflow Model Registry (si --register).
   8. Persiste un `variety_summary_<NAME>.json` con todo el contexto.
 """
+
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import time
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 import mlflow
 
-from src.config import ARTIFACTS_DIR, REPORTS_DIR
+from src.config import ARTIFACTS_DIR, CHAMPION_MAX_GAP, CHAMPION_MAX_MAPE, REPORTS_DIR
 from src.orchestration.cleanup import cleanup_residual_reports, cleanup_state
 from src.orchestration.single_run import train_model
 from src.step_01_load.data_loader import load_business_columns, load_data
@@ -33,10 +34,15 @@ from src.step_05_evaluate.champion import (
     champion_summary,
     select_champion,
 )
+from src.step_05_evaluate.feature_importance import (
+    FeatureImportanceResult,
+    compute_feature_importance,
+)
 from src.step_05_evaluate.html.winner_dashboard import render_winner_dashboard
 from src.step_06_track.business_export import export_business_excel
 from src.step_06_track.mlflow_registry import register_model, set_experiment
 from src.utils.logger import setup_logging
+from src.utils.sklearn_helpers import dump_json_artifact
 
 
 def train_variety(
@@ -95,25 +101,59 @@ def train_variety(
             f"dt={champion.elapsed_seconds:.1f}s | "
             f"composite_aux={champion.composite_score:.4f}"
         )
-        logger.info(f"[{variety}] Decision: {champion_decision.get('justification', '')}")
+        logger.info(
+            f"[{variety}] Decision: {champion_decision.get('justification', '')}"
+        )
 
-        # Cargar (X, business_cols) UNA sola vez. Antes se recargaba 2-3
+        # --- Quality gate: rechazar campeon si supera umbrales minimos ---
+        mape_ok = champion.full_mape <= CHAMPION_MAX_MAPE
+        gap_ok = (champion.abs_gap * 100) <= CHAMPION_MAX_GAP
+        if not mape_ok or not gap_ok:
+            logger.warning(
+                f"[{variety}] CAMPEON rechazado por quality gate | "
+                f"MAPE={champion.full_mape:.2f}% (max={CHAMPION_MAX_MAPE}%) | "
+                f"gap={champion.abs_gap * 100:.2f}pp (max={CHAMPION_MAX_GAP}pp) | "
+                f"El modelo NO se registrara en MLflow Registry."
+            )
+            args_register = False
+        else:
+            args_register = args.register_model
+
+        # Cargar (X, y, business_cols) UNA sola vez. Antes se recargaba 2-3
         # veces (Excel + Dashboard + render). single_run las libera al
         # terminar; el costo aqui es leer 1 hoja del Excel (~10k filas).
         try:
-            X_full, business_full = _load_variety_inputs(variety)
+            X_full, y_full, business_full = _load_variety_inputs(variety)
         except Exception:
             logger.exception(
                 f"[{variety}] no se pudo recargar data para outputs ejecutivos"
             )
             X_full = None
+            y_full = None
             business_full = None
+
+        # ---- Permutation importance (post-hoc, sobre el champion + dataset full) ----
+        # Tarda 3-8 min sobre 10k filas / 38 features. Lo hacemos antes del
+        # Excel/HTML para que el dashboard ya incluya la seccion. Si falla,
+        # logueamos y continuamos sin la seccion.
+        feature_importance: Optional[FeatureImportanceResult] = None
+        if X_full is not None and y_full is not None:
+            feature_importance = _compute_feature_importance(
+                champion=champion,
+                X=X_full,
+                y=y_full,
+                variety=variety,
+                logger=logger,
+            )
 
         # ---- Excel del CAMPEON aplicado a la data real ----
         # Una sola Excel por variedad, en reports/ junto al HTML.
         winner_excel_path = _export_winner_excel(
-            champion=champion, variety=variety, logger=logger,
-            X_raw=X_full, business_cols=business_full,
+            champion=champion,
+            variety=variety,
+            logger=logger,
+            X_raw=X_full,
+            business_cols=business_full,
         )
 
         # ---- Dashboard ejecutivo unico (Winner_{variety}.html) ----
@@ -126,6 +166,7 @@ def train_variety(
                     decision=champion_decision,
                     excel_path=winner_excel_path,
                     X_raw=X_full,
+                    feature_importance=feature_importance,
                 )
                 winner_report_path = str(winner_path)
                 logger.info(f"[{variety}] Winner dashboard: {winner_path}")
@@ -142,14 +183,21 @@ def train_variety(
                 logger.exception(f"[{variety}] no se pudo construir Winner dashboard")
 
         _tag_champion(
-            champion, results, variety, champion_decision, logger,
+            champion,
+            results,
+            variety,
+            champion_decision,
+            logger,
             winner_report_path=winner_report_path,
             winner_excel_path=winner_excel_path,
         )
 
-        if args.register_model:
+        if args_register:
             registered_name = _register_champion(
-                champion, variety, args, logger,
+                champion,
+                variety,
+                args,
+                logger,
                 winner_report_path=winner_report_path,
             )
 
@@ -180,23 +228,90 @@ def train_variety(
             for r in results
         ],
     }
-    summary_path = ARTIFACTS_DIR / f"variety_summary_{variety}.json"
-    summary_path.write_text(
-        json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8",
+    dump_json_artifact(
+        ARTIFACTS_DIR / f"variety_summary_{variety}.json",
+        summary,
     )
     return summary
 
 
 def _load_variety_inputs(variety: str):
-    """Recarga (X, business_cols) desde disco para la variedad indicada.
+    """Recarga (X, y, business_cols) desde disco para la variedad indicada.
 
-    Se usa al construir el dashboard ganador y el Excel del campeon, despues
-    de que `single_run` libero las matrices grandes en su `del`. Es barato:
+    Se usa al construir el dashboard ganador, el Excel del campeon, y el
+    permutation_importance del feature importance, despues de que
+    `single_run` libero las matrices grandes en su `del`. Es barato:
     una hoja del Excel de training (~10k filas).
     """
-    X, _y = load_data(sheet=variety)
+    X, y = load_data(sheet=variety)
     business_cols = load_business_columns(sheet=variety)
-    return X, business_cols
+    return X, y, business_cols
+
+
+def _compute_feature_importance(
+    *,
+    champion: ModelResult,
+    X,
+    y,
+    variety: str,
+    logger,
+) -> Optional[FeatureImportanceResult]:
+    """Carga el pipeline del champion, corre permutation_importance y persiste.
+
+    Persiste:
+      - reports/feature_importance_<variety>.csv (lectura humana)
+      - mlflow log_artifact en el run del champion (auditoria)
+      - tags resumen en el run (top1 feature, n_core/util/podable/ruido)
+
+    Devuelve el FeatureImportanceResult para que el caller lo inyecte al
+    HTML. Si algo falla, loguea y devuelve None (la seccion del HTML se
+    omite, el resto del pipeline sigue normal).
+    """
+    import joblib
+
+    try:
+        pipeline = joblib.load(champion.pipeline_path)
+    except Exception:
+        logger.exception(
+            f"[{variety}] no se pudo cargar el pipeline para permutation_importance"
+        )
+        return None
+
+    try:
+        fi = compute_feature_importance(pipeline, X, y, n_repeats=10)
+    except Exception:
+        logger.exception(
+            f"[{variety}] permutation_importance fallo (no bloquea el training)"
+        )
+        return None
+
+    # Persistir CSV en reports/
+    try:
+        csv_path = REPORTS_DIR / f"feature_importance_{variety}.csv"
+        fi.df.to_csv(csv_path, index=False)
+        logger.info(f"[{variety}] Feature importance CSV: {csv_path}")
+    except Exception:
+        logger.exception(f"[{variety}] no se pudo escribir feature_importance.csv")
+        csv_path = None
+
+    # Log a MLflow en el run del champion + tags resumen
+    try:
+        run_id = champion.mlflow_run_id
+        client = mlflow.tracking.MlflowClient()
+        if csv_path is not None:
+            client.log_artifact(run_id=run_id, local_path=str(csv_path))
+        for k, v in fi.to_dict_summary().items():
+            if isinstance(v, (int, float)):
+                client.log_metric(run_id=run_id, key=k, value=float(v))
+            else:
+                client.set_tag(run_id=run_id, key=k, value=str(v))
+    except Exception:
+        logger.exception(
+            f"[{variety}] no se pudo loguear feature_importance a MLflow run "
+            f"{champion.mlflow_run_id}"
+        )
+
+    return fi
 
 
 def _export_winner_excel(
@@ -228,9 +343,7 @@ def _export_winner_excel(
         "y_pred": champion.oof_y_pred,
     }
     if oof["y_true"] is None or oof["y_pred"] is None or bv is None:
-        logger.warning(
-            f"[{variety}] sin datos OOF/business para Excel del campeon"
-        )
+        logger.warning(f"[{variety}] sin datos OOF/business para Excel del campeon")
         return None
 
     try:
@@ -291,21 +404,22 @@ def _tag_champion(
             f"{champion.composite_score:.6f}",
         )
         client.set_tag(
-            champion.mlflow_run_id, "champion_abs_gap",
+            champion.mlflow_run_id,
+            "champion_abs_gap",
             f"{champion.abs_gap:.6f}",
         )
         client.set_tag(
-            champion.mlflow_run_id, "champion_full_mape",
+            champion.mlflow_run_id,
+            "champion_full_mape",
             f"{champion.full_mape:.4f}",
         )
         for r in results:
             if r.mlflow_run_id != champion.mlflow_run_id:
                 client.set_tag(r.mlflow_run_id, "is_champion", "false")
 
-        decision_path = ARTIFACTS_DIR / f"champion_{variety}.json"
-        decision_path.write_text(
-            json.dumps(champion_decision, indent=2, ensure_ascii=False),
-            encoding="utf-8",
+        decision_path = dump_json_artifact(
+            ARTIFACTS_DIR / f"champion_{variety}.json",
+            champion_decision,
         )
         summary_path = ARTIFACTS_DIR / f"variety_summary_{variety}.json"
 
@@ -340,17 +454,17 @@ def _register_champion(
         f"{champion.model_type} (run={champion.mlflow_run_id[:8]}...)"
     )
     if winner_report_path:
-        html_filename = winner_report_path.replace("\\", "/").rsplit("/", 1)[-1]
         report_uri = (
-            f"runs:/{champion.mlflow_run_id}/winner_dashboard/{html_filename}"
+            f"runs:/{champion.mlflow_run_id}/winner_dashboard/"
+            f"{Path(winner_report_path).name}"
         )
     else:
         report_uri = None
-    # register_model devuelve None solo cuando el backend es file:// (caso
-    # esperado en local). Si el backend es http:// y algo falla, levanta
-    # MlflowException; lo capturamos aqui para no abortar la variedad
-    # completa por un fallo del Registry (el modelo ya esta entrenado y
-    # logueado).
+    # register_model devuelve None cuando el backend es file:// (caso default
+    # del proyecto local). Si MLFLOW_TRACKING_URI apunta a un backend SQL y
+    # algo falla, MlflowException PROPAGA; la capturamos aqui para no
+    # abortar la variedad por un fallo del Registry (el modelo ya esta
+    # entrenado y logueado en el run).
     try:
         registered_name = register_model(
             run_id=champion.mlflow_run_id,
@@ -368,8 +482,8 @@ def _register_champion(
         )
     except Exception:
         logger.exception(
-            f"[{variety}] register_model FALLO en backend remoto "
-            "(auth/red/schema). El run sigue logueado pero NO se registro version."
+            f"[{variety}] register_model FALLO (auth/red/schema). "
+            "El run sigue logueado pero NO se registro version."
         )
         return None
     if registered_name:
@@ -377,6 +491,6 @@ def _register_champion(
     else:
         logger.warning(
             f"[{variety}] Registry no disponible (backend file://); "
-            "en EC2 con Postgres si funciona el versionado"
+            "para versionado configura MLFLOW_TRACKING_URI con un SQL backend."
         )
     return registered_name

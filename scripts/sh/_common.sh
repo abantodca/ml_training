@@ -4,15 +4,16 @@
 
 set -euo pipefail
 
-# Defaults sanos
+# Default sano: si .env no override-a, `python` del PATH (con venv activo
+# es lo deseable) corre el codigo. Override con PYTHON=... en .env.
 : "${PYTHON:=python}"
-: "${AWS_REGION:=us-east-1}"
 
 # Logger compacto
 log() { printf '\033[1;34m[task]\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m[task ERROR]\033[0m %s\n' "$*" >&2; exit 1; }
 
-# require VAR1 VAR2 ... -> aborta si alguna esta vacia
+# require VAR1 VAR2 ... -> aborta si alguna esta vacia (sin uso real ahora
+# que no hay infra; se mantiene por si algun script futuro la necesita).
 require() {
   local missing=()
   for v in "$@"; do
