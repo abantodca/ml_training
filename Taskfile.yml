@@ -21,8 +21,9 @@
 #
 # Variables overrideables por CLI (defaults vienen aqui mismo):
 #   VARIETIES = lista CSV de variedades o "all" (default POP)
-#   TUNING    = smoke (~1 min) | dev (~20 min) |
-#               prod (~1.5h, default) | prod_xl (~2.5h)
+#   TUNING    = smoke (~1 min, 2x2 CV)   | dev (~20 min, 3x3 CV) |
+#               prod (~1.5-2.5h, 5x3 CV) | prod_xl (~5-6h, 6x3 CV)
+#               prod_xl escala trials Y CV (caso extremo). Default: prod.
 #   MODEL     = auto (default, xgb + lgb compiten lex-order) | xgb | lgb |
 #               combinaciones CSV ("xgb,lgb")
 #   PARALLEL  = variedades a entrenar en paralelo (default 1).
@@ -111,7 +112,7 @@ tasks:
   # PARALLEL=1.
 
   train:
-    desc: "Entrena variedades. Vars: VARIETIES=POP|POP,VENTURA|all  TUNING=smoke|dev|prod|prod_xl  MODEL=auto|lgb|xgb|xgb,lgb  PARALLEL=N"
+    desc: "Entrena variedades. Vars: VARIETIES=POP|POP,VENTURA|all  TUNING=smoke(2x2 CV)|dev(3x3)|prod(5x3, default)|prod_xl(6x3, exhaustivo)  MODEL=auto|lgb|xgb|xgb,lgb  PARALLEL=N"
     env:
       MLFLOW_TRACKING_URI: ""
     cmds:

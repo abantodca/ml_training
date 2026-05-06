@@ -184,10 +184,10 @@ FULL_MAPE_TIE_TOLERANCE: float = 0.5
 # NO confundir con entornos (local vs aws): el tuning es ortogonal al entorno.
 #
 # Tiempo estimado para 10k filas, 16 features, modelos XGB/LGB:
-#   smoke   : ~1 min   (verificar que nada se rompe)
-#   dev     : ~10 min  (iteracion durante desarrollo)
-#   prod    : ~1.5 h   (modelo a promover)
-#   prod_xl : ~2.5 h   (baseline contra el cual medir si mas trials mueven MAPE)
+#   smoke   : ~1 min      (verificar que nada se rompe)
+#   dev     : ~20 min     (iteracion durante desarrollo)
+#   prod    : ~1.5-2.5 h  (modelo a promover)
+#   prod_xl : ~5-6 h      (baseline overnight: +1 outer fold y 2x trials vs prod)
 TUNING_PROFILES: dict[str, dict[str, int]] = {
     "smoke": {
         "n_trials": 5,
@@ -210,7 +210,7 @@ TUNING_PROFILES: dict[str, dict[str, int]] = {
     "prod_xl": {
         "n_trials": 100,
         "final_trials": 50,
-        "outer_folds": 5,
+        "outer_folds": 6,
         "inner_folds": 3,
     },
 }

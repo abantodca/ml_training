@@ -19,9 +19,18 @@ ENTORNO:
 
 --- TRAINING ---------------------------------------------------------------
    task train VARIETIES=POP                       Entrena 1 variedad (TUNING=prod default)
-   task train VARIETIES=POP TUNING=dev            Baseline rapido (~20 min)
-   task train VARIETIES=POP TUNING=prod           Produccion (~1.5h, default)
+   task train VARIETIES=POP TUNING=smoke          Sanity rapidisimo  (~1 min,  13 trials, 2x2 CV)
+   task train VARIETIES=POP TUNING=dev            Baseline rapido    (~20 min, 70 trials, 3x3 CV)
+   task train VARIETIES=POP TUNING=prod           Produccion default (~1.5-2.5h, 330 trials, 5x3 CV)
+   task train VARIETIES=POP TUNING=prod_xl        Busqueda exhaustiva (~5-6h, 650 trials, 6x3 CV)
    task train VARIETIES=POP,VENTURA               Varias variedades
+
+   Cada perfil escala en TRES ejes (no solo trials):
+     - smoke    -> dev   : trials 5.4x | CV  4 -> 9  fits/trial
+     - dev      -> prod  : trials 4.7x | CV  9 -> 15 fits/trial
+     - prod     -> prod_xl: trials 2.0x | CV 15 -> 18 fits/trial (+1 outer fold)
+   prod_xl escala trials Y CV. Util cuando prod queda borderline o como
+   baseline overnight para validar casos extremos.
 
    Cada variedad es independiente: si una falla, las demas continuan.
    Pipeline:  XGB vs LGB  ->  champion por variedad
