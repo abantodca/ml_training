@@ -11,14 +11,81 @@ requiere un backend SQL (file:// retorna None silenciosamente).
 """
 from __future__ import annotations
 
+import logging
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Callable, Dict, Iterator, Optional
 
 import mlflow
 import mlflow.sklearn
+from mlflow.exceptions import MlflowException
 from mlflow.models import infer_signature
 
-from src.config import MLFLOW_TRACKING_URI, MODEL_REGISTRY_PREFIX
+from src.config import MLFLOW_TRACKING_URI, MLRUNS_ARTIFACT_LOCATION, MODEL_REGISTRY_PREFIX
+
+_logger = logging.getLogger(__name__)
+
+
+def _is_inactive_run_error(exc: MlflowException) -> bool:
+    """True si la excepcion proviene de operar sobre un run no-activo.
+
+    Pasa cuando el run fue marcado como `deleted` externamente (UI de MLflow,
+    rm -rf mlruns/, otro proceso) entre `start_run()` y la llamada de logging.
+    El mensaje de MLflow incluye 'active' lifecycle_stage en ese caso.
+    """
+    msg = str(exc).lower()
+    return "lifecycle_stage" in msg or "must be in 'active'" in msg
+
+
+@contextmanager
+def safe_start_run(run_name: str) -> Iterator[mlflow.ActiveRun]:
+    """Context manager equivalente a `mlflow.start_run` pero no aborta si el
+    run queda inactivo durante el training.
+
+    El `with mlflow.start_run()` nativo llama `set_terminated` en `__exit__`,
+    y si el run fue marcado como `deleted` externamente (UI de MLflow,
+    `rm -rf mlruns/`, otro proceso) ese set_terminated lanza MlflowException
+    y derriba el train_model entero — perdiendo el modelo ya entrenado.
+
+    Aqui hacemos start manual, dejamos que el cuerpo corra, y al salir
+    intentamos `end_run()`; si falla por lifecycle_stage, lo absorbemos
+    (warning) en vez de propagar.
+    """
+    run = mlflow.start_run(run_name=run_name)
+    try:
+        yield run
+    finally:
+        try:
+            mlflow.end_run()
+        except MlflowException as exc:
+            if _is_inactive_run_error(exc):
+                _logger.warning(
+                    "MLflow end_run ignorado: run inactivo (lifecycle_stage). "
+                    "El modelo se persistio localmente; sigue el pipeline."
+                )
+            else:
+                raise
+
+
+def _safe_mlflow_call(fn: Callable, op_name: str) -> None:
+    """Invoca `fn()` y absorbe MlflowException por run inactivo con un warning.
+
+    Cualquier otro MlflowException PROPAGA (auth/red/schema son errores reales).
+    El objetivo es que un run borrado externamente no aborte un training de
+    1+ hora. El pipeline ya esta entrenado para cuando se loguea, asi que
+    perderlo solo porque MLflow no acepta un log_metric es desproporcionado.
+    """
+    try:
+        fn()
+    except MlflowException as exc:
+        if _is_inactive_run_error(exc):
+            _logger.warning(
+                "MLflow %s ignorado: el run quedo inactivo (lifecycle_stage). "
+                "El modelo ya esta entrenado y persistido localmente.",
+                op_name,
+            )
+            return
+        raise
 
 
 def init_mlflow(
@@ -36,7 +103,25 @@ def init_mlflow(
 
 
 def set_experiment(experiment_name: str) -> None:
-    """Wrapper thin sobre `mlflow.set_experiment`. Lo crea si no existe."""
+    """Wrapper sobre `mlflow.set_experiment` con artifact_location explicito.
+
+    Si el experimento NO existe, lo crea con `artifact_location` apuntando a
+    `mlruns/artifacts/<exp_id>/` (consistente con backend sqlite local). Sin
+    esto MLflow usaria su default `./mlartifacts/`, fragmentando el store
+    local entre `mlruns/mlflow.db` (metadata sqlite) y `mlartifacts/`
+    (artifacts).
+
+    Si el experimento YA existe, conserva su `artifact_location` historico
+    (no lo modifica) -- evita romper experimentos creados antes de la
+    migracion sqlite.
+    """
+    client = mlflow.tracking.MlflowClient()
+    exp = client.get_experiment_by_name(experiment_name)
+    if exp is None:
+        mlflow.create_experiment(
+            name=experiment_name,
+            artifact_location=MLRUNS_ARTIFACT_LOCATION,
+        )
     mlflow.set_experiment(experiment_name)
 
 
@@ -68,7 +153,7 @@ def next_run_version(experiment_name: str, model_type: str) -> int:
 def log_metrics(metrics: Dict[str, float]) -> None:
     safe = {k: float(v) for k, v in metrics.items() if v is not None}
     if safe:
-        mlflow.log_metrics(safe)
+        _safe_mlflow_call(lambda: mlflow.log_metrics(safe), "log_metrics")
 
 
 def log_business_metrics(business_validation) -> None:
@@ -97,7 +182,7 @@ def log_business_metrics(business_validation) -> None:
 def log_params(params: Dict[str, object]) -> None:
     safe = {k: v for k, v in params.items() if v is not None}
     if safe:
-        mlflow.log_params(safe)
+        _safe_mlflow_call(lambda: mlflow.log_params(safe), "log_params")
 
 
 def log_pipeline(
@@ -122,18 +207,24 @@ def log_pipeline(
         except Exception:
             # signature no es critico; preferimos loguear que abortar
             pass
-    mlflow.sklearn.log_model(pipeline, name, **kwargs)
+    _safe_mlflow_call(
+        lambda: mlflow.sklearn.log_model(pipeline, name, **kwargs),
+        "log_pipeline",
+    )
 
 
 def set_tags(tags: Dict[str, object]) -> None:
     """MLflow exige tags como str; se castea defensivamente."""
     safe = {k: ("" if v is None else str(v)) for k, v in tags.items()}
     if safe:
-        mlflow.set_tags(safe)
+        _safe_mlflow_call(lambda: mlflow.set_tags(safe), "set_tags")
 
 
 def log_artifact(path: str | Path, artifact_path: Optional[str] = None) -> None:
-    mlflow.log_artifact(str(path), artifact_path=artifact_path)
+    _safe_mlflow_call(
+        lambda: mlflow.log_artifact(str(path), artifact_path=artifact_path),
+        "log_artifact",
+    )
 
 
 def register_model(

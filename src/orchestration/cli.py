@@ -16,15 +16,12 @@ from src.config import (
     DEFAULT_VARIETIES,
     MLFLOW_EXPERIMENT_PREFIX,
     MODEL_TYPE_DEFAULT,
-    STACKING_DEFAULT,
     TUNING_PROFILES,
 )
 from src.step_01_load.data_loader import list_varieties
 from src.step_04_train.registry import valid_backends
-from src.step_04_train.search_spaces import META_SEARCH_SPACE_REGISTRY
 
 VALID_MODELS = valid_backends()
-VALID_STACKING = ["none"] + sorted(META_SEARCH_SPACE_REGISTRY)
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -104,29 +101,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "evitar oversubscription."
         ),
     )
-    parser.add_argument(
-        "--stacking",
-        choices=VALID_STACKING,
-        default=STACKING_DEFAULT,
-        help=(
-            "Meta-learner sobre el campeon (XGB/LGB). 'none' (default) = "
-            "el campeon predice directo. 'gam' = envuelve en StackedRegressor "
-            "con un pyGAM como meta. El backend NO necesita cambios: el "
-            "wrapper expone predict() como cualquier pipeline. Costo extra: "
-            "~1x el tiempo del refit final por el cross_val_predict del meta."
-        ),
-    )
-    parser.add_argument(
-        "--meta-trials",
-        type=int,
-        default=None,
-        help=(
-            "Trials de Optuna para tunear el GAM meta (n_splines, lam) "
-            "sobre las OOF preds del Stacked. None (default) = usa el "
-            "presupuesto del perfil de tuning. 0 = sin tuning, usa los "
-            "defaults de config. Solo aplica si --stacking=gam."
-        ),
-    )
     return parser.parse_args(argv)
 
 
@@ -138,15 +112,11 @@ def resolve_settings(args: argparse.Namespace) -> dict[str, int | bool | str]:
         "final_trials": args.final_trials,
         "outer_folds": args.outer_folds,
         "inner_folds": args.inner_folds,
-        "meta_trials": args.meta_trials,
     }
     for k, v in overrides.items():
         if v is not None:
             base[k] = v
     base["skip_final_tuning"] = args.skip_final_tuning
-    # Stacking flag viaja por settings para que single_run lo lea sin
-    # tener que conocer el namespace argparse completo.
-    base["stacking"] = args.stacking
     return base
 
 

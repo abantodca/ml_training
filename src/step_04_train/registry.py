@@ -4,7 +4,7 @@ Antes habia DOS dicts paralelos:
     `_MODEL_FACTORIES`     en tuning.py        (str -> factory)
     `SEARCH_SPACE_REGISTRY` en search_spaces.py  (str -> suggest_*)
 
-Cualquier nuevo backend (catboost, ngboost, ...) requeria editar dos
+Cualquier nuevo backend (ngboost, tabnet, ...) requeria editar dos
 archivos coordinadamente y arriesgar que divergieran. Peor: cli.py
 listaba `VALID_MODELS = sorted(SEARCH_SPACE_REGISTRY)` -- es decir,
 considera "modelo valido" al que tenga search_space, sin verificar que
@@ -14,9 +14,14 @@ Este modulo centraliza ambos en un dataclass tipado. El registry vive
 en el mismo `step_04_train/` que sus piezas, y `cli.py`/`tuning.py`/
 `search_spaces.py` lo importan.
 
-Para AGREGAR UN BACKEND NUEVO (catboost, tabnet, etc.) ver la guia paso
-a paso en `docs/AGREGAR_BACKEND.md` -- son 4 cambios localizados y no
-requiere tocar el orchestrator ni el champion.
+Para AGREGAR UN BACKEND NUEVO (ngboost, tabnet, ...) son 4 cambios
+localizados, sin tocar el orchestrator ni el champion:
+  1. Crear `model_<name>.py` con `get_<name>_model()` factory que
+     devuelve un sklearn-compatible regressor (idealmente envuelto en
+     `wrap_with_log_target`).
+  2. Agregar `suggest_<name>_params(trial)` en `search_spaces.py`.
+  3. Importar ambos aqui y agregar al `BACKEND_REGISTRY`.
+  4. CLI los recoge via `valid_backends()` automaticamente.
 """
 from __future__ import annotations
 

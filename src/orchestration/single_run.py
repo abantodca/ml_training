@@ -19,7 +19,6 @@ from datetime import datetime
 from typing import Dict, Optional
 
 import joblib
-import mlflow
 import numpy as np
 
 from src.config import ARTIFACTS_DIR
@@ -28,10 +27,6 @@ from src.step_01_load.data_loader import load_business_columns, load_data
 from src.step_04_train.tuning import perform_nested_cv
 from src.step_05_evaluate.champion import ModelResult
 from src.step_05_evaluate.metrics import calculate_regression_metrics
-from src.step_05_evaluate.stacking_diagnostics import (
-    StackingDiagnostics,
-    extract_stacking_diagnostics,
-)
 from src.step_06_track.business_validation import (
     BusinessValidation,
     validate_against_business_unit,
@@ -43,6 +38,7 @@ from src.step_06_track.mlflow_registry import (
     log_params,
     log_pipeline,
     next_run_version,
+    safe_start_run,
     set_tags,
 )
 from src.utils.logger import PrefixAdapter, log_business_audit
@@ -92,24 +88,15 @@ def _full_dataset_metrics(
     return full_metrics_business, full_metrics_h, pred_h_full
 
 
-def _resolve_stacking_meta(settings: dict) -> tuple[str, Optional[str]]:
-    """Devuelve (stacking_raw, stacking_normalized).
-
-    `raw` se loguea como param (string '"none"', '"gam"', ...).
-    `normalized` se pasa a perform_nested_cv (None | 'gam').
-    """
-    raw = settings.get("stacking", "none")
-    norm = None if (not raw or raw == "none") else str(raw)
-    return raw, norm
-
-
 def _set_initial_run_tags(variety: str, model_type: str, version: int, args) -> None:
     """Tags MLflow basicos al abrir el run. Se invoca DENTRO del start_run."""
-    mlflow.set_tag("variety", variety)
-    mlflow.set_tag("tuning", args.tuning)
-    mlflow.set_tag("model_type", model_type)
-    mlflow.set_tag("version", f"v{version}")
-    mlflow.set_tag("trained_at", datetime.now().isoformat(timespec="seconds"))
+    set_tags({
+        "variety": variety,
+        "tuning": args.tuning,
+        "model_type": model_type,
+        "version": f"v{version}",
+        "trained_at": datetime.now().isoformat(timespec="seconds"),
+    })
 
 
 def _log_full_metrics(
@@ -212,11 +199,9 @@ def train_model(
     experiment_name = f"{args.experiment_prefix}{variety}"
     version = next_run_version(experiment_name, model_type)
     run_name = f"{model_type}_v{version}"
-    stacking_meta_raw, stacking_meta = _resolve_stacking_meta(settings)
 
-    with mlflow.start_run(run_name=run_name) as run:
+    with safe_start_run(run_name=run_name) as run:
         _set_initial_run_tags(variety, model_type, version, args)
-        meta_trials = int(settings.get("meta_trials", 0) or 0)
         log_params({
             "variety": variety,
             "tuning": args.tuning,
@@ -226,16 +211,9 @@ def train_model(
             "outer_folds": settings["outer_folds"],
             "inner_folds": settings["inner_folds"],
             "skip_final_tuning": settings["skip_final_tuning"],
-            "stacking": stacking_meta_raw,
-            "meta_trials": meta_trials,
             "n_rows": int(X.shape[0]),
             "n_features_input": int(X.shape[1]),
         })
-        # Tag para filtrar en MLflow UI: stacked vs no-stacked al instante.
-        mlflow.set_tag("stacked", "true" if stacking_meta else "false")
-        if stacking_meta:
-            mlflow.set_tag("meta_model", stacking_meta)
-            mlflow.set_tag("meta_tuned", "true" if meta_trials > 0 else "false")
 
         log.info("[3/6] Nested CV con Optuna...")
         final_pipeline, best_params, nested_metrics, oof = perform_nested_cv(
@@ -247,10 +225,24 @@ def train_model(
             inner_folds=settings["inner_folds"],
             skip_final_tuning=settings["skip_final_tuning"],
             inner_cv_n_jobs=settings.get("inner_cv_n_jobs", -1),
-            stacking_meta=stacking_meta,
-            meta_trials=meta_trials,
             logger=logger,
         )
+
+        # Persistir el pipeline ANTES de tocar MLflow. Si MLflow falla a
+        # mitad del logging (e.g. run marcado deleted externamente), el
+        # modelo entrenado ya esta a salvo en disco -- 1+h de tuning no
+        # se pierden por un fallo de tracking.
+        local_pipeline = ARTIFACTS_DIR / f"final_pipeline_{variety}_{run_name}.joblib"
+        joblib.dump(final_pipeline, local_pipeline)
+        log.info(f"Pipeline persistido localmente: {local_pipeline.name}")
+
+        # OOF arrays a disco para que GAMM Phase 0 (corrector de residuos)
+        # y post-mortems puedan operar sin re-entrenamiento (1.5h por
+        # modelo). Reservado: variety_runner descarta ModelResult al
+        # terminar la variedad y los arrays se perderian sin esto.
+        oof_arr_path = ARTIFACTS_DIR / f"oof_{variety}_{run_name}.npz"
+        np.savez(oof_arr_path, y_true=oof["y_true"], y_pred=oof["y_pred"])
+        log.info(f"OOF persistido localmente: {oof_arr_path.name}")
 
         log.info("[4/6] MLflow logging...")
         log_metrics(nested_metrics)
@@ -261,30 +253,6 @@ def train_model(
             "mae_train_mean": f"{nested_metrics.get('nested_cv_mae_train_mean', 0):.4f}",
             "overfit_gap": f"{nested_metrics.get('nested_cv_gap_mean', 0):+.4f}",
         })
-
-        # Diagnóstico de stacking (None si el pipeline no es un StackedRegressor).
-        # Centralizado en `extract_stacking_diagnostics` para que MLflow,
-        # dashboard y Excel consuman exactamente la misma vista.
-        stacking_diag: Optional[StackingDiagnostics] = extract_stacking_diagnostics(
-            final_pipeline,
-        )
-        if stacking_diag is not None:
-            if stacking_diag.tuned_params:
-                log_params({f"meta_{k}": v for k, v in stacking_diag.tuned_params.items()})
-            if stacking_diag.tuning_log:
-                log_metrics({
-                    f"meta_tuning_{k}": v for k, v in stacking_diag.tuning_log.items()
-                })
-            log_metrics({
-                "meta_fallback_mae_base_oof": stacking_diag.mae_base_oof,
-                "meta_fallback_mae_meta_oof": stacking_diag.mae_meta_oof,
-                "meta_fallback_delta_pct": stacking_diag.delta_pct,
-                "meta_fallback_active": float(stacking_diag.active),
-            })
-            set_tags({
-                "meta_active": "true" if stacking_diag.active else "false",
-                "meta_delta_pct": f"{stacking_diag.delta_pct:+.2f}",
-            })
 
         # ---- Validacion en unidad de negocio (KG/JR = KG/JR_H * H-EF) ----
         log.info("Validando en unidad de negocio (KG/JR)...")
@@ -324,10 +292,8 @@ def train_model(
         )
         log_artifact(params_path, artifact_path="hyperparameters")
 
-        log.info("[5/6] Persistiendo pipeline...")
+        log.info("[5/6] Persistiendo pipeline en MLflow...")
         _log_pipeline_with_signature(final_pipeline, X)
-        local_pipeline = ARTIFACTS_DIR / f"final_pipeline_{variety}_{run_name}.joblib"
-        joblib.dump(final_pipeline, local_pipeline)
 
         elapsed = time.perf_counter() - t0
         bv_oof_dump: Dict[str, float] = {}
@@ -359,7 +325,7 @@ def train_model(
             f"gap={nested_metrics.get('nested_cv_gap_mean', 0):+.4f} | "
             f"R2={nested_metrics['nested_cv_r2_mean']:.4f} | "
             f"FullMAPE={full_metrics_business.get('mape', float('nan')):.2f}% | "
-            f"dt={elapsed:.1f}s"
+            f"dt={elapsed:.1f}s | run_id={run.info.run_id[:12]}"
         )
 
         result = ModelResult(
@@ -375,7 +341,6 @@ def train_model(
             full_metrics_h=full_metrics_h or None,
             oof_y_true=oof["y_true"],
             oof_y_pred=oof["y_pred"],
-            stacking_diagnostics=stacking_diag,
         )
 
     # liberar referencias grandes ANTES del cleanup global

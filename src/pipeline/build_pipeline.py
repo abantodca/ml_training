@@ -19,6 +19,11 @@ def create_preprocessing_pipeline() -> Pipeline:
     inferencia. En entrenamiento ve TODO el train fold; en cada predict()
     de test reusa solo el historial del fit, sin contaminar entre folds.
 
+    `OutlierCapper(group_col="FUNDO")` aprende limites IQR/percentile POR
+    FUNDO. Grupos con n<30 caen al cap global. Responde a fundos
+    heterogeneos: capping global cortaria colas legitimas de un fundo
+    bueno o no tocaria outliers reales de uno bajo.
+
     El `variance_filter` final descarta dummies constantes que aparecen
     cuando una variedad no observa todos los niveles de FUNDO/FORMATO
     (la dummy queda en 0 para todas las filas). `set_output('pandas')`
@@ -32,7 +37,7 @@ def create_preprocessing_pipeline() -> Pipeline:
             ("lag_features", LagFeatureTransformer()),
             ("missing_flags", MissingFlagger()),
             ("imputer", CustomKNNImputer()),
-            ("outliers", OutlierCapper()),
+            ("outliers", OutlierCapper(group_col="FUNDO")),
             ("feature_engineering", FeatureGenerator()),
             (
                 "variance_filter",

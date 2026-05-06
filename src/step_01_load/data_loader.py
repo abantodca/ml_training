@@ -130,13 +130,15 @@ def load_data(
 
     useless_present = [c for c in USELESS_COLUMNS if c in df.columns]
     if useless_present:
-        # MES y DIA_SEM se descartan como columna raw pero su informacion se
-        # reinyecta como features ciclicas (MES_SIN/COS/..., DIA_SEM_SIN/COS)
+        # MES se descarta como columna raw; su informacion se reinyecta como
+        # ciclicas (MES_SIN/COS, MES_SIN2/COS2, MES_SIN3/COS3) y SEMANA_SIN/COS
         # que FeatureGenerator deriva de FECHA durante el fit del Pipeline.
-        # VARIEDAD se elimina del todo: ya entrenamos un modelo por variedad.
+        # DIA_SEM se descarta sin reemplazo (auditoria 2026-05-05: corr ~0
+        # con target, η²=0.0014). VARIEDAD se elimina del todo: ya entrenamos
+        # un modelo por variedad.
         logger.info(
             f"Descartadas como raw {useless_present} "
-            f"(MES/DIA_SEM se reinyectan como ciclicas desde FECHA en FeatureGenerator)"
+            f"(MES se reinyecta como ciclicas desde FECHA en FeatureGenerator)"
         )
 
     df = df.loc[:, needed].copy()

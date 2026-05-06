@@ -1,4 +1,4 @@
-"""Helpers compartidos por la capa de training (tuning / oof / stacking).
+"""Helpers compartidos por la capa de training (tuning / oof).
 
 Centraliza patrones que se repetian bit-for-bit en multiples archivos:
 

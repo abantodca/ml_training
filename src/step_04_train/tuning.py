@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import time
 import warnings
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -40,19 +41,11 @@ from src.config import (
     OOF_ENSEMBLE_K,
     OUTER_CV_FOLDS,
     RANDOM_STATE,
-    STACKING_AUTO_FALLBACK,
-    STACKING_GAM_LAM,
-    STACKING_GAM_N_SPLINES,
-    STACKING_META_INNER_FOLDS,
-    STACKING_META_TRIALS_DEFAULT,
-    STACKING_NAN_FLAG_THRESHOLD,
-    STACKING_OOF_FOLDS,
-    STACKING_X_SUBSET,
 )
 from src.step_04_train.oof_ensemble import OOFEnsembleRegressor
 from src.step_04_train.registry import get_backend
+from src.step_04_train.sample_weights import compute_sample_weights
 from src.step_04_train.search_spaces import suggest_full_params
-from src.step_04_train.stacking import StackedRegressor
 from src.utils.sklearn_helpers import (
     fit_with_optional_sample_weight,
     index_or_none,
@@ -137,36 +130,6 @@ def _build_strat_label(
     return None, "none"
 
 
-def compute_sample_weights(
-    y: pd.Series,
-    n_bins: int = 20,
-    weight_cap: float = 5.0,
-) -> np.ndarray:
-    """Pesos inversos a la densidad del target con bins de IGUAL ANCHO.
-
-    qcut (igual frecuencia) daria pesos uniformes; cut (igual ancho) hace que
-    las colas (target muy alto/bajo, poca masa) reciban mas peso. Se cap-ea
-    `weight_cap` para evitar que 1-2 outliers extremos dominen el loss.
-    Normalizado a media=1.
-
-    Compensa el sesgo "regresion a la media" de los arboles dando mas peso
-    a regiones de target raras.
-    """
-    y_arr = np.asarray(y, dtype=float)
-    n = len(y_arr)
-
-    # Bins de igual ancho. include_lowest=True para incluir el min.
-    bins = pd.cut(y_arr, bins=n_bins, labels=False, include_lowest=True)
-    counts = pd.Series(bins).value_counts().to_dict()
-
-    weights = np.array([1.0 / max(counts[int(b)], 1) for b in bins], dtype=float)
-    # Cap antes de normalizar para no permitir pesos extremos
-    weights = np.minimum(weights, weight_cap * weights.mean())
-    # Normalizar a media=1
-    weights = weights * (n / weights.sum())
-    return weights
-
-
 def _objective(
     trial: optuna.Trial,
     X_train: pd.DataFrame,
@@ -223,6 +186,244 @@ def _format_eta(seconds: float) -> str:
     return f"{seconds / 3600:.1f}h"
 
 
+# ---------------------------------------------------------------------------
+# Helpers privados de Nested CV (extraidos de perform_nested_cv para que el
+# orquestador quede como lectura lineal de ~50 lineas).
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _OuterFoldResults:
+    """Acumulado del outer CV loop. Mutable por construccion incremental
+    (append por fold). El orquestador lo agrega a `nested_metrics` al final.
+    """
+
+    mae_test: list[float]
+    mae_train: list[float]
+    gap: list[float]
+    r2: list[float]
+    best_params: list[Dict[str, object]]
+    oof_pred: np.ndarray
+    oof_fold: np.ndarray
+
+
+def _build_cv_splitters(
+    X: pd.DataFrame,
+    outer_folds: int,
+    inner_folds: int,
+    random_state: int,
+):
+    """Construye outer/inner CV con stratification adaptativa.
+
+    Devuelve `(outer_cv, inner_cv, strat_label, strat_strategy)`. Si la
+    variedad no soporta stratification (1 FUNDO + 1 FORMATO o columnas
+    ausentes), `strat_label` es None y el caller cae a `KFold` normal.
+
+    `min_count`: tras el outer split, el train fold contiene ~N*(outer-1)/outer
+    miembros de cada clase. El inner StratifiedKFold necesita >= inner_folds
+    en cada clase, asi que el minimo seguro a nivel de dataset completo es
+    `ceil(inner * outer / (outer-1))`. Se toma el max con `outer_folds` para
+    no quedar por debajo del requisito del propio outer.
+    """
+    import math
+    strat_min_count = max(
+        outer_folds,
+        math.ceil(inner_folds * outer_folds / max(outer_folds - 1, 1)),
+    )
+    strat_label, strat_strategy = _build_strat_label(X, min_count=strat_min_count)
+    splitter_cls = StratifiedKFold if strat_label is not None else KFold
+    outer_cv = splitter_cls(n_splits=outer_folds, shuffle=True, random_state=random_state)
+    inner_cv = splitter_cls(n_splits=inner_folds, shuffle=True, random_state=random_state)
+    return outer_cv, inner_cv, strat_label, strat_strategy
+
+
+def _maybe_sample_weights(
+    y: pd.Series, use_sample_weights: bool, logger,
+) -> Optional[np.ndarray]:
+    """Computa sample_weights por decil del target o devuelve None."""
+    if not use_sample_weights:
+        return None
+    sw = compute_sample_weights(y, n_bins=10)
+    logger.info(
+        f"Sample weights ON | n_bins=10 | "
+        f"min={sw.min():.3f} max={sw.max():.3f} mean={sw.mean():.3f}"
+    )
+    return sw
+
+
+def _run_outer_cv_loop(
+    *,
+    X: pd.DataFrame,
+    y: pd.Series,
+    preprocessor: Pipeline,
+    model_type: str,
+    outer_cv,
+    inner_cv,
+    strat_label: Optional[pd.Series],
+    sample_weights: Optional[np.ndarray],
+    n_trials: int,
+    final_trials: int,
+    skip_final_tuning: bool,
+    outer_folds: int,
+    random_state: int,
+    t0: float,
+    logger,
+) -> _OuterFoldResults:
+    """Itera outer folds: tune Optuna inner + refit + eval test/train.
+
+    Acumula metricas por fold y predicciones OOF. El refit por fold es
+    necesario para evaluar gap (MAE_test - MAE_train) honestamente.
+    """
+    n = len(y)
+    res = _OuterFoldResults(
+        mae_test=[], mae_train=[], gap=[], r2=[], best_params=[],
+        oof_pred=np.full(n, np.nan, dtype=float),
+        oof_fold=np.full(n, -1, dtype=int),
+    )
+    for fold_idx, (train_idx, test_idx) in enumerate(
+        outer_cv.split(X, strat_label), start=1,
+    ):
+        fold_t0 = time.perf_counter()
+        logger.info(f"Outer fold {fold_idx}/{outer_folds} | tuning + eval")
+
+        X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
+        y_tr, y_te = y.iloc[train_idx], y.iloc[test_idx]
+        sw_tr = index_or_none(sample_weights, train_idx)
+        # strat_label es pd.Series: requiere .iloc, no encaja en index_or_none.
+        strat_tr = strat_label.iloc[train_idx] if strat_label is not None else None
+
+        study = _make_study(random_state + fold_idx)
+        study.optimize(
+            lambda trial: _objective(
+                trial, X_tr, y_tr, preprocessor, inner_cv, model_type,
+                sample_weights_train=sw_tr,
+                strat_label_train=strat_tr,
+            ),
+            n_trials=n_trials,
+            show_progress_bar=False,
+            gc_after_trial=True,
+        )
+
+        best_pipeline = _build_pipeline(preprocessor, model_type)
+        best_pipeline.set_params(**study.best_params)
+        fit_with_optional_sample_weight(best_pipeline, X_tr, y_tr, sample_weight=sw_tr)
+
+        y_pred_te = best_pipeline.predict(X_te)
+        mae_test = float(mean_absolute_error(y_te, y_pred_te))
+        r2_test = float(r2_score(y_te, y_pred_te))
+        y_pred_tr = best_pipeline.predict(X_tr)
+        mae_train = float(mean_absolute_error(y_tr, y_pred_tr))
+
+        res.mae_test.append(mae_test)
+        res.mae_train.append(mae_train)
+        res.gap.append(mae_test - mae_train)
+        res.r2.append(r2_test)
+        res.best_params.append(dict(study.best_params))
+        res.oof_pred[test_idx] = y_pred_te
+        res.oof_fold[test_idx] = fold_idx
+
+        fold_dt = time.perf_counter() - fold_t0
+        elapsed = time.perf_counter() - t0
+        eta = (elapsed / fold_idx) * (outer_folds - fold_idx) + (
+            0 if skip_final_tuning else (final_trials / n_trials) * (elapsed / fold_idx)
+        )
+        logger.info(
+            f"Fold {fold_idx} | MAE_test={mae_test:.4f} | MAE_train={mae_train:.4f} | "
+            f"gap={mae_test - mae_train:+.4f} | R2={r2_test:.4f} | "
+            f"dt={_format_eta(fold_dt)} | eta_resto={_format_eta(eta)}"
+        )
+    return res
+
+
+def _aggregate_nested_metrics(res: _OuterFoldResults) -> Dict[str, float]:
+    """Agrega listas por-fold en el dict que consume el HTML / business audit."""
+    return {
+        # backward-compatible (lo que ya leia el HTML)
+        "nested_cv_mae_mean": float(np.mean(res.mae_test)),
+        "nested_cv_mae_std": float(np.std(res.mae_test)),
+        "nested_cv_r2_mean": float(np.mean(res.r2)),
+        "nested_cv_r2_std": float(np.std(res.r2)),
+        # detector de overfitting
+        "nested_cv_mae_train_mean": float(np.mean(res.mae_train)),
+        "nested_cv_mae_train_std": float(np.std(res.mae_train)),
+        "nested_cv_gap_mean": float(np.mean(res.gap)),
+        "nested_cv_gap_std": float(np.std(res.gap)),
+    }
+
+
+def _pick_final_params(
+    *,
+    fold_results: _OuterFoldResults,
+    X: pd.DataFrame,
+    y: pd.Series,
+    preprocessor: Pipeline,
+    inner_cv,
+    model_type: str,
+    sample_weights: Optional[np.ndarray],
+    strat_label: Optional[pd.Series],
+    final_trials: int,
+    skip_final_tuning: bool,
+    random_state: int,
+    logger,
+) -> Dict[str, object]:
+    """Devuelve los params para el refit final.
+
+    Dos modos:
+      - `skip_final_tuning=True`: argmin sobre los outer folds (rapido).
+      - `False` (default): ronda extra de Optuna sobre TODO el dataset.
+    """
+    if skip_final_tuning:
+        best_idx = int(np.argmin(fold_results.mae_test))
+        logger.info(
+            f"Saltando ronda final | usando best_params del fold #{best_idx + 1} "
+            f"(MAE_test={fold_results.mae_test[best_idx]:.4f})"
+        )
+        return fold_results.best_params[best_idx]
+
+    logger.info(f"Ronda final | trials={final_trials} sobre dataset completo...")
+    final_study = _make_study(random_state)
+    final_study.optimize(
+        lambda trial: _objective(
+            trial, X, y, preprocessor, inner_cv, model_type,
+            sample_weights_train=sample_weights,
+            strat_label_train=strat_label,
+        ),
+        n_trials=final_trials,
+        show_progress_bar=False,
+        gc_after_trial=True,
+    )
+    return final_study.best_params
+
+
+def _fit_final_ensemble(
+    *,
+    preprocessor: Pipeline,
+    model_type: str,
+    best_params: Dict[str, object],
+    X: pd.DataFrame,
+    y: pd.Series,
+    sample_weights: Optional[np.ndarray],
+    random_state: int,
+    t0: float,
+    logger,
+) -> OOFEnsembleRegressor:
+    """Wrap del pipeline tuneado en OOFEnsembleRegressor + fit sobre todo X."""
+    base_pipeline = _build_pipeline(preprocessor, model_type)
+    base_pipeline.set_params(**best_params)
+    ensemble = OOFEnsembleRegressor(
+        base_pipeline=base_pipeline,
+        n_models=OOF_ENSEMBLE_K,
+        random_state=random_state,
+    )
+    ensemble.fit(X, y, sample_weight=sample_weights)
+    logger.info(
+        f"Pipeline final entrenado | K={OOF_ENSEMBLE_K} pipelines promediados | "
+        f"tiempo_total={_format_eta(time.perf_counter() - t0)} | "
+        f"best_params={best_params}"
+    )
+    return ensemble
+
+
 def perform_nested_cv(
     X: pd.DataFrame,
     y: pd.Series,
@@ -236,11 +437,9 @@ def perform_nested_cv(
     skip_final_tuning: bool = False,
     inner_cv_n_jobs: int = -1,
     use_sample_weights: bool = True,
-    stacking_meta: Optional[str] = None,
-    meta_trials: int = STACKING_META_TRIALS_DEFAULT,
     logger=logger,
 ) -> Tuple[Pipeline, Dict[str, object], Dict[str, float], Dict[str, np.ndarray]]:
-    """Ejecuta Nested CV y devuelve:
+    """Orquestador thin de Nested CV. La logica vive en helpers privados.
 
     Parametros
     ----------
@@ -254,77 +453,22 @@ def perform_nested_cv(
                       (fold a fold) para soportar sample_weight. Aceptamos
                       el flag para no romper la CLI/settings. La paralelizacion
                       real ahora es por variedad (`--parallel-varieties`).
-    stacking_meta : None | "gam". Si "gam", el refit final envuelve el
-                    `OOFEnsembleRegressor` en `StackedRegressor` con un
-                    pyGAM como meta-learner. El nested CV se mantiene SOBRE
-                    EL BASE puro (no incluye al meta) para que las metricas
-                    de gap/MAE_test/R2 sigan comparables con runs historicos.
-                    None (default) = comportamiento legacy bit-for-bit.
-    meta_trials : trials de Optuna para tunear (gam_n_splines, gam_lam) sobre
-                  las OOF preds del propio Stacked. 0 (default) = sin tuning.
-                  Solo aplica si stacking_meta == "gam". El presupuesto por
-                  perfil esta en TUNING_PROFILES[<perfil>]["meta_trials"].
 
     Returns
     -------
     final_pipeline   : `OOFEnsembleRegressor` con K pipelines refiteados
                         sobre folds del KFold (K = `config.OOF_ENSEMBLE_K`).
-                        `.predict(X)` promedia las K predicciones.
-                        Si K=1 wrap-ea un unico refit sobre todo el dataset
-                        (modo legacy).
     best_params      : dict con los hiperparametros del modelo de produccion.
     nested_metrics   : dict con MAE/R2 mean y std (test, train, gap).
-    oof              : dict con `y_true`, `y_pred` y `fold_id` (predicciones
-                        out-of-fold para diagnostico/graficas).
+    oof              : dict con `y_true`, `y_pred` y `fold_id`.
     """
     outer_folds = outer_folds or OUTER_CV_FOLDS
     inner_folds = inner_folds or INNER_CV_FOLDS
     final_trials = final_trials if final_trials is not None else n_trials
 
-    # CV adaptativo: estratifica por FUNDO/FORMATO si la variedad lo permite,
-    # cae a KFold normal si no hay variabilidad util (1 FUNDO + 1 FORMATO,
-    # variedad muy chica, columnas ausentes). Decision por variedad.
-    #
-    # Calculo de `min_count`: tras el outer split, el train fold contiene
-    # ~N*(outer-1)/outer miembros de cada clase. El inner StratifiedKFold
-    # necesita >= inner_folds en cada clase, asi que el minimo seguro a
-    # nivel de dataset completo es ceil(inner * outer / (outer-1)). Se
-    # toma el max con outer_folds para no quedar por debajo del requisito
-    # del propio outer. Antes usabamos max(outer, inner) -> suficiente
-    # para el outer pero el inner emitia "least populated class has only
-    # 1 members" cuando una clase con n=2 caia 1+1 entre train/val.
-    import math
-    strat_min_count = max(
-        outer_folds,
-        math.ceil(inner_folds * outer_folds / max(outer_folds - 1, 1)),
+    outer_cv, inner_cv, strat_label, strat_strategy = _build_cv_splitters(
+        X, outer_folds, inner_folds, random_state,
     )
-    strat_label, strat_strategy = _build_strat_label(
-        X, min_count=strat_min_count,
-    )
-    if strat_label is not None:
-        outer_cv = StratifiedKFold(
-            n_splits=outer_folds, shuffle=True, random_state=random_state,
-        )
-        inner_cv = StratifiedKFold(
-            n_splits=inner_folds, shuffle=True, random_state=random_state,
-        )
-    else:
-        outer_cv = KFold(
-            n_splits=outer_folds, shuffle=True, random_state=random_state,
-        )
-        inner_cv = KFold(
-            n_splits=inner_folds, shuffle=True, random_state=random_state,
-        )
-
-    outer_mae_test: list[float] = []
-    outer_mae_train: list[float] = []
-    outer_gap: list[float] = []
-    outer_r2: list[float] = []
-    outer_best_params: list[Dict[str, object]] = []
-
-    n = len(y)
-    oof_pred = np.full(n, np.nan, dtype=float)
-    oof_fold = np.full(n, -1, dtype=int)
 
     total_trials = outer_folds * n_trials + (0 if skip_final_tuning else final_trials)
     logger.info(
@@ -345,93 +489,20 @@ def perform_nested_cv(
             "FUNDO/FORMATO; KFold normal)"
         )
 
-    # Sample weights inversos a frecuencia por decil del target. Compensa el
-    # sesgo "regresion a la media" de los arboles dando mas peso a deciles
-    # raros (target alto/bajo). None = comportamiento legacy.
-    sample_weights: Optional[np.ndarray] = None
-    if use_sample_weights:
-        sample_weights = compute_sample_weights(y, n_bins=10)
-        logger.info(
-            f"Sample weights ON | n_bins=10 | "
-            f"min={sample_weights.min():.3f} max={sample_weights.max():.3f} "
-            f"mean={sample_weights.mean():.3f}"
-        )
-
+    sample_weights = _maybe_sample_weights(y, use_sample_weights, logger)
     optuna.logging.set_verbosity(optuna.logging.WARNING)
     t0 = time.perf_counter()
 
-    for fold_idx, (train_idx, test_idx) in enumerate(
-        outer_cv.split(X, strat_label), start=1,
-    ):
-        fold_t0 = time.perf_counter()
-        logger.info(f"Outer fold {fold_idx}/{outer_folds} | tuning + eval")
-
-        X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
-        y_tr, y_te = y.iloc[train_idx], y.iloc[test_idx]
-        sw_tr = index_or_none(sample_weights, train_idx)
-        # strat_label es pd.Series: requiere .iloc, no encaja en index_or_none
-        # (que asume numpy array). Mantenemos el if/else explicito.
-        strat_tr = (
-            strat_label.iloc[train_idx] if strat_label is not None else None
-        )
-
-        study = _make_study(random_state + fold_idx)
-        study.optimize(
-            lambda trial: _objective(
-                trial, X_tr, y_tr, preprocessor, inner_cv, model_type,
-                sample_weights_train=sw_tr,
-                strat_label_train=strat_tr,
-            ),
-            n_trials=n_trials,
-            show_progress_bar=False,
-            gc_after_trial=True,
-        )
-
-        best_pipeline = _build_pipeline(preprocessor, model_type)
-        best_pipeline.set_params(**study.best_params)
-        fit_with_optional_sample_weight(best_pipeline, X_tr, y_tr, sample_weight=sw_tr)
-
-        # Test (generalizacion)
-        y_pred_te = best_pipeline.predict(X_te)
-        mae_test = float(mean_absolute_error(y_te, y_pred_te))
-        r2_test = float(r2_score(y_te, y_pred_te))
-        # Train (para detectar overfitting)
-        y_pred_tr = best_pipeline.predict(X_tr)
-        mae_train = float(mean_absolute_error(y_tr, y_pred_tr))
-        gap = mae_test - mae_train
-
-        outer_mae_test.append(mae_test)
-        outer_mae_train.append(mae_train)
-        outer_gap.append(gap)
-        outer_r2.append(r2_test)
-
-        oof_pred[test_idx] = y_pred_te
-        oof_fold[test_idx] = fold_idx
-        outer_best_params.append(dict(study.best_params))
-
-        fold_dt = time.perf_counter() - fold_t0
-        elapsed = time.perf_counter() - t0
-        eta = (elapsed / fold_idx) * (outer_folds - fold_idx) + (
-            0 if skip_final_tuning else (final_trials / n_trials) * (elapsed / fold_idx)
-        )
-        logger.info(
-            f"Fold {fold_idx} | MAE_test={mae_test:.4f} | MAE_train={mae_train:.4f} | "
-            f"gap={gap:+.4f} | R2={r2_test:.4f} | "
-            f"dt={_format_eta(fold_dt)} | eta_resto={_format_eta(eta)}"
-        )
-
-    nested_metrics: Dict[str, float] = {
-        # backward-compatible (lo que ya leia el HTML)
-        "nested_cv_mae_mean": float(np.mean(outer_mae_test)),
-        "nested_cv_mae_std": float(np.std(outer_mae_test)),
-        "nested_cv_r2_mean": float(np.mean(outer_r2)),
-        "nested_cv_r2_std": float(np.std(outer_r2)),
-        # detector de overfitting
-        "nested_cv_mae_train_mean": float(np.mean(outer_mae_train)),
-        "nested_cv_mae_train_std": float(np.std(outer_mae_train)),
-        "nested_cv_gap_mean": float(np.mean(outer_gap)),
-        "nested_cv_gap_std": float(np.std(outer_gap)),
-    }
+    fold_results = _run_outer_cv_loop(
+        X=X, y=y, preprocessor=preprocessor, model_type=model_type,
+        outer_cv=outer_cv, inner_cv=inner_cv, strat_label=strat_label,
+        sample_weights=sample_weights,
+        n_trials=n_trials, final_trials=final_trials,
+        skip_final_tuning=skip_final_tuning,
+        outer_folds=outer_folds, random_state=random_state,
+        t0=t0, logger=logger,
+    )
+    nested_metrics = _aggregate_nested_metrics(fold_results)
     logger.info(
         f"Nested CV resultado | MAE_test={nested_metrics['nested_cv_mae_mean']:.4f} "
         f"+/- {nested_metrics['nested_cv_mae_std']:.4f} | "
@@ -440,86 +511,21 @@ def perform_nested_cv(
         f"R2={nested_metrics['nested_cv_r2_mean']:.4f}"
     )
 
-    # ----- Pipeline de produccion -----
-    if skip_final_tuning:
-        best_idx = int(np.argmin(outer_mae_test))
-        logger.info(
-            f"Saltando ronda final | usando best_params del fold #{best_idx + 1} "
-            f"(MAE_test={outer_mae_test[best_idx]:.4f})"
-        )
-        best_params = outer_best_params[best_idx]
-    else:
-        logger.info(
-            f"Ronda final | trials={final_trials} sobre dataset completo..."
-        )
-        final_study = _make_study(random_state)
-        final_study.optimize(
-            lambda trial: _objective(
-                trial, X, y, preprocessor, inner_cv, model_type,
-                sample_weights_train=sample_weights,
-                strat_label_train=strat_label,
-            ),
-            n_trials=final_trials,
-            show_progress_bar=False,
-            gc_after_trial=True,
-        )
-        best_params = final_study.best_params
-
-    base_pipeline = _build_pipeline(preprocessor, model_type)
-    base_pipeline.set_params(**best_params)
-    base_estimator = OOFEnsembleRegressor(
-        base_pipeline=base_pipeline,
-        n_models=OOF_ENSEMBLE_K,
-        random_state=random_state,
+    best_params = _pick_final_params(
+        fold_results=fold_results, X=X, y=y, preprocessor=preprocessor,
+        inner_cv=inner_cv, model_type=model_type,
+        sample_weights=sample_weights, strat_label=strat_label,
+        final_trials=final_trials, skip_final_tuning=skip_final_tuning,
+        random_state=random_state, logger=logger,
     )
-
-    # Envoltorio opcional de stacking. El nested CV de arriba ya midio el
-    # base puro (gap/MAE/R2), asi que esas metricas siguen siendo
-    # comparables historicamente. El meta-learner solo afecta lo que se
-    # promueve a produccion y lo que se mide post-hoc en business_validation.
-    if stacking_meta is None:
-        final_pipeline = base_estimator
-        final_pipeline.fit(X, y, sample_weight=sample_weights)
-        logger.info(
-            f"Pipeline final entrenado | K={OOF_ENSEMBLE_K} pipelines promediados | "
-            f"tiempo_total={_format_eta(time.perf_counter() - t0)} | "
-            f"best_params={best_params}"
-        )
-    elif stacking_meta == "gam":
-        logger.info(
-            f"Stacking ON (meta=gam) | x_subset={STACKING_X_SUBSET} | "
-            f"n_oof_folds={STACKING_OOF_FOLDS} | "
-            f"n_splines={STACKING_GAM_N_SPLINES} | lam={STACKING_GAM_LAM} | "
-            f"meta_trials={meta_trials} | meta_inner_folds={STACKING_META_INNER_FOLDS} | "
-            f"auto_fallback={STACKING_AUTO_FALLBACK} | "
-            f"nan_flag_threshold={STACKING_NAN_FLAG_THRESHOLD}"
-        )
-        final_pipeline = StackedRegressor(
-            base_pipeline=base_estimator,
-            x_subset_cols=list(STACKING_X_SUBSET),
-            n_oof_folds=STACKING_OOF_FOLDS,
-            gam_n_splines=STACKING_GAM_N_SPLINES,
-            gam_lam=STACKING_GAM_LAM,
-            nan_flag_threshold=STACKING_NAN_FLAG_THRESHOLD,
-            auto_fallback=STACKING_AUTO_FALLBACK,
-            tune_meta_trials=meta_trials,
-            tune_meta_inner_folds=STACKING_META_INNER_FOLDS,
-            random_state=random_state,
-        )
-        final_pipeline.fit(X, y, sample_weight=sample_weights)
-        logger.info(
-            f"Stacked pipeline entrenado | base=OOFEnsembleRegressor(K={OOF_ENSEMBLE_K}) | "
-            f"meta=LinearGAM | tiempo_total={_format_eta(time.perf_counter() - t0)} | "
-            f"best_params={best_params}"
-        )
-    else:
-        raise ValueError(
-            f"stacking_meta '{stacking_meta}' no soportado. Validos: None, 'gam'."
-        )
-
+    final_pipeline = _fit_final_ensemble(
+        preprocessor=preprocessor, model_type=model_type, best_params=best_params,
+        X=X, y=y, sample_weights=sample_weights, random_state=random_state,
+        t0=t0, logger=logger,
+    )
     oof = {
         "y_true": np.asarray(y, dtype=float),
-        "y_pred": oof_pred,
-        "fold_id": oof_fold,
+        "y_pred": fold_results.oof_pred,
+        "fold_id": fold_results.oof_fold,
     }
     return final_pipeline, best_params, nested_metrics, oof

@@ -93,6 +93,34 @@ class OOFEnsembleRegressor(BaseEstimator, RegressorMixin):
         self.models_ = models
         return self
 
+    def _stacked_preds(self, X) -> np.ndarray:
+        """Stack de las K predicciones (filas x K modelos). Helper compartido
+        por `predict` y `predict_with_std` para no duplicar el list comp."""
+        return np.column_stack([m.predict(X) for m in self.models_])
+
     def predict(self, X) -> np.ndarray:
-        preds = np.column_stack([m.predict(X) for m in self.models_])
-        return preds.mean(axis=1)
+        return self._stacked_preds(X).mean(axis=1)
+
+    def predict_with_std(self, X) -> tuple[np.ndarray, np.ndarray]:
+        """Devuelve (mean, std) de las K predicciones.
+
+        `std` por fila es un proxy directo de incertidumbre del modelo:
+        cuando los K pipelines (entrenados en train folds distintos pero
+        misma configuracion) coinciden, el modelo es confiable; cuando
+        divergen, hay incertidumbre alta sobre esa prediccion.
+
+        Util para construir intervalos en negocio:
+            estimacion = mean
+            banda_inf  = mean - 1.96 * std
+            banda_sup  = mean + 1.96 * std
+
+        Cuando `n_models=1`, std es 0 para todas las filas (un solo modelo
+        no tiene varianza interna). En ese caso usar `predict()` directo.
+        """
+        preds = self._stacked_preds(X)
+        # ddof=1 (sample std). Con K=1 devuelve NaN -> reemplazo a 0 para no
+        # propagar NaN al consumer (es honesto: 1 modelo => 0 incertidumbre
+        # entre modelos, que es trivialmente cierto).
+        if preds.shape[1] <= 1:
+            return preds.mean(axis=1), np.zeros(preds.shape[0])
+        return preds.mean(axis=1), preds.std(axis=1, ddof=1)

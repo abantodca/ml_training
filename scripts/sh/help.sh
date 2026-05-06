@@ -9,7 +9,8 @@ cat <<'EOF'
 =============================================================================
 
 ENTORNO:
-  Local (Windows / Linux). MLflow file:// en ./mlruns. Sin AWS.
+  Local (Windows / Linux). MLflow sqlite en mlruns/mlflow.db (Model Registry
+  habilitado). Sin AWS.
 
 --- SETUP & DATA -----------------------------------------------------------
    task setup                    Instala deps Python (pip install -r requirements.txt)
@@ -17,21 +18,23 @@ ENTORNO:
                                    (split por variedad desde el acumulado)
 
 --- TRAINING ---------------------------------------------------------------
-   task train VARIETIES=POP               Entrena 1 variedad
-   task train VARIETIES=POP,VENTURA       Entrena varias variedades
-   task train VARIETIES=all               Entrena todas las variedades
+   task train VARIETIES=POP                       Entrena 1 variedad (TUNING=prod default)
+   task train VARIETIES=POP TUNING=dev            Baseline rapido (~20 min)
+   task train VARIETIES=POP TUNING=prod           Produccion (~1.5h, default)
+   task train VARIETIES=POP,VENTURA               Varias variedades
 
    Cada variedad es independiente: si una falla, las demas continuan.
-   Pipeline siempre:  XGB vs LGB  →  campeon  →  GAM ajusta errores del campeon
-   GAM es el default. Auto-fallback incluido: si GAM no mejora, se desactiva
-   solo y el modelo entrega la prediccion del base puro sin intervencion.
+   Pipeline:  XGB vs LGB  ->  champion por variedad
+              (lex-order: gap -> MAPE -> tiempo). MODEL=auto (default)
+              entrena ambos y el lex-order resuelve. Losers se eliminan
+              automaticamente de MLflow Experiments (en mlruns/.trash/,
+              recuperables).
    Si DB-HISTORICA.xlsx no existe, se genera automaticamente.
 
-   Para desactivar GAM (solo base XGB/LGB):
-   task train VARIETIES=POP STACKING=none
-
---- MLFLOW (UI local) -------------------------------------------------------
+--- MLFLOW (UI local con Model Registry) -----------------------------------
    task mlflow:ui                Abre la UI en http://localhost:5000
+                                   (backend sqlite -> tab "Models" funcional,
+                                    versionado real del campeon registrado)
 
 --- LOGS / AUDITORIA --------------------------------------------------------
    task logs:local                              tail al log del orquestador

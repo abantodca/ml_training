@@ -71,25 +71,6 @@ body {
   border: 1.5px solid rgba(255,255,255,.32);
 }
 
-/* ===== STACKING PILL (hero) ===== */
-.stacking-pill {
-  display: inline-flex; align-items: center; gap: 12px;
-  margin-top: 14px; padding: 8px 14px; border-radius: 999px;
-  background: rgba(255,255,255,.14);
-  border: 1.2px solid rgba(255,255,255,.28);
-  font-size: 12.5px; line-height: 1.3;
-}
-.stacking-pill .dot {
-  width: 9px; height: 9px; border-radius: 50%;
-  box-shadow: 0 0 0 3px rgba(255,255,255,.18);
-  flex: 0 0 auto;
-}
-.stacking-pill.active .dot { background: #22c55e; }
-.stacking-pill.neutral .dot { background: #fbbf24; }
-.stacking-pill.fallback .dot { background: #cbd5e0; }
-.stacking-pill .text { display: flex; flex-direction: column; }
-.stacking-pill .lbl { font-weight: 700; letter-spacing: .04em; }
-.stacking-pill .sub { color: rgba(255,255,255,.78); font-size: 11.5px; }
 .verdict-badge .icon { font-size: 22px; }
 .verdict-headline { font-size: 17px; margin: 14px 0 6px; font-weight: 600; }
 .verdict-body { font-size: 14px; color: rgba(255,255,255,.92);
@@ -156,12 +137,6 @@ section .lead { color: var(--gray-700); font-size: 14px; margin: 4px 0 18px; }
   font-family: "SF Mono", Menlo, Consolas, monospace;
   border-top: 1px dashed var(--gray-200); padding-top: 8px; margin-top: 6px; }
 
-.kpi-footnote {
-  font-size: 12.5px; color: var(--gray-700); margin-top: 14px;
-  padding: 10px 14px; background: var(--gray-50);
-  border-left: 3px solid var(--gold); border-radius: 6px; line-height: 1.55;
-}
-
 /* ===== ACTIONS ===== */
 .action {
   display: flex; gap: 14px; padding: 14px 16px; border-radius: 10px;
@@ -175,6 +150,28 @@ section .lead { color: var(--gray-700); font-size: 14px; margin: 4px 0 18px; }
 .action .title { font-weight: 700; color: var(--navy); margin-bottom: 4px;
   font-size: 14px; }
 .action .body { font-size: 13px; color: var(--gray-700); line-height: 1.55; }
+
+/* ===== BIAS / BACKENDS COMPARISON TABLES ===== */
+.bias-table, .backends-table {
+  width: 100%; border-collapse: collapse; font-size: 13px;
+  margin-top: 8px;
+}
+.bias-table th, .bias-table td,
+.backends-table th, .backends-table td {
+  padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--gray-200);
+}
+.bias-table th, .backends-table th {
+  background: var(--gray-50); color: var(--navy); font-weight: 700;
+  font-size: 12px; text-transform: uppercase; letter-spacing: .03em;
+}
+.bias-table td.sub  { color: #b45309; font-weight: 700; }   /* subestima -> ambar oscuro */
+.bias-table td.sobre { color: #1d4ed8; font-weight: 700; }  /* sobreestima -> azul */
+.backends-table tr.champ-row {
+  background: #f0fdf4; font-weight: 600;
+}
+.backends-table tr.champ-row td:first-child {
+  border-left: 4px solid var(--green);
+}
 
 /* ===== HELP / GLOSSARY ===== */
 details.help {
@@ -238,126 +235,6 @@ details.technical .body { padding: 22px 26px; }
 /* ===== JUSTIFY ===== */
 .justify-text { background: var(--gray-100); border-left: 4px solid var(--gold);
   padding: 14px 18px; border-radius: 8px; font-size: 14px; color: var(--gray-700); }
-
-/* ===== STACKING / META BLOCK (technical) ===== */
-.stacking-banner {
-  display: flex; gap: 12px; align-items: flex-start;
-  padding: 14px 16px; border-radius: 10px; margin: 4px 0 14px;
-  font-size: 13.5px; line-height: 1.55; border: 1px solid;
-}
-.stacking-banner.good {
-  background: #f0fdf4; border-color: #bbf7d0; color: #166534;
-}
-.stacking-banner.neutral {
-  background: #fffbeb; border-color: #fde68a; color: #92400e;
-}
-.stacking-banner.fallback {
-  background: var(--gray-50); border-color: var(--gray-200);
-  color: var(--gray-700);
-}
-.stacking-banner .banner-icon { font-size: 18px; line-height: 1.2; flex: 0 0 auto; }
-.stacking-banner .banner-text { flex: 1 1 auto; font-weight: 500; }
-
-.meta-kpi-grid {
-  display: grid; gap: 10px; margin: 10px 0 16px;
-  grid-template-columns: repeat(2, 1fr);
-}
-@media (min-width: 900px) {
-  .meta-kpi-grid { grid-template-columns: repeat(4, 1fr); }
-}
-.meta-kpi {
-  border: 1px solid var(--gray-200); border-radius: 10px;
-  padding: 12px 14px; background: white;
-}
-.meta-kpi .label {
-  font-size: 10.5px; color: var(--gray-500); text-transform: uppercase;
-  letter-spacing: .1em; font-weight: 700;
-}
-.meta-kpi .value {
-  font-size: 22px; font-weight: 700; color: var(--navy); margin-top: 4px;
-  font-variant-numeric: tabular-nums;
-}
-.meta-kpi .sub { font-size: 11.5px; color: var(--gray-500); margin-top: 2px; }
-.meta-kpi.good .value { color: #166534; }
-.meta-kpi.warn .value { color: var(--amber); }
-.meta-kpi.neutral .value { color: var(--gray-700); }
-
-.meta-features {
-  border: 1px solid var(--gray-200); border-radius: 10px;
-  padding: 12px 14px; margin: 4px 0 14px; background: white;
-}
-.meta-features-title {
-  font-size: 12.5px; font-weight: 700; color: var(--navy);
-  display: flex; align-items: baseline; gap: 8px; margin-bottom: 8px;
-  border-bottom: 1px solid var(--gray-100); padding-bottom: 6px;
-}
-.meta-features-title .hint {
-  font-size: 11px; color: var(--gray-500); font-weight: 500;
-  letter-spacing: .04em;
-}
-.meta-features-table {
-  width: 100%; border-collapse: collapse; font-size: 12.5px;
-}
-.meta-features-table td {
-  padding: 6px 8px; border-bottom: 1px solid var(--gray-100);
-}
-.meta-features-table td:first-child {
-  font-family: "SF Mono", Menlo, Consolas, monospace;
-  color: var(--navy); white-space: nowrap;
-}
-.meta-features-table td code {
-  background: var(--gray-100); padding: 1px 6px; border-radius: 4px;
-  font-size: 12px;
-}
-.meta-features-table tbody tr:last-child td { border-bottom: 0; }
-
-.ftype-pill {
-  display: inline-block; padding: 2px 9px; border-radius: 999px;
-  font-size: 11px; font-weight: 600; letter-spacing: .02em;
-}
-.ftype-pill.ftype-pred { background: #fef3c7; color: #92400e; }
-.ftype-pill.ftype-cat { background: #dbeafe; color: #1e40af; }
-.ftype-pill.ftype-flag { background: #fde2e2; color: #991b1b; }
-.ftype-pill.ftype-cont { background: #dcfce7; color: #166534; }
-
-.meta-tuning {
-  border: 1px solid var(--gray-200); border-radius: 10px;
-  padding: 12px 14px; margin: 4px 0 14px; background: var(--gray-50);
-}
-.meta-tuning-title {
-  font-size: 12.5px; font-weight: 700; color: var(--navy);
-  margin-bottom: 8px;
-}
-.meta-tuning-grid {
-  display: grid; gap: 8px;
-  grid-template-columns: repeat(2, 1fr);
-}
-@media (min-width: 720px) {
-  .meta-tuning-grid { grid-template-columns: repeat(3, 1fr); }
-}
-@media (min-width: 1080px) {
-  .meta-tuning-grid { grid-template-columns: repeat(6, 1fr); }
-}
-.meta-tuning-grid > div {
-  background: white; border: 1px solid var(--gray-200);
-  border-radius: 8px; padding: 8px 10px;
-  display: flex; flex-direction: column; gap: 2px;
-}
-.meta-tuning-grid .k {
-  font-size: 10.5px; color: var(--gray-500); text-transform: uppercase;
-  letter-spacing: .1em; font-weight: 700;
-}
-.meta-tuning-grid .v {
-  font-size: 15px; font-weight: 700; color: var(--navy);
-  font-variant-numeric: tabular-nums;
-}
-
-.meta-tech-line {
-  font-family: "SF Mono", Menlo, Consolas, monospace;
-  font-size: 11.5px; color: var(--gray-500);
-  border-top: 1px dashed var(--gray-200); padding-top: 8px;
-  margin-top: 8px;
-}
 
 /* ===== MODELS GRID + KPI CARDS (technical, reused) ===== */
 .models-grid { display: grid; gap: 16px; grid-template-columns: 1fr; }
@@ -500,87 +377,4 @@ footer { text-align:center; color: var(--gray-500); font-size: 12px;
 """
 
 
-# CSS aislado de la seccion de feature importance. Vive aparte de
-# DASHBOARD_CSS para que el modo retroactivo (parche en HTML existente)
-# pueda inyectar SOLO estos estilos sin reescribir todo el bloque <style>.
-FI_DASHBOARD_CSS = """
-/* ===== Feature Importance ===== */
-.fi-summary { display:flex; flex-wrap:wrap; gap:14px; align-items:baseline;
-  padding:12px 16px; background:var(--gray-50); border-radius:8px;
-  border:1px solid var(--gray-200); font-size:14px; }
-.fi-summary small { color:var(--gray-600); }
-.fi-stat { font-weight:600; }
-.fi-stat.core    { color:#166534; }
-.fi-stat.util    { color:#92400e; }
-.fi-stat.podable { color:#991b1b; }
-.fi-stat.ruido   { color:#1f2937; }
-
-.fi-chart { display:grid; gap:6px; margin-top:10px; }
-.fi-row { display:grid; grid-template-columns: 36px 1fr 26% auto 28px auto;
-  align-items:center; gap:10px; padding:8px 12px; border-radius:6px;
-  background:var(--gray-50); border:1px solid var(--gray-200); font-size:13px; }
-.fi-row .fi-rank { font-weight:700; color:var(--gray-500); font-size:12px; }
-.fi-row .fi-name { font-family:ui-monospace,Menlo,monospace; font-size:13px; }
-.fi-row .fi-bar-wrap { background:var(--gray-200); height:14px; border-radius:7px;
-  overflow:hidden; }
-.fi-row .fi-bar { height:100%; background:#3b82f6; border-radius:7px; transition:width .3s; }
-.fi-row.fi-core    .fi-bar { background:#22c55e; }
-.fi-row.fi-util    .fi-bar { background:#3b82f6; }
-.fi-row.fi-podable .fi-bar { background:#f59e0b; }
-.fi-row.fi-ruido   .fi-bar { background:#ef4444; }
-.fi-row .fi-val { font-family:ui-monospace,Menlo,monospace; font-size:12px;
-  color:var(--gray-700); white-space:nowrap; }
-.fi-row .fi-val small { color:var(--gray-500); font-size:11px; }
-.fi-badge { display:inline-block; padding:2px 8px; border-radius:999px;
-  font-size:11px; font-weight:700; white-space:nowrap; }
-.fi-badge.core    { background:#dcfce7; color:#166534; }
-.fi-badge.util    { background:#dbeafe; color:#1e40af; }
-.fi-badge.podable { background:#fee2e2; color:#991b1b; }
-.fi-badge.ruido   { background:#1f2937; color:#f3f4f6; }
-
-.fi-actionable { padding:12px 16px; margin-top:10px; border-radius:8px;
-  border-left:4px solid var(--gray-400); background:var(--gray-50); }
-.fi-actionable.ruido   { border-left-color:#ef4444; background:#fef2f2; }
-.fi-actionable.podable { border-left-color:#f59e0b; background:#fffbeb; }
-.fi-actionable.info    { border-left-color:#22c55e; background:#f0fdf4; }
-.fi-actionable .fi-act-title { font-weight:700; font-size:14px; margin-bottom:4px; }
-.fi-actionable .fi-act-desc  { font-size:13px; color:var(--gray-700); margin-bottom:8px; }
-.fi-actionable .fi-act-list  { display:flex; flex-wrap:wrap; gap:6px; }
-.fi-chip { font-family:ui-monospace,Menlo,monospace; font-size:12px;
-  padding:2px 8px; background:var(--gray-100); border-radius:4px;
-  border:1px solid var(--gray-300); }
-
-.fi-dir { display:inline-flex; align-items:center; justify-content:center;
-  width:24px; height:24px; border-radius:50%; font-weight:700; font-size:14px;
-  cursor:help; }
-.fi-dir.up      { color:#166534; background:#dcfce7; }
-.fi-dir.down    { color:#991b1b; background:#fee2e2; }
-.fi-dir.neutral { color:var(--gray-700); background:var(--gray-100); }
-.fi-dir-cell.up      { color:#166534; }
-.fi-dir-cell.down    { color:#991b1b; }
-.fi-dir-cell.neutral { color:var(--gray-700); }
-
-.fi-beeswarm { margin-top:18px; padding:14px; background:var(--gray-50);
-  border:1px solid var(--gray-200); border-radius:8px; }
-.fi-beeswarm img { max-width:100%; height:auto; display:block; margin:0 auto; }
-.fi-bee-cap { font-size:12px; color:var(--gray-600); margin-top:8px;
-  line-height:1.5; }
-
-.fi-table-wrap summary { cursor:pointer; padding:8px 12px;
-  background:var(--gray-50); border-radius:6px; font-weight:600; }
-.fi-table { width:100%; border-collapse:collapse; margin-top:10px; font-size:13px; }
-.fi-table th, .fi-table td { padding:6px 10px; text-align:left;
-  border-bottom:1px solid var(--gray-200); }
-.fi-table th { background:var(--gray-100); font-weight:700; }
-.fi-table tr:hover { background:var(--gray-50); }
-.fi-table code { font-size:12px; }
-"""
-
-
-# DASHBOARD_CSS completo = base + FI. El renderer de training inyecta
-# DASHBOARD_CSS en <style>; el modo retro inyecta solo FI_DASHBOARD_CSS
-# como parche, asi no duplica reglas existentes.
-DASHBOARD_CSS = DASHBOARD_CSS + FI_DASHBOARD_CSS
-
-
-__all__ = ["_PLOTLY_JS_TAG", "DASHBOARD_CSS", "FI_DASHBOARD_CSS"]
+__all__ = ["_PLOTLY_JS_TAG", "DASHBOARD_CSS"]

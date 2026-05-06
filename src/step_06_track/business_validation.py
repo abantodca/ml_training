@@ -24,6 +24,7 @@ Calculamos DOS escenarios para que el gerente vea ambas perspectivas:
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
@@ -31,6 +32,8 @@ import numpy as np
 import pandas as pd
 
 from src.step_05_evaluate.metrics import calculate_regression_metrics
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -136,9 +139,16 @@ def validate_against_business_unit(
         result.oof_mask = mask_oof
 
     # ---- In-sample (modelo final aplicado a todo el dataset) ----
+    # In-sample falla rara vez (mismo X que se uso en fit). Si pasa, log
+    # con traceback para diagnosticar; el caller obtiene metrics_insample
+    # vacio (BusinessValidation tolera ausencia in-sample sin romper).
     try:
         y_pred_h_full = final_pipeline.predict(X_full)
     except Exception:
+        logger.warning(
+            "business_validation: final_pipeline.predict(X_full) fallo; "
+            "metrics_insample queda vacio", exc_info=True,
+        )
         y_pred_h_full = None
 
     if y_pred_h_full is not None:

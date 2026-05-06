@@ -2,7 +2,7 @@
 
 Aislar los espacios aqui (en vez de mezclarlos con el bucle Nested CV)
 permite:
-    - Anadir un nuevo backend (catboost, ngboost, ...) editando UN solo
+    - Anadir un nuevo backend (ngboost, tabnet, ...) editando UN solo
       archivo, sin tocar `tuning.py`.
     - Versionar cambios de search space sin churn en la logica de CV.
     - Reusar los espacios desde notebooks de exploracion.
@@ -47,25 +47,43 @@ def suggest_preprocessor_params(trial: optuna.Trial) -> Dict[str, object]:
 
 
 def suggest_xgb_params(trial: optuna.Trial) -> Dict[str, object]:
-    """Search space anti-overfitting (rev. 5 - cerrar gap remanente):
-    XGB ya tenia gap=+0.135 (el sano). Rev anterior dejaba alpha=0.017 y
-    gamma=0.10 (Optuna eligio 'casi sin uso') -> palancas desperdiciadas.
-    Esta rev. sube los pisos para forzar uso real de esas palancas y
-    apunta a gap ~0.10-0.12 sin sacrificar MAE_test.
-    - max_depth: 3-7 -> 3-6 (Optuna eligio 6, no 7; bajamos techo 1 para
-      cerrar el espacio sin podar la zona util).
-    - min_child_weight: 3-30 -> 5-50 (sube piso, evita splits de hoja chica).
-    - reg_alpha: 1e-3 a 10 -> 0.1 a 20 (sube piso 100x; mata el 'sin alpha').
-    - gamma: 0.1 a 10 -> 0.5 a 15 (sube piso 5x; obliga mejora minima
-      mas exigente para crear un split).
-    NO se tocan colsample_* (Optuna eligio 0.61-0.78, zona buena).
+    """Search space anti-overfitting (rev. 6.1 - simplificacion + anti-gap):
+    Rev. 6 ya endurecio max_depth, reg_lambda, gamma, min_child_weight para
+    pasar el quality gate. Rev. 6.1 simplifica el search eliminando palancas
+    redundantes que Optuna combinaba en `feature_fraction` efectivo muy bajo
+    (run anterior: bytree=0.760 * bylevel=0.762 * bynode=0.668 = 0.39 features
+    efectivas en cualquier nodo -> hiper-especializacion -> overfit por otra
+    via). Ademas baja n_estimators upper para no perder trials en arboles
+    extra que sin early stopping no aportan:
+    - colsample_bylevel REMOVIDO (queda fijo en default 1.0). Multiplicaba
+      con bytree y producia agresividad combinada.
+    - colsample_bynode REMOVIDO (idem).
+    - max_delta_step REMOVIDO. Marginal en regresion MAE; gastaba trials.
+    - n_estimators upper: 1500 -> 1000. Run anterior eligio 1436 (top); con
+      learning_rate ~0.05 y arboles regularizados, despues de 800 arboles el
+      gradiente es ~0 y los extras solo memorizan. Sin early stopping en
+      el fit el modelo entrena los 1500 igual.
+    Mantenido sin cambio respecto a rev. 6: max_depth 3-5, min_child_weight
+    10-50, gamma 1.5-15, reg_lambda 3-15, reg_alpha 0.1-20 (log).
+
+    Rev. 6.2 (2026-05-05) anade `grow_policy` con max_leaves condicional:
+    - `grow_policy='depthwise'` (default): split todos los nodos del mismo
+      nivel antes de bajar. Comportamiento actual.
+    - `grow_policy='lossguide'`: split el nodo con mayor gain (Newton-style,
+      similar a LGB num_leaves). Requiere acotar con `max_leaves`. Genera
+      arboles asimetricos -> mas diversidad ante seeds distintas.
+    - `max_leaves` en lossguide: rango 8-32 (espejo conservador de LGB
+      num_leaves cap=18). Cuando depthwise, NO se tunea (XGB lo ignora).
     """
-    return {
+    grow_policy = trial.suggest_categorical(
+        "regressor__regressor__grow_policy", ["depthwise", "lossguide"]
+    )
+    params = {
         "regressor__regressor__n_estimators": trial.suggest_int(
-            "regressor__regressor__n_estimators", 200, 1500
+            "regressor__regressor__n_estimators", 200, 1000
         ),
         "regressor__regressor__max_depth": trial.suggest_int(
-            "regressor__regressor__max_depth", 3, 6
+            "regressor__regressor__max_depth", 3, 5
         ),
         "regressor__regressor__learning_rate": trial.suggest_float(
             "regressor__regressor__learning_rate", 1e-2, 0.3, log=True
@@ -76,28 +94,25 @@ def suggest_xgb_params(trial: optuna.Trial) -> Dict[str, object]:
         "regressor__regressor__colsample_bytree": trial.suggest_float(
             "regressor__regressor__colsample_bytree", 0.5, 1.0
         ),
-        "regressor__regressor__colsample_bylevel": trial.suggest_float(
-            "regressor__regressor__colsample_bylevel", 0.5, 1.0
-        ),
-        "regressor__regressor__colsample_bynode": trial.suggest_float(
-            "regressor__regressor__colsample_bynode", 0.5, 1.0
-        ),
         "regressor__regressor__min_child_weight": trial.suggest_float(
-            "regressor__regressor__min_child_weight", 5.0, 50.0, log=True
+            "regressor__regressor__min_child_weight", 10.0, 50.0, log=True
         ),
         "regressor__regressor__gamma": trial.suggest_float(
-            "regressor__regressor__gamma", 0.5, 15.0, log=True
-        ),
-        "regressor__regressor__max_delta_step": trial.suggest_int(
-            "regressor__regressor__max_delta_step", 0, 7
+            "regressor__regressor__gamma", 1.5, 15.0, log=True
         ),
         "regressor__regressor__reg_alpha": trial.suggest_float(
             "regressor__regressor__reg_alpha", 0.1, 20.0, log=True
         ),
         "regressor__regressor__reg_lambda": trial.suggest_float(
-            "regressor__regressor__reg_lambda", 1.0, 10.0, log=True
+            "regressor__regressor__reg_lambda", 3.0, 15.0, log=True
         ),
+        "regressor__regressor__grow_policy": grow_policy,
     }
+    if grow_policy == "lossguide":
+        params["regressor__regressor__max_leaves"] = trial.suggest_int(
+            "regressor__regressor__max_leaves", 8, 32
+        )
+    return params
 
 
 # ---------------------------------------------------------------------------
@@ -106,31 +121,44 @@ def suggest_xgb_params(trial: optuna.Trial) -> Dict[str, object]:
 
 
 def suggest_lgb_params(trial: optuna.Trial) -> Dict[str, object]:
-    """Search space anti-overfitting (rev. 5 - cierre de gap):
-    Rev anterior dejaba a Optuna elegir max_depth=7 + num_leaves=88 +
-    min_child_samples=29, lo que producia gap=+0.24. Esta rev. fuerza
-    arboles mas chicos y hojas con mas filas para cerrar el gap.
-    - max_depth: 3-7 -> 3-5 (techo bajo, ya no permite arboles muy
-      profundos). Al techo viejo Optuna chocaba el limite.
-    - num_leaves: cap 127 -> 31 (con 16 estratos y 10k filas, 31 hojas
-      ~ 322 filas/hoja en promedio, impide hojas hiper-especificas).
-    - min_child_samples: 20-100 -> 50-200 (sube piso 2.5x; no permite
-      hojas con menos de 50 cosechas, mata memorizacion de outliers).
-    - reg_alpha: 1e-3 a 10 -> 0.5 a 20 (sube piso 500x; ya no existe
-      el trial 'casi sin alpha' que Optuna podia elegir).
-    - reg_lambda: 0.5 a 10 -> 2.0 a 20 (sube piso 4x).
-    - min_split_gain: 1e-3 a 1 -> 0.01 a 5 (sube piso 10x; mas exigente
-      con la mejora minima para crear un split).
-    Notas: el objective='quantile' alpha=0.5 (ver model_lgb.py) cambia la
-    escala del Hessian; los rangos de min_child_weight no son directamente
-    comparables a un LGB con objective='regression'.
+    """Search space anti-overfitting (rev. 7.2 - simplificacion + anti-gap):
+    Rev. 7.1 capo num_leaves a 18 absoluto y subio min_child_samples / reg_lambda.
+    Rev. 7.2 simplifica eliminando palancas redundantes que combinadas producian
+    feature_fraction efectivo muy bajo (run anterior: bytree=0.747 * bynode=0.539
+    = 0.40 features efectivas -> hiper-especializacion -> overfit por otra via),
+    y elimina subsample_freq tunable (movido a model_lgb.py como fijo en 1):
+    - feature_fraction_bynode REMOVIDO (queda fijo en default 1.0). Multiplicaba
+      con colsample_bytree y producia agresividad combinada.
+    - subsample_freq REMOVIDO del search; ahora fijo a 1 en model_lgb.py.
+      Antes podia variar 1-7; valores altos anulaban el bagging porque solo
+      1/N arboles veia un sample (resto entrenaba con dataset completo).
+    - n_estimators upper: 1500 -> 1000. Run anterior eligio 1165 (cerca top);
+      con LR ~0.05 y arboles regularizados, despues de 800 arboles el gradiente
+      es ~0 y los extras solo memorizan. Sin early stopping no se cortan.
+    Mantenido respecto a rev. 7.1: max_depth 3-5, num_leaves cap absoluto 18,
+    subsample 0.5-0.80, min_child_samples 60-250, reg_lambda 5-25.
+    Notas: objective='regression_l1' (ver model_lgb.py) -> MAE nativo.
+
+    Rev. 7.3 (2026-05-05) anade dos palancas anti-gap ortogonales a las
+    actuales (no se duplican con depth/min_child_samples/reg_lambda):
+    - `extra_trees` True/False: random splits estilo ExtraTrees. Cuando True,
+      el split point se elige random dentro del rango (no greedy). Reduce
+      capacidad efectiva del arbol y la varianza entre arboles -> menor
+      overfit. Costo: cada arbol individual es peor, pero el ensemble suma
+      diversidad. Optuna decide si ayuda.
+    - `path_smooth` 0-2: regularizacion bayesiana sobre splits con poco
+      soporte (smooth = 0 desactiva). Penaliza splits con n chico de un
+      lado, lo que combate el overfit por ruido en hojas marginales.
+      Rango 0-2 (oficial: >0 typical 1-2).
     """
     max_depth = trial.suggest_int("regressor__regressor__max_depth", 3, 5)
-    # Cap a 31 hojas: con 10k filas y 16 estratos, ~322 filas/hoja medio.
-    num_leaves_max = min(2 ** max_depth - 1, 31)
+    # Cap absoluto 18 sobre la formula 2^depth - 8 (era cap 24 en depth=5).
+    # depth=5 -> min(18, 24) = 18. depth=4 -> min(18, 8) = 8. depth=3 -> 7.
+    # Floor=7 para no degenerar.
+    num_leaves_max = min(18, max(7, 2 ** max_depth - 8))
     return {
         "regressor__regressor__n_estimators": trial.suggest_int(
-            "regressor__regressor__n_estimators", 200, 1500
+            "regressor__regressor__n_estimators", 200, 1000
         ),
         "regressor__regressor__max_depth": max_depth,
         "regressor__regressor__num_leaves": trial.suggest_int(
@@ -140,19 +168,13 @@ def suggest_lgb_params(trial: optuna.Trial) -> Dict[str, object]:
             "regressor__regressor__learning_rate", 1e-2, 0.3, log=True
         ),
         "regressor__regressor__subsample": trial.suggest_float(
-            "regressor__regressor__subsample", 0.5, 1.0
-        ),
-        "regressor__regressor__subsample_freq": trial.suggest_int(
-            "regressor__regressor__subsample_freq", 1, 7
+            "regressor__regressor__subsample", 0.5, 0.80
         ),
         "regressor__regressor__colsample_bytree": trial.suggest_float(
             "regressor__regressor__colsample_bytree", 0.5, 1.0
         ),
-        "regressor__regressor__feature_fraction_bynode": trial.suggest_float(
-            "regressor__regressor__feature_fraction_bynode", 0.5, 1.0
-        ),
         "regressor__regressor__min_child_samples": trial.suggest_int(
-            "regressor__regressor__min_child_samples", 50, 200
+            "regressor__regressor__min_child_samples", 60, 250
         ),
         "regressor__regressor__min_split_gain": trial.suggest_float(
             "regressor__regressor__min_split_gain", 0.01, 5.0, log=True
@@ -161,42 +183,15 @@ def suggest_lgb_params(trial: optuna.Trial) -> Dict[str, object]:
             "regressor__regressor__reg_alpha", 0.5, 20.0, log=True
         ),
         "regressor__regressor__reg_lambda": trial.suggest_float(
-            "regressor__regressor__reg_lambda", 2.0, 20.0, log=True
+            "regressor__regressor__reg_lambda", 5.0, 25.0, log=True
+        ),
+        "regressor__regressor__extra_trees": trial.suggest_categorical(
+            "regressor__regressor__extra_trees", [False, True]
+        ),
+        "regressor__regressor__path_smooth": trial.suggest_float(
+            "regressor__regressor__path_smooth", 0.0, 2.0
         ),
     }
-
-
-# ---------------------------------------------------------------------------
-# Meta-learners (capa de stacking)
-# ---------------------------------------------------------------------------
-#
-# Estos search spaces son INDEPENDIENTES del backend del base. Se mantienen
-# aqui para que un futuro tuning del meta tenga la misma API (`suggest_*` +
-# registry) que el backend. En la implementacion ACTUAL del stacking
-# (`StackedRegressor`) los hiperparametros del GAM se leen de `config.py`
-# (defaults) en lugar de tunearse junto al base; tunearlos en el mismo
-# trial multiplicaria el costo (cada trial fitea base+meta). Cuando se
-# decida tunear el GAM, el caller debe combinar este dict con el del base
-# usando una rama separada del optuna study (no un solo objective monolitico).
-
-
-def suggest_gam_meta_params(trial: optuna.Trial) -> Dict[str, object]:
-    """Search space para el LinearGAM meta-learner.
-
-    Las claves NO usan el prefijo `regressor__regressor__` porque el GAM
-    no es un step del Pipeline sklearn: vive como atributo de
-    `StackedRegressor`. El caller mapea estos valores a los kwargs del
-    constructor de `StackedRegressor` directamente.
-    """
-    return {
-        "gam_n_splines": trial.suggest_int("gam_n_splines", 8, 25),
-        "gam_lam": trial.suggest_float("gam_lam", 1e-2, 10.0, log=True),
-    }
-
-
-META_SEARCH_SPACE_REGISTRY: Dict[str, callable] = {
-    "gam": suggest_gam_meta_params,
-}
 
 
 # ---------------------------------------------------------------------------

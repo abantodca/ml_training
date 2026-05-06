@@ -136,8 +136,8 @@ ml_training/
     │   └── lag_features.py                  # add_lag_features (~31 features rolling/seasonal/ratios) — invocado desde data_loader.py
     ├── pipeline/build_pipeline.py           # missing_flags → imputer → outliers → features → variance_filter
     ├── step_04_train/
-    │   ├── model_xgb.py                     # get_xgb_model() — XGBRegressor envuelto en TTR
-    │   ├── model_lgb.py                     # get_lgb_model() — LGBMRegressor (objective=quantile α=0.5)
+    │   ├── model_xgb.py                     # get_xgb_model() — XGBRegressor envuelto en TTR (objective=reg:absoluteerror, MAE nativo)
+    │   ├── model_lgb.py                     # get_lgb_model() — LGBMRegressor envuelto en TTR (objective=regression_l1, MAE nativo)
     │   ├── model_gam.py                     # get_gam_meta_model() — LinearGAM (pyGAM) para stacking
     │   ├── search_spaces.py                 # Espacios Optuna por backend + meta (registries extensibles)
     │   ├── target_transform.py              # log1p + cap p99.5 vía TransformedTargetRegressor (CV-safe)
@@ -148,7 +148,7 @@ ml_training/
     │   ├── metrics.py                       # MAE, RMSE, R², MAPE
     │   ├── diagnostics.py                   # gráficos matplotlib → base64 PNG
     │   ├── champion.py                      # select_champion (lex-order: gap → MAPE → tiempo)
-    │   ├── explainability.py                # feature importance + SHAP del campeón
+    │   ├── explainability.py                # KPIs ejecutivos + glosario + WinnerKit
     │   └── html/                            # dashboard ejecutivo modular
     │       ├── winner_dashboard.py          # entrypoint: Winner_<variety>.html
     │       ├── sections.py, technical.py    # KPIs, tarjetas, tablas, sección técnica
@@ -276,7 +276,7 @@ Las divisiones usan `np.where(den > 0, num/den, NaN)`; los NaN resultantes son t
 ### Anti-overfitting / estabilidad
 
 - **`TransformedTargetRegressor`** (`target_transform.py`): aplica `log1p(min(y, p99.5))` en el espacio de y antes de fittear el modelo y `expm1` al predecir. CV-safe porque el cap se calcula DENTRO de cada fold sobre `y_train`. Estabiliza varianza y aplasta ~0.5% de outliers extremos sin tocar `y_test` del scoring.
-- **Sample weights** (`tuning.compute_sample_weights`): pesos inversos a la densidad del target con bins de IGUAL ANCHO (no qcut), cap=5×, normalizados a media=1. Compensa el sesgo "regresión a la media" de los árboles dando más peso a deciles raros (target alto/bajo).
+- **Sample weights** (`tuning.compute_sample_weights`): pesos inversos a la densidad del target con bins de IGUAL ANCHO (no qcut), cap=5× + `sqrt` para saturar la cola larga (max post-norm ~2.8 vs ~8 sin sqrt), normalizados a media=1. Compensa el sesgo "regresión a la media" de los árboles dando más peso a deciles raros sin amplificar outliers.
 - **`OOFEnsembleRegressor`** (`oof_ensemble.py`): refit final = K=5 pipelines clonados, cada uno entrenado en `(K−1)/K` del dataset según un `KFold`; `predict()` promedia las K predicciones. Reduce varianza ~5–10% del modelo de producción a costa de 5× el tiempo del refit final (despreciable vs nested CV). `K=1` degenera al modo legacy bit-for-bit.
 
 ### Stacking (capa GAM, opt-in)
@@ -324,7 +324,7 @@ Una sola página HTML autocontenida (Plotly inline o por CDN según
 - Resumen ejecutivo con badge semáforo (Excelente / Aceptable / Insuficiente / No recomendado) según R² OOF + brecha train-test.
 - Gauges de R² y MAE contra targets gerenciales (`REPORT_R2_TARGET`, `REPORT_MAE_TARGET`).
 - 4 KPIs con código de color (precisión, R², mejora vs baseline, estado).
-- Gráficos embebidos: predicho vs real OOF, residuales, feature importance, SHAP.
+- Gráficos embebidos: predicho vs real OOF, residuales.
 - Desempeño por subgrupo (FORMATO, FUNDO) con flag automático de subgrupos problemáticos (`MAPE > 1.5 × MAPE_global` y `n ≥ REPORT_SUBGROUP_MIN_N`).
 - Análisis de overfitting (gap relativo, verdict).
 - Tabla de hiperparámetros óptimos + representación técnica del pipeline.

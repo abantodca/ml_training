@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Training local multi-variedad + multi-modelo.
-# Args: TUNING MODEL VARIETIES [PARALLEL=1] [STACKING=none] [EXTRA="--no-register"]
+# Args: TUNING MODEL VARIETIES [PARALLEL=1] [EXTRA="--no-register"]
 #
 # TUNING   = presupuesto Optuna (smoke|dev|prod|prod_xl). NO es entorno.
 # MODEL    = auto (default) | xgb | lgb | xgb,lgb | all.
@@ -11,14 +11,12 @@
 #              - 2 cores  -> PARALLEL=1 o 2
 #              - 4 cores  -> PARALLEL=2 o 3
 #              - 8 cores  -> PARALLEL=4
-# STACKING = none (default) | gam. 'gam' envuelve el campeon en StackedRegressor.
 source "$(dirname "$0")/_common.sh"
 TUNING=${1:-dev}
 MODEL=${2:-auto}
 VARIETIES=${3:-POP}
 PARALLEL=${4:-1}
-STACKING=${5:-none}
-EXTRA=${6:-}
+EXTRA=${5:-}
 
 # Auto-split: si data/training/DB-HISTORICA.xlsx no existe, lo regeneramos
 # desde data/BD_HISTORICO_ACUMULADO.xlsx. Si ya existe, se asume
@@ -41,5 +39,4 @@ fi
   --model "$MODEL" \
   --varieties "$VARIETIES" \
   --parallel-varieties "$PARALLEL" \
-  --stacking "$STACKING" \
   $EXTRA

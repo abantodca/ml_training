@@ -17,7 +17,6 @@ from src.config import DATE_COLUMN
 from src.step_05_evaluate.champion import ModelResult
 from src.step_05_evaluate.diagnostics import plot_pred_vs_actual_plotly
 from src.step_05_evaluate.html.helpers import fmt, kpi_card
-from src.step_05_evaluate.stacking_diagnostics import StackingDiagnostics
 
 
 def _kpi_panel_for_model(r: ModelResult, *, is_winner: bool, rank: int) -> str:
@@ -316,26 +315,26 @@ def _build_subgroup_table(
 
 
 _SUBGRP_TAB_JS = """
-<script>
-function showSubgrpTab(rootId, tabId) {
-  var root = document.getElementById(rootId);
-  if (!root) return;
-  root.querySelectorAll('.subgrp-tab-btn').forEach(function(b){ b.classList.remove('active'); });
-  root.querySelectorAll('.subgrp-panel').forEach(function(p){ p.classList.remove('active'); });
-  var btn = document.getElementById(rootId + '-btn-' + tabId);
-  var panel = document.getElementById(rootId + '-panel-' + tabId);
-  if (btn) btn.classList.add('active');
-  if (panel) {
-    panel.classList.add('active');
-    panel.querySelectorAll('.plotly-graph-div').forEach(function(g){
-      if (window.Plotly && Plotly.Plots && Plotly.Plots.resize) {
-        try { Plotly.Plots.resize(g); } catch(e) {}
-      }
-    });
-  }
-}
-</script>
-"""
+        <script>
+        function showSubgrpTab(rootId, tabId) {
+        var root = document.getElementById(rootId);
+        if (!root) return;
+        root.querySelectorAll('.subgrp-tab-btn').forEach(function(b){ b.classList.remove('active'); });
+        root.querySelectorAll('.subgrp-panel').forEach(function(p){ p.classList.remove('active'); });
+        var btn = document.getElementById(rootId + '-btn-' + tabId);
+        var panel = document.getElementById(rootId + '-panel-' + tabId);
+        if (btn) btn.classList.add('active');
+        if (panel) {
+            panel.classList.add('active');
+            panel.querySelectorAll('.plotly-graph-div').forEach(function(g){
+            if (window.Plotly && Plotly.Plots && Plotly.Plots.resize) {
+                try { Plotly.Plots.resize(g); } catch(e) {}
+            }
+            });
+        }
+        }
+        </script>
+    """
 
 
 def _build_subgroup_block(
@@ -417,144 +416,6 @@ def _build_subgroup_block(
     return f'{stats}<div class="subgrp-tabs" id="{root_id}">{nav}{body}</div>{_SUBGRP_TAB_JS}'
 
 
-def _build_stacking_block(stacking: Optional[StackingDiagnostics]) -> str:
-    """Sección 'Capa Meta (GAM)' del detalle técnico.
-
-    Muestra:
-      1. Banner de estado (ACTIVA verde / FALLBACK gris) + headline en
-         lenguaje natural para gerencia.
-      2. KPIs comparativos: MAE base OOF · MAE meta OOF · Δ% · estado.
-      3. Tabla de features que vio el GAM (con tipo: spline / factor / flag).
-      4. Hiperparámetros y log de tuning si hubo Optuna sobre el meta.
-
-    Si no hay stacking devuelve "" (sección invisible).
-    """
-    if stacking is None:
-        return ""
-
-    # ---- Banner ----
-    if not stacking.active:
-        banner_cls = "stacking-banner fallback"
-        banner_icon = "🛡"
-    elif stacking.improves_base:
-        banner_cls = "stacking-banner good"
-        banner_icon = "✅"
-    else:
-        banner_cls = "stacking-banner neutral"
-        banner_icon = "ℹ"
-    banner = (
-        f'<div class="{banner_cls}">'
-        f'<span class="banner-icon">{banner_icon}</span>'
-        f'<span class="banner-text">{escape(stacking.headline)}</span>'
-        f'</div>'
-    )
-
-    # ---- KPI cards: base vs meta ----
-    delta_cls = "good" if stacking.improves_base else (
-        "neutral" if stacking.delta_pct >= 0 and stacking.delta_pct < 0.5 else "warn"
-    )
-    kpis = (
-        '<div class="meta-kpi-grid">'
-        f'<div class="meta-kpi"><div class="label">MAE base (OOF)</div>'
-        f'<div class="value">{stacking.mae_base_oof:.4f}</div>'
-        f'<div class="sub">modelo base puro</div></div>'
-        f'<div class="meta-kpi"><div class="label">MAE base+meta (OOF)</div>'
-        f'<div class="value">{stacking.mae_meta_oof:.4f}</div>'
-        f'<div class="sub">tras la capa meta</div></div>'
-        f'<div class="meta-kpi {delta_cls}"><div class="label">Δ vs base</div>'
-        f'<div class="value">{stacking.delta_pct:+.2f}%</div>'
-        f'<div class="sub">negativo = mejora</div></div>'
-        f'<div class="meta-kpi {("good" if stacking.active else "warn")}">'
-        f'<div class="label">Estado en producción</div>'
-        f'<div class="value">{escape(stacking.status_label)}</div>'
-        f'<div class="sub">'
-        f'{"usa cascada base→meta" if stacking.active else "fallback → solo base"}'
-        f'</div></div>'
-        '</div>'
-    )
-
-    # ---- Features que vio el GAM ----
-    cat_set = set(stacking.cat_features)
-    flag_set = set(stacking.nan_flag_features)
-    feat_rows: List[str] = []
-    for name in stacking.feature_names:
-        if name == "pred_base":
-            ftype = "Predicción del modelo base"
-            ftype_cls = "ftype-pred"
-        elif name in flag_set:
-            ftype = "Indicador de dato faltante (factor)"
-            ftype_cls = "ftype-flag"
-        elif name in cat_set:
-            ftype = "Categórica (factor)"
-            ftype_cls = "ftype-cat"
-        else:
-            ftype = "Continua (spline)"
-            ftype_cls = "ftype-cont"
-        feat_rows.append(
-            f'<tr><td><code>{escape(name)}</code></td>'
-            f'<td><span class="ftype-pill {ftype_cls}">{escape(ftype)}</span></td></tr>'
-        )
-    features_table = (
-        '<div class="meta-features">'
-        '<div class="meta-features-title">Variables que ajusta la capa meta '
-        f'<span class="hint">{len(stacking.feature_names)} en total</span></div>'
-        '<table class="meta-features-table"><thead><tr>'
-        '<th>Variable</th><th>Tipo</th>'
-        '</tr></thead><tbody>'
-        + "".join(feat_rows) +
-        '</tbody></table></div>'
-    )
-
-    # ---- Tuning info (si hubo Optuna sobre el meta) ----
-    tuning_html = ""
-    if stacking.tuned and stacking.tuning_log:
-        tlog = stacking.tuning_log
-        n_splines = stacking.tuned_params.get("gam_n_splines", float("nan"))
-        lam = stacking.tuned_params.get("gam_lam", float("nan"))
-        n_trials_v = tlog.get("n_trials")
-        inner_v = tlog.get("inner_folds")
-        score_v = tlog.get("best_score_mae", float("nan"))
-        elapsed_v = tlog.get("elapsed_s", float("nan"))
-        n_trials_txt = f"{int(n_trials_v)}" if n_trials_v is not None else "—"
-        inner_txt = f"{int(inner_v)}" if inner_v is not None else "—"
-        tuning_html = (
-            '<div class="meta-tuning">'
-            '<div class="meta-tuning-title">Hiperparámetros tuneados (Optuna)</div>'
-            '<div class="meta-tuning-grid">'
-            f'<div><span class="k">n_splines</span><span class="v">{int(n_splines) if np.isfinite(n_splines) else "—"}</span></div>'
-            f'<div><span class="k">lam</span><span class="v">{lam:.4f}</span></div>'
-            f'<div><span class="k">trials</span><span class="v">{n_trials_txt}</span></div>'
-            f'<div><span class="k">inner folds</span><span class="v">{inner_txt}</span></div>'
-            f'<div><span class="k">best MAE</span><span class="v">{score_v:.4f}</span></div>'
-            f'<div><span class="k">tiempo</span><span class="v">{elapsed_v:.1f}s</span></div>'
-            '</div></div>'
-        )
-    elif stacking.tuned_params:
-        n_splines = stacking.tuned_params.get("gam_n_splines", float("nan"))
-        lam = stacking.tuned_params.get("gam_lam", float("nan"))
-        tuning_html = (
-            '<div class="meta-tuning">'
-            '<div class="meta-tuning-title">Hiperparámetros (defaults de configuración)</div>'
-            '<div class="meta-tuning-grid">'
-            f'<div><span class="k">n_splines</span><span class="v">{int(n_splines) if np.isfinite(n_splines) else "—"}</span></div>'
-            f'<div><span class="k">lam</span><span class="v">{lam:.4f}</span></div>'
-            '</div></div>'
-        )
-
-    return f"""
-    <div class="tech-block">
-      <div class="eyebrow">Capa meta · {escape(stacking.meta_type.upper())} (stacking)</div>
-      <h3>¿Está la capa meta ayudando al modelo base?</h3>
-      <p class="lead">El modelo de producción combina un modelo base (XGB/LGB) y una capa meta (un modelo aditivo simple) que ajusta la predicción. El sistema sólo activa la capa meta si supera al base por al menos {stacking.fallback_threshold_pct:.1f}% en datos no vistos — si no, automáticamente cae al modelo base puro.</p>
-      {banner}
-      {kpis}
-      {features_table}
-      {tuning_html}
-      <p class="meta-tech-line">{escape(stacking.technical_line)}</p>
-    </div>
-    """
-
-
 def build_technical_section(
     *,
     results: List[ModelResult],
@@ -563,7 +424,6 @@ def build_technical_section(
     X_aligned: Optional[pd.DataFrame],
     abs_errors: np.ndarray,
     real: np.ndarray,
-    stacking: Optional[StackingDiagnostics] = None,
 ) -> str:
     n_models = len(results)
     grid_cls = "models-grid"
@@ -584,7 +444,6 @@ def build_technical_section(
         for r in ordered
     )
     subgroup_block = _build_subgroup_block(X_aligned, abs_errors, real)
-    stacking_block = _build_stacking_block(stacking)
     justification = decision.get("justification", "")
     criteria = " → ".join(decision.get("decision_criteria", []))
 
@@ -601,8 +460,6 @@ def build_technical_section(
           <p class="lead">Criterio aplicado (orden estricto): {escape(criteria)}</p>
           <div class="justify-text">{escape(justification)}</div>
         </div>
-
-        {stacking_block}
 
         <div class="tech-block">
           <div class="eyebrow">Panel comparativo · KPIs por modelo</div>

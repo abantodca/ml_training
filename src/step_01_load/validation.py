@@ -43,7 +43,7 @@ _NUMERIC_RANGES: dict = {
     "DPC": (0.0, None),        # dias post cosecha; tipicamente 0-180
     "P/BAYA": (0.0, None),     # peso por baya en gramos
     "HA": (0.0, None),         # hectareas cosechadas
-    "DIA_COSECHA": (1, 366),   # dia juliano del año
+    "DIA_COSECHA": (1, 366),   # dia desde inicio de campana (no DOY); cap >365 generoso
     # Para validar H-EF (jornada efectiva) usamos un rango plausible:
     "H-EF": (0.0, 24.0),       # horas efectivas en una jornada
     "KG/JR": (0.0, None),      # kilos por jornal

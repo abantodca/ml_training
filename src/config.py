@@ -18,11 +18,13 @@ Esquema de modelado (decidido tras EDA):
     Numericas (raw) : KG/HA, %INDUS, DPC, P/BAYA, HA, DIA_COSECHA
     Categoricas     : FORMATO, FUNDO
     Date-derived    : ANIO, MES_SIN/COS (orden 1-3), SEMANA_SIN/COS,
-                      DIA_SEM_SIN/COS, TEMPORADA_ALTA/BAJA  (creadas en FeatureGenerator)
+                      TEMPORADA_ALTA/BAJA  (creadas en FeatureGenerator)
+                      DIA_SEM_SIN/COS removidas (auditoria 2026-05-05: corr ~0).
     Structural      : KG_TOTAL, INDUS_KG_HA, KG_PER_BAYA, KG_HA_PER_DPC
                       (ratios intra-fila en FeatureGenerator)
-    Lag features    : ~31 cols rolling/seasonal/ratios por (FUNDO+FORMATO,
-                      FUNDO, FORMATO) en step_03_features/lag_features.py.
+    Lag features    : 35 cols rolling/seasonal/std/slope/ratios + tenure + cadencia
+                      por (FUNDO+FORMATO, FUNDO, FORMATO) en step_03_features/
+                      lag_features.py (ver LAG_OUTPUT_COLUMNS).
 
 Excluidas por LEAKAGE (target = KG/JR / H-EF, demostrado con max_abs_diff = 0):
     KG/JR, H-EF
@@ -56,11 +58,16 @@ S3_ARTIFACTS_BUCKET: str = os.environ.get("S3_ARTIFACTS_BUCKET", "")
 S3_ARTIFACTS_PREFIX: str = os.environ.get("S3_ARTIFACTS_PREFIX", "ml-training")
 S3_REPORTS_PREFIX: str = os.environ.get("S3_REPORTS_PREFIX", "ml-training/reports")
 
-# `mlruns/` solo se crea cuando el backend MLflow es file:// (caso default
-# del proyecto local-only). Si MLFLOW_TRACKING_URI apunta a un server
+# `mlruns/` se crea cuando el backend MLflow es local (file:// o sqlite://
+# apuntando a mlruns/mlflow.db). Si MLFLOW_TRACKING_URI apunta a un server
 # externo el dir queda inerte (no se crea para no producir ruido).
 _tracking_uri_raw = os.environ.get("MLFLOW_TRACKING_URI", "")
-_use_local_mlruns = (not _tracking_uri_raw) or _tracking_uri_raw.startswith("file:")
+_use_local_mlruns = (
+    (not _tracking_uri_raw)
+    or _tracking_uri_raw.startswith("file:")
+    or "mlruns/mlflow.db" in _tracking_uri_raw
+    or "mlruns\\mlflow.db" in _tracking_uri_raw
+)
 
 
 def init_dirs() -> None:
@@ -106,15 +113,27 @@ RAW_FEATURE_COLUMNS: list[str] = NUMERIC_FEATURES + CATEGORICAL_FEATURES + [DATE
 LEAKAGE_COLUMNS: list[str] = ["KG/JR", "H-EF"]
 USELESS_COLUMNS: list[str] = ["VARIEDAD", "DIA_SEM", "MES"]
 
+# Missing flags: columnas con missing significativo cuyo NaN es informativo.
+# `MissingFlagger` agrega `<col>__MISS` antes del imputer para que el modelo
+# reciba la senal de "esta fila tenia ese valor faltante". Decision basada
+# en EDA POP (filas con P/BAYA NaN -> MAPE 17.3% vs 15.6% observadas;
+# %INDUS similar). Si entrenas otra variedad con patrones distintos,
+# pasar `cols=` explicito al constructor de `MissingFlagger` o ajustar aqui.
+MISSING_FLAG_COLS: list[str] = ["%INDUS", "P/BAYA"]
+
 # ---------------------------------------------------------------------------
 # Hiperparametros de CV y tuning
 # ---------------------------------------------------------------------------
 RANDOM_STATE: int = 42
-# 'auto' = entrena TODOS los backends disponibles (xgb + lgb hoy) cada uno
+# 'auto' = entrena TODOS los backends del registry (xgb + lgb hoy) cada uno
 # con su Optuna study independiente, y `champion.select_champion` elige el
-# mejor por variedad usando composite_score (MAE_test penalizado por overfit).
-# Pasa "xgb" o "lgb" explicito si quieres saltarte la comparacion (ahorra
-# ~50% del tiempo). Pasa "xgb,lgb" o "all" para el mismo efecto que "auto".
+# mejor por variedad usando lex-order (gap -> full_mape -> tiempo). Si en
+# el futuro se agrega un nuevo backend al BACKEND_REGISTRY, "auto" lo
+# incluye automaticamente.
+#
+# Pasa "xgb" o "lgb" explicito para uno solo (ahorra ~50% tiempo). "xgb,lgb"
+# o "all" tambien validos. Nota: CatBoost fue evaluado y eliminado del
+# proyecto 2026-05-05 (no aportaba en POP; mismo patron que GAMM Phase 0).
 MODEL_TYPE_DEFAULT: str = "auto"
 
 # ---------------------------------------------------------------------------
@@ -124,13 +143,25 @@ MODEL_TYPE_DEFAULT: str = "auto"
 # se registra ni promueve en MLflow Registry. Los logs y artefactos se
 # guardan igual para auditoria.
 #
-# CHAMPION_MAX_MAPE: MAPE maximo aceptable en data completa (full refit).
-#   Valor en % (ej: 30.0 = 30%). Si el campeon supera este umbral,
-#   el modelo no se promueve. Ajustar segun baseline del negocio.
+# CHAMPION_MAX_MAPE: MAPE OOF maximo aceptable (out-of-fold, honesto).
+#   Valor en % (ej: 25.0 = 25%). Si el campeon supera este umbral,
+#   el modelo no se promueve. Comparado contra `champion.oof_mape`
+#   (cada fila predicha por un modelo que NO la vio en train).
+#   25% es ~8pp arriba del MAPE_oof observado en POP (~17%); deja
+#   holgura para variedades mas dificiles pero filtra modelos rotos.
+#   Antes era 30% comparado contra full_mape (in-sample, optimista).
 # CHAMPION_MAX_GAP: brecha maxima Train-Test aceptable (overfitting).
-#   Valor en % (ej: 15.0 = 15pp de diferencia entre MAPE_train y MAPE_test).
-CHAMPION_MAX_MAPE: float = float(os.environ.get("CHAMPION_MAX_MAPE", "30.0"))
-CHAMPION_MAX_GAP: float = float(os.environ.get("CHAMPION_MAX_GAP", "15.0"))
+#   Valor en % (18.0 = 18pp de diferencia entre MAE_train y MAE_test).
+#   Subido de 15 -> 18 tras evidencia empirica: con search spaces rev. 7.1
+#   (LGB) y rev. 6 (XGB) -- capacidad capada y regularizacion estricta
+#   forzada -- el suelo realista del gap para POP (10k filas, 16 estratos
+#   FUNDO_FORMATO, target con cola larga) ronda 0.13-0.18pp. 15pp era
+#   conservador sin restricciones de capacidad, y rechazaba modelos que
+#   ya combatieron el overfit pero rebotan contra el techo del dataset.
+#   Un overfit "real" (Optuna gaming el search space) deja gaps de 20+pp,
+#   que este threshold sigue rechazando correctamente.
+CHAMPION_MAX_MAPE: float = float(os.environ.get("CHAMPION_MAX_MAPE", "25.0"))
+CHAMPION_MAX_GAP: float = float(os.environ.get("CHAMPION_MAX_GAP", "18.0"))
 
 # ---------------------------------------------------------------------------
 # Decision lex-order del champion (champion.select_champion)
@@ -147,14 +178,6 @@ GAP_TIE_TOLERANCE: float = 0.005
 # tiempo. 0.5 pp de MAPE es ruido tipico entre seeds distintas.
 FULL_MAPE_TIE_TOLERANCE: float = 0.5
 
-# Si el meta GAM mejora al base por mas de este porcentaje (delta_pct < -X),
-# se considera que aporta valor real y se desempata a favor del modelo con
-# stacking activo. Por debajo de este umbral la mejora cae en ruido de CV.
-META_PREFERENCE_DELTA_PCT: float = -2.0
-
-# Auto-fallback del StackedRegressor: el meta debe mejorar el MAE del base
-# en al menos esta proporcion para no caer al base puro. 0.005 = 0.5%.
-STACKING_FALLBACK_RELATIVE_MARGIN: float = 0.005
 
 # ---------------------------------------------------------------------------
 # Tuning profiles (presupuesto de Optuna: cuantos trials, cuantos folds).
@@ -165,40 +188,30 @@ STACKING_FALLBACK_RELATIVE_MARGIN: float = 0.005
 #   dev     : ~10 min  (iteracion durante desarrollo)
 #   prod    : ~1.5 h   (modelo a promover)
 #   prod_xl : ~2.5 h   (baseline contra el cual medir si mas trials mueven MAPE)
-#
-# `meta_trials` se aplica SOLO si --stacking gam. Se ejecuta DESPUES del
-# nested CV del base, sobre las OOF preds que produce StackedRegressor.fit
-# (ver Opcion C en la nota de diseno de stacking.py). 0 = sin tuning del
-# meta (usa STACKING_GAM_N_SPLINES / STACKING_GAM_LAM como defaults).
-# Tiempo extra: ~meta_trials * 30s para dataset 10k filas.
 TUNING_PROFILES: dict[str, dict[str, int]] = {
     "smoke": {
         "n_trials": 5,
         "final_trials": 3,
         "outer_folds": 2,
         "inner_folds": 2,
-        "meta_trials": 0,
     },
     "dev": {
         "n_trials": 20,
         "final_trials": 10,
         "outer_folds": 3,
         "inner_folds": 3,
-        "meta_trials": 20,
     },
     "prod": {
         "n_trials": 60,
         "final_trials": 30,
         "outer_folds": 5,
         "inner_folds": 3,
-        "meta_trials": 30,
     },
     "prod_xl": {
         "n_trials": 100,
         "final_trials": 50,
         "outer_folds": 5,
         "inner_folds": 3,
-        "meta_trials": 50,
     },
 }
 DEFAULT_TUNING: str = "dev"
@@ -214,87 +227,27 @@ INNER_CV_FOLDS: int = TUNING_PROFILES[DEFAULT_TUNING]["inner_folds"]
 OOF_ENSEMBLE_K: int = 5
 
 # ---------------------------------------------------------------------------
-# Stacking (capa meta sobre el campeon XGB/LGB)
-# ---------------------------------------------------------------------------
-# "none" = campeon directo (default actual). "gam" = envuelve el campeon
-# en `StackedRegressor` con un GAM (pyGAM) como meta-learner.
-# El meta recibe [pred_base, X_subset] y emite la prediccion final.
-#
-# Por que el default es "none" (mayo 2026): en POP el GAM con el x_subset
-# actual (KG/HA, %INDUS, DIA_COSECHA, P/BAYA, FORMATO) cae a fallback en
-# 100% de los casos -- esas 5 features YA estan en el base XGB/LGB y el
-# GAM aditivo es estrictamente menos expresivo que el base con
-# interacciones. Resultado: -7-9% MAE vs base, fallback automatico, +5
-# minutos de computo por nada. Para que el meta aporte, el x_subset debe
-# incluir features que el base NO ve (estadisticos agregados por FUNDO,
-# residuos, etc.); hasta tener ese diseño, default = "none".
-STACKING_DEFAULT: str = "none"
-
-# Columnas raw que el GAM recibe ADEMAS de pred_base. Mantener corto
-# (3-7 features) evita curse-of-dim del GAM. Mezcla continuas + categoricas:
-# StackedRegressor detecta el dtype y elige `s()` (spline) o `f()` (factor)
-# automaticamente. Categoricas: label-encoded con map memorizado en fit.
-# Continuas con NaN ratio > STACKING_NAN_FLAG_THRESHOLD: se auto-genera
-# una flag <col>__ISNAN como factor adicional (evita que el spline se
-# pegue al pico de la mediana imputada).
-#
-# Decisiones del subset actual:
-#   - KG/HA, %INDUS, DIA_COSECHA  : continuas con MI alta y curvas suaves.
-#   - P/BAYA                       : continua con 39% missing -> spline +
-#                                    flag __ISNAN auto-generada (factor).
-#   - FORMATO                      : categorica -> factor por nivel (f()).
-#                                    Estabiliza overfit en formatos chicos
-#                                    donde un spline se pegaria al ruido.
-STACKING_X_SUBSET: list[str] = [
-    "KG/HA",
-    "%INDUS",
-    "DIA_COSECHA",
-    "P/BAYA",
-    "FORMATO",
-]
-
-# Folds del cross_val_predict interno para construir las OOF preds que
-# alimentan al GAM en fit. K=5 es estandar; bajar a 3 para `--tuning dev`.
-STACKING_OOF_FOLDS: int = 5
-
-# Defaults del GAM (pueden ser tuneados por Optuna via search_spaces).
-# `lam=1.5` (subido desde 0.6) prioriza smoothness sobre fit: data con
-# cola larga + gap CV->prod 3-5pp se beneficia mas de splines suaves
-# que de wiggle. Tunear con Optuna si una variedad pide otra cosa.
-STACKING_GAM_N_SPLINES: int = 15
-STACKING_GAM_LAM: float = 1.5
-
-# NaN ratio a partir del cual se auto-genera la flag <col>__ISNAN para
-# una columna continua del subset. El factor binario captura la senal
-# "imputed vs observed" sin que el spline alise el paso 0->1 como continuo.
-STACKING_NAN_FLAG_THRESHOLD: float = 0.10
-
-# Auto-fallback: tras fit, comparar MAE del base puro vs MAE del meta
-# sobre las OOF preds. Si el meta no mejora al base por mas de un
-# margen pequeno (~0.5%), `predict()` cae al base puro. Garantiza
-# que activar stacking nunca empeora vs el campeon.
-STACKING_AUTO_FALLBACK: bool = True
-
-# Tuning del meta GAM con Optuna. Se ejecuta sobre las OOF preds que
-# StackedRegressor.fit ya genera (Opcion C: reusar oof_pred del propio
-# stacked, no del nested CV del base). 0 = sin tuning (usa defaults).
-# El presupuesto recomendado vive en TUNING_PROFILES[<perfil>]["meta_trials"];
-# este valor es el fallback cuando el caller no override-a.
-STACKING_META_TRIALS_DEFAULT: int = 0
-
-# KFold interno del Optuna del meta. Un fold separado del OOF del base
-# evita que el GAM se entrene y valide sobre las MISMAS predicciones
-# (overfit del meta). 3 es un balance velocidad/varianza razonable.
-STACKING_META_INNER_FOLDS: int = 3
-
-# ---------------------------------------------------------------------------
 # MLflow
 # ---------------------------------------------------------------------------
-# Default: backend local file:// hacia ./mlruns. Si se setea
-# MLFLOW_TRACKING_URI en el entorno, se respeta (permite apuntar a un
-# MLflow server externo si el caso lo amerita). Para uso local-only
-# normal NO requiere ningun .env.
-MLFLOW_TRACKING_URI: str = _tracking_uri_raw or MLRUNS_DIR.as_uri()
+# Default: backend local SQLITE (sqlite:///mlruns/mlflow.db) -> habilita
+# Model Registry real con versionado y stage transitions. Antes era
+# file://mlruns/ que NO soporta Registry (register_model devolvia None).
+# Con el comparativo multi-backend (xgb + lgb hoy) tener registry funcional
+# es critico: cada training crea una nueva version del modelo registrado y
+# las versiones perdedoras quedan archivadas.
+#
+# Si MLFLOW_TRACKING_URI esta en el entorno se respeta (apuntar a server
+# externo o forzar file:// para casos legacy).
+#
+# `MLRUNS_ARTIFACT_LOCATION` se usa como `artifact_location` al crear
+# experimentos (ver `mlflow_registry.set_experiment`). Esto mantiene los
+# artifacts (pipelines, jsons, html) en `./mlruns/artifacts/<exp_id>/`,
+# en lugar del default de MLflow `./mlartifacts/`. Sin esto, sqlite
+# backend dispersaria metadata en mlruns/mlflow.db pero artifacts en
+# mlartifacts/, fragmentando el local store.
+MLFLOW_DEFAULT_DB: Path = MLRUNS_DIR / "mlflow.db"
+MLFLOW_TRACKING_URI: str = _tracking_uri_raw or f"sqlite:///{MLFLOW_DEFAULT_DB.as_posix()}"
+MLRUNS_ARTIFACT_LOCATION: str = (MLRUNS_DIR / "artifacts").as_uri()
 
 # Prefijo del nombre de experimento. El experimento final por variedad sera
 # `f"{MLFLOW_EXPERIMENT_PREFIX}{variety}"`.

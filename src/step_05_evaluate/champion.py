@@ -29,11 +29,9 @@ import numpy as np
 from src.config import (
     FULL_MAPE_TIE_TOLERANCE,
     GAP_TIE_TOLERANCE,
-    META_PREFERENCE_DELTA_PCT,
 )
 
 if TYPE_CHECKING:
-    from src.step_05_evaluate.stacking_diagnostics import StackingDiagnostics
     from src.step_06_track.business_validation import BusinessValidation
 
 
@@ -71,10 +69,6 @@ class ModelResult:
     full_metrics_h: Optional[Dict[str, float]] = None  # KG/JR_H in-sample
     oof_y_true: Optional[np.ndarray] = None
     oof_y_pred: Optional[np.ndarray] = None
-    # Diagnóstico de la capa meta (stacking). None si el pipeline no es
-    # un StackedRegressor. Lo extrae `single_run` con duck typing para que
-    # el dashboard / Excel lo consuman sin reabrir el joblib.
-    stacking_diagnostics: Optional["StackingDiagnostics"] = None
     composite_score: float = field(init=False)
 
     def __post_init__(self) -> None:
@@ -88,11 +82,32 @@ class ModelResult:
     def full_mape(self) -> float:
         """MAPE en KG/JR sobre el dataset completo (mas bajo es mejor).
 
+        IN-SAMPLE: refit + predict en TODO X (incluyendo train). Mide
+        estabilidad del modelo de produccion, no generalizacion. Lo usa
+        `select_champion` como criterio de desempate de "estabilidad".
+
         Si no hay metricas full disponibles, cae al MAPE OOF de negocio.
         Si tampoco, devuelve infinito (deja al modelo en ultimo lugar).
         """
         if self.full_metrics and "mape" in self.full_metrics:
             return float(self.full_metrics["mape"])
+        if self.business_metrics_oof and "mape" in self.business_metrics_oof:
+            return float(self.business_metrics_oof["mape"])
+        return float("inf")
+
+    @property
+    def oof_mape(self) -> float:
+        """MAPE en KG/JR sobre predicciones OUT-OF-FOLD (honesto).
+
+        Cada fila se predice con un modelo que NO la vio en train -> mide
+        generalizacion real. Es la metrica correcta para el quality gate
+        (CHAMPION_MAX_MAPE), porque `full_mape` es in-sample y subestima el
+        error de produccion.
+
+        Si no hay metricas OOF disponibles devuelve infinito (gate falla).
+        No cae a `full_mape` para evitar que el gate se relaje silenciosamente
+        cuando el OOF no se calculo.
+        """
         if self.business_metrics_oof and "mape" in self.business_metrics_oof:
             return float(self.business_metrics_oof["mape"])
         return float("inf")
@@ -123,38 +138,17 @@ def composite_score(
     return mae + 0.5 * gap
 
 
-def _meta_value_bucket(r: "ModelResult") -> int:
-    """Bucket de "valor real del stacking" para desempate.
-
-    Devuelve un entero menor (= mejor) cuando el modelo tiene la capa
-    meta activa Y mejora al base por mas de META_PREFERENCE_DELTA_PCT.
-    Si no hay stacking, fallback, o la mejora es ruido, todos comparten
-    el mismo bucket (sin preferencia). Asi el lex-order solo prefiere
-    stacking cuando aporta valor empiricamente.
-    """
-    diag = getattr(r, "stacking_diagnostics", None)
-    if diag is None or not diag.active:
-        return 0
-    if diag.delta_pct < META_PREFERENCE_DELTA_PCT:
-        return -1  # mejor (preferido)
-    return 0
-
-
 def _decision_key(r: "ModelResult") -> tuple:
     """Llave lex-order para `min(...)`. Aplica las tolerancias por bucket.
 
     Orden de prioridad:
       1. Bucket de |gap| (overfitting; empata si difiere < GAP_TIE_TOLERANCE).
       2. Bucket de MAPE total (estabilidad; idem FULL_MAPE_TIE_TOLERANCE).
-      3. Bucket de "valor del stacking" (prefiere meta activo SOLO si aporta
-         > -META_PREFERENCE_DELTA_PCT de mejora real). Sin esto el ranking
-         seria insensible al stacking.
-      4. Tiempo de entrenamiento (eficiencia).
+      3. Tiempo de entrenamiento (eficiencia).
     """
     gap_bucket = round(r.abs_gap / GAP_TIE_TOLERANCE)
     mape_bucket = round(r.full_mape / FULL_MAPE_TIE_TOLERANCE)
-    meta_bucket = _meta_value_bucket(r)
-    return (gap_bucket, mape_bucket, meta_bucket, r.elapsed_seconds)
+    return (gap_bucket, mape_bucket, r.elapsed_seconds)
 
 
 def select_champion(results: List[ModelResult]) -> ModelResult:
@@ -233,13 +227,11 @@ def champion_summary(
         "decision_criteria": [
             "1_min_abs_gap (overfitting)",
             "2_min_full_mape (estabilidad data total)",
-            "3_meta_value (stacking activo con mejora real)",
-            "4_min_elapsed_seconds (eficiencia)",
+            "3_min_elapsed_seconds (eficiencia)",
         ],
         "tolerances": {
             "gap": GAP_TIE_TOLERANCE,
             "full_mape_pp": FULL_MAPE_TIE_TOLERANCE,
-            "meta_preference_delta_pct": META_PREFERENCE_DELTA_PCT,
         },
         "justification": _justification(champion, rivals),
         "ranking": [

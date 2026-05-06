@@ -4,30 +4,35 @@
 #
 # Pipeline de etapas (src/):
 #   step_01_load       carga del acumulado / split por variedad
-#   step_02_clean      limpieza, missing flags, outlier capping
+#   step_02_clean      limpieza, missing flags, outlier capping (per-FUNDO)
 #   step_03_features   ratios estructurales + ciclicas + lags + one-hot
-#   step_04_train      tuning Optuna (XGB / LGB) + OOF ensemble + stacking GAM
-#   step_05_evaluate   metricas + champion + dashboard ejecutivo
-#   step_06_track      MLflow logging (file://mlruns)
+#   step_04_train      tuning Optuna (XGB / LGB) + OOF ensemble (K=5)
+#   step_05_evaluate   metricas + champion lex-order + dashboard ejecutivo
+#   step_06_track      MLflow logging (sqlite:///mlruns/mlflow.db + Registry)
 #
-# ENTORNO: corre en Windows / Linux local. MLflow file:// en ./mlruns.
+# ENTORNO: corre en Windows / Linux local. MLflow sqlite en mlruns/mlflow.db.
 #
 # Uso normal:
 #   task train VARIETIES=POP                           # entrena 1 variedad
-#   task train VARIETIES=POP,VENTURA                   # entrena varias
-#   task train VARIETIES=all                           # entrena todas
+#   task train VARIETIES=POP TUNING=dev                # baseline rapido (~20 min)
+#   task train VARIETIES=POP TUNING=prod               # produccion (~1.5h)
+#   task train VARIETIES=POP,VENTURA                   # varias variedades
+#   task train VARIETIES=all                           # todas
 #
-# Opciones avanzadas (train:local):
-#   TUNING=smoke|dev|prod|prod_xl   (presupuesto Optuna; default: prod)
-#   MODEL=auto|xgb|lgb              (default: auto = XGB + LGB, elige campeon)
-#   PARALLEL=N                      (variedades en paralelo, default 1)
-#   STACKING=none|gam               (default: none — GAM cae a fallback con x_subset actual)
+# Variables overrideables por CLI (defaults vienen aqui mismo):
+#   VARIETIES = lista CSV de variedades o "all" (default POP)
+#   TUNING    = smoke (~1 min) | dev (~20 min) |
+#               prod (~1.5h, default) | prod_xl (~2.5h)
+#   MODEL     = auto (default, xgb + lgb compiten lex-order) | xgb | lgb |
+#               combinaciones CSV ("xgb,lgb")
+#   PARALLEL  = variedades a entrenar en paralelo (default 1).
+#               2-4 segun cores. >1 setea automaticamente MODEL_N_JOBS=1
+#               para evitar oversubscription.
 #
 # Otros:
 #   task setup                                         # 1 vez tras clonar
 #   task data:split                                    # genera training xlsx
-#   task smoke                                         # ~1 min, POP, model auto
-#   task mlflow:ui                                     # abre la UI local en :5000
+#   task mlflow:ui                                     # UI en localhost:5000 (sqlite)
 #   task audit:compare -- --variety POP --last 5       # comparativa entre runs
 # =============================================================================
 
@@ -51,7 +56,6 @@ vars:
   #   task train:local VARIETIES=all PARALLEL=4 TUNING=prod
   TUNING: "{{.TUNING | default \"prod\"}}"
   MODEL: "{{.MODEL | default \"auto\"}}"
-  STACKING: "{{.STACKING | default \"none\"}}"
   VARIETIES: "{{.VARIETIES | default \"POP\"}}"
   PARALLEL: "{{.PARALLEL | default \"1\"}}"
   STAGE: "{{.STAGE | default \"\"}}"
@@ -96,59 +100,32 @@ tasks:
 
   # ═══ Training ═══════════════════════════════════════════════════════════
   # Uso:
-  #   task train VARIETIES=POP             # una variedad
-  #   task train VARIETIES=POP,VENTURA     # varias variedades
-  #   task train VARIETIES=all             # todas
+  #   task train VARIETIES=POP                   # una variedad (TUNING=prod)
+  #   task train VARIETIES=POP TUNING=dev        # baseline rapido (~20 min)
+  #   task train VARIETIES=POP MODEL=lgb         # solo LGB
+  #   task train VARIETIES=POP,VENTURA           # varias variedades
+  #   task train VARIETIES=all PARALLEL=3        # todas, 3 en paralelo
   #
   # Cada variedad es independiente: si una falla, las demas continuan.
-  # Defaults: TUNING=prod, MODEL=auto (XGB + LGB, elige campeon por variedad).
+  # Defaults: TUNING=prod, MODEL=auto (xgb + lgb compiten lex-order),
+  # PARALLEL=1.
 
   train:
-    desc: "Entrena variedades. VARIETIES=POP|POP,VENTURA|all"
+    desc: "Entrena variedades. Vars: VARIETIES=POP|POP,VENTURA|all  TUNING=smoke|dev|prod|prod_xl  MODEL=auto|lgb|xgb|xgb,lgb  PARALLEL=N"
     env:
       MLFLOW_TRACKING_URI: ""
     cmds:
-      - "{{.BASH}} scripts/sh/train_local.sh prod auto {{.VARIETIES}} 1
-        {{.STACKING}}"
-
-  # ═══ Feature importance (post-hoc, sin re-entrenar) ════════════════════
-  # Corre permutation_importance contra el ULTIMO campeon registrado para
-  # identificar features con importancia ~0 (candidatas a podar). No
-  # re-entrena: solo carga el modelo de mlruns/ y permuta features sobre el
-  # dataset. Tiempo: ~3-8 min con 10k filas.
-  #
-  # Uso:
-  #   task features:importance VARIETY=POP
-  #   task features:importance VARIETY=POP TOP=30 NREPEATS=5
-  #   task features:importance VARIETY=POP SAMPLE=3000     # acelera iterando
-
-  features:importance:
-    desc: "Permutation importance del ultimo champion (VARIETY=POP)"
-    vars:
-      VARIETY: "{{.VARIETY | default \"POP\"}}"
-      TOP: "{{.TOP | default \"25\"}}"
-      NREPEATS: "{{.NREPEATS | default \"10\"}}"
-      SAMPLE: "{{.SAMPLE | default \"0\"}}"
-    cmds:
-      - "{{.PY}} scripts/analyze_features.py --variety {{.VARIETY}}
-        --top {{.TOP}} --n-repeats {{.NREPEATS}} --sample {{.SAMPLE}}"
-
-  features:importance:retro:
-    desc: "Permutation importance + log a MLflow + re-render Winner HTML (retroactivo, no re-entrena)"
-    vars:
-      VARIETY: "{{.VARIETY | default \"POP\"}}"
-      NREPEATS: "{{.NREPEATS | default \"10\"}}"
-    cmds:
-      - "{{.PY}} scripts/analyze_features.py --variety {{.VARIETY}}
-        --n-repeats {{.NREPEATS}} --log-to-mlflow --rerender-html"
+      - "{{.BASH}} scripts/sh/train_local.sh {{.TUNING}} {{.MODEL}} {{.VARIETIES}} {{.PARALLEL}}"
 
   # ═══ MLflow UI (local) ══════════════════════════════════════════════════
 
   mlflow:ui:
     desc: "Abre la UI de MLflow local en http://localhost:5000 (Ctrl-C para cerrar)"
     cmds:
-      - "{{.PY}} -m mlflow ui --backend-store-uri file:./mlruns --host 127.0.0.1
-        --port 5000"
+      - "{{.PY}} -m mlflow ui
+        --backend-store-uri sqlite:///mlruns/mlflow.db
+        --default-artifact-root file:./mlruns/artifacts
+        --host 127.0.0.1 --port 5000"
 
   # ═══ Logs / Auditoria ═══════════════════════════════════════════════════
 

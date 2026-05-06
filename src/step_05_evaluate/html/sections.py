@@ -5,7 +5,6 @@
   3. Mega KPIs   : las 3 preguntas que importan en lenguaje simple.
   4. Guide       : ¿Como leer este reporte? + glosario.
   5. Actions     : recomendaciones auto-generadas.
-  6. Feature Importance : que variables sostienen el modelo (post-hoc).
 
 Cada `build_*` recibe primitivos / dataclasses listos (no hace I/O ni
 calculos pesados) y devuelve un fragmento HTML escapado.
@@ -25,6 +24,7 @@ from src.config import (
 from src.step_05_evaluate.champion import ModelResult
 from src.step_05_evaluate.explainability import (
     Action,
+    GroupBias,
     PlainKPI,
     TrainingContext,
     Verdict,
@@ -33,46 +33,7 @@ from src.step_05_evaluate.explainability import (
     kpi_precision,
     kpi_vs_baseline,
 )
-from src.step_05_evaluate.feature_importance import (
-    STATUS_CORE,
-    STATUS_NOISE,
-    STATUS_PRUNABLE,
-    STATUS_UTIL,
-    FeatureImportanceResult,
-)
 from src.step_05_evaluate.html.helpers import download_button
-from src.step_05_evaluate.stacking_diagnostics import StackingDiagnostics
-
-
-def _stacking_pill(stacking: Optional[StackingDiagnostics]) -> str:
-    """Pill del hero — comunica en una mirada si la capa meta está ayudando.
-
-    Tres estados visuales:
-      - active + improves_base : verde, "Capa meta ACTIVA · -X% error"
-      - active sin mejora      : amarillo, "Capa meta ACTIVA · cambio +X%"
-      - fallback               : gris, "Capa meta FALLBACK · usa modelo base"
-    Sin stacking devuelve string vacío (no contamina el hero del legacy).
-    """
-    if stacking is None:
-        return ""
-    if not stacking.active:
-        cls = "fallback"
-        sub = "usa modelo base · seguridad activada"
-    elif stacking.improves_base:
-        cls = "active"
-        sub = f"reduce error en {abs(stacking.delta_pct):.2f}%"
-    else:
-        cls = "neutral"
-        sub = f"cambio {stacking.delta_pct:+.2f}% en error"
-    return (
-        f'<div class="stacking-pill {cls}">'
-        f'<span class="dot"></span>'
-        f'<span class="text">'
-        f'<span class="lbl">Capa meta {stacking.status_label}</span>'
-        f'<span class="sub">{escape(sub)}</span>'
-        f'</span>'
-        f'</div>'
-    )
 
 
 def build_hero(
@@ -82,18 +43,9 @@ def build_hero(
     verdict: Verdict,
     excel_path: Optional[str],
     timestamp: str,
-    stacking: Optional[StackingDiagnostics] = None,
 ) -> str:
-    """Hero ejecutivo + pill de stacking si el campeón usa capa meta."""
-    pill = _stacking_pill(stacking)
-    # Etiqueta de modelo: si hay stacking activo, mostrar "XGB + GAM"; si
-    # hay fallback, "XGB (meta desactivada)"; si no hay stacking, solo XGB.
-    if stacking is None:
-        model_label = champion.model_type.upper()
-    elif stacking.active:
-        model_label = f"{champion.model_type.upper()} + {stacking.meta_type.upper()}"
-    else:
-        model_label = f"{champion.model_type.upper()} (meta desactivada)"
+    """Hero ejecutivo del dashboard."""
+    model_label = champion.model_type.upper()
     return f"""
     <div class="hero {verdict.color_key}">
       <div class="hero-text">
@@ -109,7 +61,6 @@ def build_hero(
         </div>
         <div class="verdict-headline">{escape(verdict.headline)}</div>
         <div class="verdict-body">{escape(verdict.body)}</div>
-        {pill}
       </div>
       <div class="hero-side">
         {download_button(excel_path, variety)}
@@ -121,7 +72,6 @@ def build_hero(
 def build_context_section(
     ctx: TrainingContext,
     champion: ModelResult,
-    stacking: Optional[StackingDiagnostics] = None,
 ) -> str:
     date_range = "—"
     if ctx.date_min and ctx.date_max:
@@ -132,15 +82,8 @@ def build_context_section(
     if ctx.n_formatos > 3:
         formatos_str += f", +{ctx.n_formatos - 3} más"
 
-    if stacking is None:
-        model_label = champion.model_type.upper()
-        model_sub = f"de {champion.elapsed_seconds:.0f}s entrenamiento"
-    elif stacking.active:
-        model_label = f"{champion.model_type.upper()} + {stacking.meta_type.upper()}"
-        model_sub = "modelo base + capa meta (stacking activo)"
-    else:
-        model_label = champion.model_type.upper()
-        model_sub = "modelo base (capa meta desactivada por seguridad)"
+    model_label = champion.model_type.upper()
+    model_sub = f"de {champion.elapsed_seconds:.0f}s entrenamiento"
 
     cards = "".join([
         f'<div class="ctx-card"><div class="label">Cosechas analizadas</div>'
@@ -196,7 +139,6 @@ def build_mega_kpis(
     pred: np.ndarray,
     full_mape: float,
     full_r2: Optional[float],
-    stacking: Optional[StackingDiagnostics] = None,
 ) -> str:
     k1 = kpi_precision(abs_errors, full_mape)
     k2 = kpi_explanatory_power(full_r2)
@@ -206,38 +148,12 @@ def build_mega_kpis(
         + _kpi_mega_card(k2, "📊")
         + _kpi_mega_card(k3, "📈")
     )
-    # Nota explícita sobre la fuente de los KPIs cuando hay stacking. Sin
-    # ella, el lector asume que el "modelo" del que hablan los KPIs es el
-    # mismo del hero — pero el OOF honesto se mide sobre el modelo base.
-    footnote = ""
-    if stacking is not None:
-        if stacking.active and stacking.improves_base:
-            footnote = (
-                f'<p class="kpi-footnote">Las cifras de arriba son del modelo '
-                f'base medido honestamente. La capa meta (activa) reduce el '
-                f'error en {abs(stacking.delta_pct):.2f}% adicional según el '
-                f'auto-diagnóstico interno — ver "Capa meta" en el detalle '
-                f'técnico.</p>'
-            )
-        elif stacking.active:
-            footnote = (
-                f'<p class="kpi-footnote">Las cifras de arriba son del modelo '
-                f'base medido honestamente. La capa meta está activa con un '
-                f'cambio de {stacking.delta_pct:+.2f}% en el error.</p>'
-            )
-        else:
-            footnote = (
-                '<p class="kpi-footnote">El modelo en producción es el '
-                'mostrado arriba: la capa meta no aportó mejora suficiente '
-                'y el sistema la desactivó automáticamente (auto-fallback).</p>'
-            )
     return f"""
     <section>
       <div class="eyebrow">Las preguntas que importan</div>
       <h2>¿Qué tan bueno es este modelo?</h2>
       <p class="lead">Tres respuestas en lenguaje simple. Si tienes 30 segundos para entender el modelo, lee esto.</p>
       <div class="kpi-mega-grid">{cards}</div>
-      {footnote}
     </section>
     """
 
@@ -269,193 +185,225 @@ def build_guide_section() -> str:
     """
 
 
-_FI_STATUS_LABELS: dict = {
-    STATUS_CORE: ("Núcleo", "🟢"),
-    STATUS_UTIL: ("Útil", "🟡"),
-    STATUS_PRUNABLE: ("Podable", "🔴"),
-    STATUS_NOISE: ("Ruido", "⚫"),
-}
+def build_bias_section(fundo_bias: List[GroupBias]) -> str:
+    """Sesgo direccional por FUNDO. Vacio si no hay sesgos significativos.
 
-_FI_STATUS_DESCRIPTIONS: dict = {
-    STATUS_CORE: (
-        "Variables que sostienen el modelo (≥5% del impacto SHAP total). "
-        "Sin ellas el error sube significativamente. NO eliminar."
-    ),
-    STATUS_UTIL: (
-        "Variables que aportan entre 1% y 5% del impacto SHAP total. "
-        "Mantener; eliminar solo si hay razón operativa (costo de captura)."
-    ),
-    STATUS_PRUNABLE: (
-        "Variables con contribución entre 0.1% y 1% del impacto SHAP total. "
-        "El modelo casi no las usa — eliminarlas simplifica el pipeline sin "
-        "degradar el error."
-    ),
-    STATUS_NOISE: (
-        "Variables con contribución <0.1% del impacto SHAP total. "
-        "Aporte despreciable — PODAR PRIMERO."
-    ),
-}
-
-
-def _direction_arrow(direction: float, threshold: float = 0.005) -> tuple[str, str]:
-    """Devuelve (icono, css_class) segun el signo y magnitud del SHAP signed avg."""
-    if abs(direction) < threshold:
-        return ("≈", "neutral")
-    if direction > 0:
-        return ("↑", "up")
-    return ("↓", "down")
-
-
-def build_feature_importance_section(fi: Optional[FeatureImportanceResult]) -> str:
-    """Sección SHAP de importancia de variables.
-
-    Renderiza:
-      - Resumen ejecutivo (cuántas en cada bucket).
-      - Top 15 features como barras horizontales con magnitud relativa
-        + dirección (↑/↓/≈) basada en SHAP value medio (signed).
-      - Beeswarm PNG (distribución de SHAP por feature, color = signo).
-      - Tabla colapsable con las 40 features clasificadas.
-      - Lista explícita de features ruido / podables (accionable).
-
-    Si `fi` es None, devuelve string vacío (la sección se omite del HTML).
+    Diferencia clave vs `actions`: aqui el problema NO es el tamano del
+    error, es la DIRECCION (sobreestima vs subestima). Un fundo con MAPE
+    razonable puede igual tener un sesgo del +8% sostenido que pasa
+    invisible en el filtro por magnitud y le cuesta dinero al negocio.
     """
-    if fi is None or fi.df.empty:
+    if not fundo_bias:
         return ""
+    rows = "".join(
+        f'<tr>'
+        f'<td>{escape(b.group_value)}</td>'
+        f'<td>{b.n}</td>'
+        f'<td class="{"sub" if b.direction == "subestima" else "sobre"}">'
+        f'{b.direction.upper()} {abs(b.bias_pct_of_real_mean):.1f}%'
+        f'</td>'
+        f'<td>{b.mean_signed_bias:+.2f} kg/jornal</td>'
+        f'</tr>'
+        for b in fundo_bias
+    )
+    return f"""
+    <section>
+      <div class="eyebrow">Diagnostico estructural</div>
+      <h2>Sesgo direccional por FUNDO</h2>
+      <p class="lead">
+        Fundos donde el modelo se desvia consistentemente hacia un lado
+        (sobre o subestima). El error puede estar en rango aceptable, pero
+        la direccion es sistematica: revisar la causa antes de automatizar
+        decisiones operativas en estos fundos.
+      </p>
+      <table class="bias-table">
+        <thead><tr>
+          <th>FUNDO</th><th>n</th><th>Sesgo</th><th>Diferencia promedio</th>
+        </tr></thead>
+        <tbody>{rows}</tbody>
+      </table>
+    </section>
+    """
 
-    df = fi.df
-    summary = fi.to_dict_summary()
-    top_n = min(15, len(df))
-    top_df = df.head(top_n)
-    max_imp = float(top_df["importance_mean"].max()) or 1.0
 
-    # ---- Bar chart (top 15) con dirección ----
-    rows: list[str] = []
-    for _, row in top_df.iterrows():
-        imp = float(row["importance_mean"])
-        std = float(row["importance_std"])
-        direction = float(row.get("direction_mean", 0.0))
-        arrow, dir_cls = _direction_arrow(direction)
-        width_pct = max(2.0, min(100.0, abs(imp) / max_imp * 100.0))
-        status = row["status"]
-        label, icon = _FI_STATUS_LABELS.get(status, (status, ""))
-        rows.append(
-            f'<div class="fi-row fi-{escape(status)}">'
-            f'<span class="fi-rank">#{int(row["rank"])}</span>'
-            f'<span class="fi-name">{escape(str(row["feature"]))}</span>'
-            f'<div class="fi-bar-wrap">'
-            f'<div class="fi-bar" style="width: {width_pct:.1f}%"></div>'
-            f'</div>'
-            f'<span class="fi-val">{imp:.4f} <small>±{std:.4f}</small></span>'
-            f'<span class="fi-dir {dir_cls}" title="impacto promedio: {direction:+.4f}">'
-            f'{arrow}</span>'
-            f'<span class="fi-badge {escape(status)}">{icon} {escape(label)}</span>'
-            f'</div>'
+def build_backends_comparison_section(
+    results: List[ModelResult],
+    champion: ModelResult,
+) -> str:
+    """Tabla comparativa de los backends que compitieron.
+
+    Solo se renderiza si len(results) >= 2. La fila del campeon va resaltada
+    y las otras muestran deltas absolutos vs campeon. Permite que el lector
+    ejecutivo entienda por que ese backend gano.
+    """
+    if len(results) < 2:
+        return ""
+    rows_html = ""
+    for r in sorted(results, key=lambda x: x.abs_gap):
+        is_champ = r.model_type == champion.model_type
+        delta_gap = r.abs_gap - champion.abs_gap
+        delta_mape = (
+            r.full_mape - champion.full_mape
+            if r.full_mape != float("inf") and champion.full_mape != float("inf")
+            else float("nan")
         )
-    bars_html = "".join(rows)
-
-    # ---- Beeswarm PNG embebido ----
-    if getattr(fi, "beeswarm_b64", None):
-        beeswarm_html = (
-            '<div class="fi-beeswarm">'
-            '<img alt="Distribución SHAP por variable" '
-            f'src="data:image/png;base64,{fi.beeswarm_b64}">'
-            '<p class="fi-bee-cap">Cada punto es una predicción individual. '
-            'Eje X = impacto de la variable en esa predicción (positivo = empuja '
-            'arriba, negativo = empuja abajo). Color rojo/azul refuerza el signo. '
-            'La <i>dispersión</i> de cada fila muestra qué tan variable es el '
-            'efecto entre cosechas.</p>'
-            '</div>'
+        delta_time = r.elapsed_seconds - champion.elapsed_seconds
+        crown = "👑 " if is_champ else ""
+        klass = "champ-row" if is_champ else ""
+        delta_gap_str = "—" if is_champ else f"{delta_gap:+.4f}"
+        delta_mape_str = (
+            "—" if is_champ
+            else (f"{delta_mape:+.2f} pp" if not np.isnan(delta_mape) else "—")
         )
-    else:
-        beeswarm_html = ""
-
-    # ---- Tabla colapsable: las 40 features ----
-    table_rows: list[str] = []
-    for _, row in df.iterrows():
-        status = row["status"]
-        label, icon = _FI_STATUS_LABELS.get(status, (status, ""))
-        direction = float(row.get("direction_mean", 0.0))
-        arrow, dir_cls = _direction_arrow(direction)
-        table_rows.append(
-            f'<tr class="fi-{escape(status)}">'
-            f'<td>{int(row["rank"])}</td>'
-            f'<td><code>{escape(str(row["feature"]))}</code></td>'
-            f'<td>{float(row["importance_mean"]):.4f}</td>'
-            f'<td>±{float(row["importance_std"]):.4f}</td>'
-            f'<td class="fi-dir-cell {dir_cls}">{arrow} {direction:+.4f}</td>'
-            f'<td><span class="fi-badge {escape(status)}">{icon} {escape(label)}</span></td>'
+        delta_time_str = "—" if is_champ else f"{delta_time:+.0f}s"
+        full_mape_str = (
+            f"{r.full_mape:.2f}%" if r.full_mape != float("inf") else "—"
+        )
+        rows_html += (
+            f'<tr class="{klass}">'
+            f'<td>{crown}{escape(r.model_type.upper())}</td>'
+            f'<td>{r.abs_gap:.4f}</td>'
+            f'<td>{delta_gap_str}</td>'
+            f'<td>{full_mape_str}</td>'
+            f'<td>{delta_mape_str}</td>'
+            f'<td>{r.elapsed_seconds:.0f}s</td>'
+            f'<td>{delta_time_str}</td>'
             f'</tr>'
         )
-    table_html = "".join(table_rows)
+    return f"""
+    <section>
+      <div class="eyebrow">Comparativo de modelos</div>
+      <h2>¿Por que gano este modelo?</h2>
+      <p class="lead">
+        El campeon se elige por orden lexicografico: primero menor brecha
+        Train-Test (overfitting), luego menor MAPE total, finalmente menor
+        tiempo. Cada candidato entreno en su propio Optuna study sobre la
+        misma data y CV.
+      </p>
+      <table class="backends-table">
+        <thead><tr>
+          <th>Modelo</th>
+          <th>|Brecha|</th><th>Δ vs campeon</th>
+          <th>MAPE total</th><th>Δ vs campeon</th>
+          <th>Tiempo</th><th>Δ vs campeon</th>
+        </tr></thead>
+        <tbody>{rows_html}</tbody>
+      </table>
+    </section>
+    """
 
-    # ---- Lista accionable: ruido + podables ----
-    actionable: list[str] = []
-    for status in (STATUS_NOISE, STATUS_PRUNABLE):
-        feats = df.loc[df["status"] == status, "feature"].tolist()
-        if not feats:
-            continue
-        label, icon = _FI_STATUS_LABELS[status]
-        desc = _FI_STATUS_DESCRIPTIONS[status]
-        feat_chips = "".join(f'<code class="fi-chip">{escape(f)}</code>' for f in feats)
-        actionable.append(
-            f'<div class="fi-actionable {escape(status)}">'
-            f'<div class="fi-act-title">{icon} {escape(label)} — {len(feats)} variable(s)</div>'
-            f'<div class="fi-act-desc">{escape(desc)}</div>'
-            f'<div class="fi-act-list">{feat_chips}</div>'
-            f'</div>'
+
+def build_statistical_diagnostic_section(
+    *,
+    mae_ci,
+    mape_ci,
+    r2_ci,
+    heteroscedasticity,
+    calibration_df,
+) -> str:
+    """Diagnostico estadistico riguroso: IC bootstrap + heteroscedasticity + calibration.
+
+    Solo se renderiza si hay al menos UNA pieza disponible (todas pueden venir
+    None si la muestra fue insuficiente).
+    """
+    if all(x is None for x in [mae_ci, mape_ci, r2_ci, heteroscedasticity, calibration_df]):
+        return ""
+
+    # IC bootstrap
+    ci_rows = ""
+    if mae_ci is not None:
+        ci_rows += (
+            f"<tr><td>Error absoluto medio (KG/JR)</td>"
+            f"<td>{mae_ci.point:.4f}</td>"
+            f"<td>[{mae_ci.ci_low:.4f}, {mae_ci.ci_high:.4f}]</td></tr>"
         )
-    actionable_html = "".join(actionable) if actionable else (
-        '<div class="fi-actionable info">'
-        '<div class="fi-act-title">✅ Sin variables candidatas a eliminar</div>'
-        '<div class="fi-act-desc">El modelo usa todas las features con importancia '
-        'mayor que el umbral mínimo. La poda no aporta.</div>'
-        '</div>'
+    if mape_ci is not None:
+        ci_rows += (
+            f"<tr><td>Error porcentual medio (%)</td>"
+            f"<td>{mape_ci.point:.2f}</td>"
+            f"<td>[{mape_ci.ci_low:.2f}, {mape_ci.ci_high:.2f}]</td></tr>"
+        )
+    if r2_ci is not None:
+        ci_rows += (
+            f"<tr><td>R² (variabilidad explicada)</td>"
+            f"<td>{r2_ci.point:.4f}</td>"
+            f"<td>[{r2_ci.ci_low:.4f}, {r2_ci.ci_high:.4f}]</td></tr>"
+        )
+    ci_block = (
+        f"<table class='backends-table'>"
+        f"<thead><tr><th>Métrica</th><th>Valor</th><th>IC 95%</th></tr></thead>"
+        f"<tbody>{ci_rows}</tbody></table>"
+        if ci_rows else ""
     )
 
-    # ---- Resumen ejecutivo ----
-    n_total = summary["fi_n_features"]
-    summary_html = (
-        f'<div class="fi-summary">'
-        f'<span class="fi-stat core">🟢 {summary["fi_n_core"]} núcleo</span> · '
-        f'<span class="fi-stat util">🟡 {summary["fi_n_util"]} útiles</span> · '
-        f'<span class="fi-stat podable">🔴 {summary["fi_n_prunable"]} podables</span> · '
-        f'<span class="fi-stat ruido">⚫ {summary["fi_n_noise"]} ruido</span> '
-        f'<small>(de {n_total} variables · método: {summary["fi_method"]} · '
-        f'{summary["fi_n_models"]} modelos · MAE base = {summary["fi_mae_base"]:.4f})</small>'
-        f'</div>'
-    )
+    # Heteroscedasticidad
+    hetero_block = ""
+    if heteroscedasticity is not None and not (heteroscedasticity.p_value != heteroscedasticity.p_value):
+        klass = "action warning" if heteroscedasticity.is_heteroscedastic else "action info"
+        icon = "⚠" if heteroscedasticity.is_heteroscedastic else "✅"
+        title = (
+            "Variabilidad del error NO uniforme"
+            if heteroscedasticity.is_heteroscedastic
+            else "Variabilidad del error uniforme"
+        )
+        hetero_block = (
+            f'<div class="{klass}" style="margin-top:12px;">'
+            f'<div class="icon">{icon}</div>'
+            f'<div class="body-wrap">'
+            f'<div class="title">{escape(title)}</div>'
+            f'<div class="body">{escape(heteroscedasticity.note)}</div>'
+            f'</div></div>'
+        )
+
+    # Calibration plot (Plotly)
+    calib_block = ""
+    if calibration_df is not None and len(calibration_df) > 0:
+        try:
+            from src.step_05_evaluate.diagnostics import plot_calibration_plotly
+            calib_block = plot_calibration_plotly(calibration_df)
+        except Exception:
+            calib_block = ""
 
     return f"""
     <section>
-      <div class="eyebrow">Importancia de variables (SHAP)</div>
-      <h2>¿Qué variables sostienen el modelo?</h2>
-      <p class="lead">Análisis post-hoc con SHAP TreeExplainer sobre los
-      {summary["fi_n_models"]} modelos del ensemble. Para cada predicción se
-      mide la contribución de cada variable. La <b>magnitud</b> indica cuánto
-      pesa la variable en el modelo; la <b>dirección</b> (↑/↓) indica si en
-      promedio empuja la predicción arriba o abajo. Variables con magnitud
-      ≈ 0 son candidatas a eliminar.</p>
+      <div class="eyebrow">Diagnóstico estadístico</div>
+      <h2>¿Qué tan confiables son estos números?</h2>
+      <p class="lead">
+        Tres respuestas con sustento estadístico: (1) cuánto puede variar
+        cada métrica si el dataset hubiera sido ligeramente distinto
+        (intervalos de confianza al 95% via bootstrap), (2) si el modelo
+        falla más en algunos rangos que en otros (heteroscedasticidad),
+        (3) si las predicciones promedio coinciden con los reales por bin
+        (calibración).
+      </p>
+      {ci_block}
+      {hetero_block}
+      {calib_block}
+    </section>
+    """
 
-      {summary_html}
 
-      <h3 style="margin-top:18px">Top {top_n} variables — magnitud y dirección</h3>
-      <div class="fi-chart">{bars_html}</div>
+def build_pdp_section(pdp_html: str) -> str:
+    """Renderiza el PDP (Partial Dependence Plot) si fue generado.
 
-      {beeswarm_html}
-
-      <h3 style="margin-top:24px">Decisión de poda</h3>
-      {actionable_html}
-
-      <details class="fi-table-wrap" style="margin-top:18px">
-        <summary>Ver clasificación completa de las {n_total} variables</summary>
-        <table class="fi-table">
-          <thead><tr>
-            <th>Rank</th><th>Variable</th><th>Magnitud</th><th>Std</th>
-            <th>Dirección</th><th>Estado</th>
-          </tr></thead>
-          <tbody>{table_html}</tbody>
-        </table>
-      </details>
+    `pdp_html` ya viene como `<div>` plotly desde
+    `diagnostics.plot_partial_dependence_plotly`. Si llega vacio (modelo no
+    expone feature_importances_, sklearn fallo, etc.), la seccion se omite.
+    """
+    if not pdp_html:
+        return ""
+    return f"""
+    <section>
+      <div class="eyebrow">¿Qué mueve la predicción?</div>
+      <h2>Efecto marginal de las features clave</h2>
+      <p class="lead">
+        Para cada una de las features más importantes, este gráfico muestra
+        cómo cambia la predicción promedio cuando esa feature varía,
+        manteniendo el resto constante. Pendiente positiva = la feature
+        eleva el pronóstico al subir; pendiente plana = el modelo no
+        depende fuerte de ella en ese rango.
+      </p>
+      {pdp_html}
     </section>
     """
 

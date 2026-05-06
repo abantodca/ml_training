@@ -116,7 +116,6 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
         out = pd.DataFrame(index=series.index)
         month = s.dt.month.astype(int)
         week = s.dt.isocalendar().week.astype(int)
-        dow = s.dt.dayofweek.astype(int)  # 0=Lunes..6=Domingo
 
         # MES: armonicos Fourier orden 1-3. El orden 1 modela la onda anual;
         # 2 y 3 capturan asimetria observada (caida ene-abr, pico sep-oct).
@@ -130,10 +129,11 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
         out["SEMANA_SIN"] = np.sin(2 * np.pi * week / 52.0)
         out["SEMANA_COS"] = np.cos(2 * np.pi * week / 52.0)
 
-        # DIA_SEM cíclico (lun-dom adyacentes). η²=0.0014 univariado pero
-        # captura la caida real sab-dom; sin/cos preferible al ordinal 1-7.
-        out["DIA_SEM_SIN"] = np.sin(2 * np.pi * dow / 7.0)
-        out["DIA_SEM_COS"] = np.cos(2 * np.pi * dow / 7.0)
+        # DIA_SEM_SIN/COS removidas tras auditoria empirica (2026-05-05):
+        # corr con KG/JR_H = +0.031 / -0.001 sobre 10073 filas POP. El η²=0.0014
+        # original era universal (toda la senal cabia en ruido); con boosted
+        # trees max_depth=4 las tomaba como splits aleatorios en folds chicos
+        # y inflaba varianza entre trials de Optuna.
 
         # Temporada agronomica (referencia=TRANSICION: may, nov, ambos 0).
         # ALTA=jun-oct (z>0), BAJA=dic-abr (z<0 por condicion de fruta).
@@ -170,7 +170,7 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
         # set sin re-evaluar.
         self.structural_feature_names_ = self._resolve_structural(X)
 
-        # Derivadas de fecha
+        # Derivadas de fecha (DIA_SEM_SIN/COS removidas: corr con target ~0).
         if date_col is not None:
             self.date_feature_names_ = (
                 [
@@ -178,7 +178,6 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
                     "MES_SIN2", "MES_COS2",
                     "MES_SIN3", "MES_COS3",
                     "SEMANA_SIN", "SEMANA_COS",
-                    "DIA_SEM_SIN", "DIA_SEM_COS",
                     "TEMPORADA_ALTA", "TEMPORADA_BAJA",
                 ]
                 + (["ANIO"] if self.add_year else [])

@@ -27,14 +27,16 @@ import pandas as pd
 from src.config import REPORT_PROJECT_NAME, REPORTS_DIR
 from src.step_05_evaluate.champion import ModelResult
 from src.step_05_evaluate.explainability import build_winner_kit
-from src.step_05_evaluate.feature_importance import FeatureImportanceResult
 from src.step_05_evaluate.html.sections import (
     build_actions_section,
+    build_backends_comparison_section,
+    build_bias_section,
     build_context_section,
-    build_feature_importance_section,
     build_guide_section,
     build_hero,
     build_mega_kpis,
+    build_pdp_section,
+    build_statistical_diagnostic_section,
 )
 from src.step_05_evaluate.html.styles import DASHBOARD_CSS, _PLOTLY_JS_TAG
 from src.step_05_evaluate.html.technical import build_technical_section
@@ -49,7 +51,6 @@ def render_winner_dashboard(
     output_dir: Optional[Path] = None,
     excel_path: Optional[str] = None,
     X_raw: Optional[pd.DataFrame] = None,
-    feature_importance: Optional[FeatureImportanceResult] = None,
 ) -> Path:
     """Genera `reports/Winner_{variety}.html` y devuelve la ruta."""
     out_dir = Path(output_dir) if output_dir else REPORTS_DIR
@@ -57,47 +58,74 @@ def render_winner_dashboard(
     out_path = out_dir / f"Winner_{variety}.html"
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
 
-    kit = build_winner_kit(
-        variety=variety, champion=champion, X_raw=X_raw,
-        feature_importance=feature_importance,
-    )
+    kit = build_winner_kit(variety=variety, champion=champion, X_raw=X_raw)
 
     hero = build_hero(
         variety=variety, champion=champion, verdict=kit.verdict,
-        excel_path=excel_path, timestamp=ts, stacking=kit.stacking,
+        excel_path=excel_path, timestamp=ts,
     )
-    context_html = build_context_section(kit.context, champion, stacking=kit.stacking)
+    context_html = build_context_section(kit.context, champion)
     mega_kpis = build_mega_kpis(
         kit.abs_err, kit.real, kit.pred, kit.oof_mape, kit.oof_r2,
-        stacking=kit.stacking,
     )
     guide = build_guide_section()
+    backends_compare = build_backends_comparison_section(results, champion)
+    stat_diag = build_statistical_diagnostic_section(
+        mae_ci=kit.mae_oof_ci, mape_ci=kit.mape_oof_ci, r2_ci=kit.r2_oof_ci,
+        heteroscedasticity=kit.heteroscedasticity,
+        calibration_df=kit.calibration,
+    )
+    bias_html = build_bias_section(kit.fundo_bias)
     actions_html = build_actions_section(kit.actions)
-    fi_html = build_feature_importance_section(kit.feature_importance)
+
+    # PDP (Partial Dependence Plots): defensivo, requiere cargar pipeline +
+    # transformar X_sample. Si cualquier paso falla, la seccion se omite.
+    pdp_html = ""
+    if X_raw is not None and champion.pipeline_path:
+        try:
+            import joblib
+            ensemble = joblib.load(champion.pipeline_path)
+            # Tomamos el primer pipeline del ensemble para preprocessor + features
+            inner_pipe = ensemble.models_[0] if hasattr(ensemble, "models_") else ensemble
+            preprocessor = inner_pipe.named_steps["preprocessor"]
+            X_sample = X_raw.head(min(500, len(X_raw)))
+            X_transformed = preprocessor.transform(X_sample)
+            from src.step_05_evaluate.diagnostics import plot_partial_dependence_plotly
+            pdp_html = plot_partial_dependence_plotly(
+                ensemble, X_transformed,
+                feature_names=list(X_transformed.columns),
+                top_k=5,
+            )
+        except Exception:
+            pdp_html = ""
+    pdp_section = build_pdp_section(pdp_html)
     technical = build_technical_section(
         results=results, champion=champion, decision=decision,
         X_aligned=kit.X_aligned, abs_errors=kit.abs_err, real=kit.real,
-        stacking=kit.stacking,
     )
 
     html = f"""<!doctype html>
-<html lang="es"><head><meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Winner · {escape(variety)} — {escape(REPORT_PROJECT_NAME)}</title>
-{_PLOTLY_JS_TAG}
-<style>{DASHBOARD_CSS}</style></head>
-<body>
-<div class="wrap">
-{hero}
-{context_html}
-{mega_kpis}
-{guide}
-{actions_html}
-{fi_html}
-{technical}
-<footer>Generado automáticamente por el pipeline de entrenamiento ML · {escape(ts)}</footer>
-</div>
-</body></html>"""
+        <html lang="es"><head><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>Winner · {escape(variety)} — {escape(REPORT_PROJECT_NAME)}</title>
+        {_PLOTLY_JS_TAG}
+        <style>{DASHBOARD_CSS}</style></head>
+        <body>
+        <div class="wrap">
+        {hero}
+        {context_html}
+        {mega_kpis}
+        {guide}
+        {backends_compare}
+        {stat_diag}
+        {pdp_section}
+        {bias_html}
+        {actions_html}
+        {technical}
+        <footer>Generado automáticamente por el pipeline de entrenamiento ML · {escape(ts)}</footer>
+        </div>
+        </body></html>
+    """
 
     out_path.write_text(html, encoding="utf-8")
     return out_path

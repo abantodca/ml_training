@@ -26,7 +26,7 @@ El transformer:
   - En `fit(X, y)` memoriza el historial necesario (FUNDO, FORMATO,
     FECHA, KG/HA, target). Ese historial viaja serializado dentro del
     pipeline cuando MLflow guarda el modelo.
-  - En `fit_transform(X, y)` ademas devuelve X con los 31 lag features
+  - En `fit_transform(X, y)` ademas devuelve X con los 35 lag features
     calculados sobre el train fold (sin leakage cross-fold).
   - En `transform(X_new)` calcula lags para filas nuevas usando solo el
     historial memorizado. Permite que el backend serve solo necesite
@@ -45,9 +45,11 @@ para construir el historial.
 Cold start
 ----------
 Filas sin >=3 observaciones previas en su grupo reciben sentinel
-`COLD_START_FILL_VALUE` (-1) y la flag `LAG_FF_COLD=1`. Los modelos
-de arbol manejan -1 como una hoja distinta sin necesidad de
-preprocessamiento adicional. Los ratios cold-start tambien son -1.
+`COLD_START_FILL_VALUE` (-1). Los modelos de arbol manejan -1 como una
+hoja distinta sin necesidad de preprocessamiento adicional. Las flags
+LAG_FF_COLD/LAG_FF_SEASONAL_COLD existian aqui pero se eliminaron tras
+permutation_importance (mayo 2026): el sentinel -1 ya comunica el
+cold-start a los arboles, la flag binaria era redundante.
 """
 from __future__ import annotations
 
@@ -67,8 +69,28 @@ MIN_PERIODS = 3
 COLD_START_FILL_VALUE = -1.0
 KG_HA_COL = "KG/HA"
 
+# Estabilizadores adicionales por FUNDO+FORMATO sobre KG/HA:
+# - std rolling 30: VOLATILIDAD del grupo. Un FUNDO+FORMATO con std alta
+#   es mas dificil de predecir; el arbol puede tratarlo distinto. Tambien
+#   alimenta predict_with_std de OOFEnsembleRegressor.
+# - slope rolling 30: regresion lineal de KG/HA contra t en ultimas 30 obs.
+#   Captura momentum (alza/caida) que la mediana no ve.
+# - days_since_last_FF: dias desde la cosecha previa en mismo FF. Senal de
+#   cadencia agronomica.
+# - REL_FORMATO_30: KG_HA_lag_F_30 / KG_HA_lag_FMT_30. Posicionamiento
+#   relativo del fundo dentro de su cohorte de formato.
+#
+# EWMA halflife=15 + std_FF_90 fueron evaluados pero descartados: corr
+# +0.98 con KG_HA_lag_FF_30 y +0.95 entre std_FF_30 y std_FF_90. Una sola
+# ventana cubre la senal de volatilidad sin duplicar.
+STD_WINDOW: int = 30
+SLOPE_WINDOW: int = 30
+
 # Lag estacional: ventana centrada en (fecha - 365d) con tolerancia +/-15d.
-# Captura ciclo agronómico anual (mismo periodo del año anterior por FUNDO+FORMATO).
+# Captura ciclo agronomico anual (mismo periodo del ano anterior por FUNDO+FORMATO).
+# Ventana ±30d (wide) fue evaluada (2026-05-05) y descartada: corr +0.969
+# con la ±15d sobre POP (cadencia diaria regular). La ventana mas amplia
+# captura casi exactamente las mismas obs -> redundancia.
 SEASONAL_PERIOD_DAYS: int = 365
 SEASONAL_TOLERANCE_DAYS: int = 15
 
@@ -116,29 +138,22 @@ def _seasonal_lag_for_group(dates_d: np.ndarray, values: np.ndarray) -> np.ndarr
     return out
 
 
-def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
-    """Agrega lags + ratios. Devuelve df con orden original preservado.
+# ---------------------------------------------------------------------------
+# Helpers privados de add_lag_features. Cada uno muta `df_work` in-place
+# (escribe columnas nuevas) y devuelve la lista de nombres agregados. La
+# mutacion es deliberada para evitar copiar ~10k filas x 30 columnas en
+# cada paso intermedio (cada call de pipeline.fit lo invoca).
+# ---------------------------------------------------------------------------
 
-    Por cada (FUNDO+FORMATO, FUNDO, FORMATO) x (KG_JR_H, KG_HA) x (30, 90):
-        <value>_lag_<grupo>_<window>      mediana de las N obs anteriores
 
-    Ratios "actual vs lag" (solo para KG_HA, que NO es leakage):
-        KG_HA_ratio_FF_30 / _90           KG/HA actual / lag respectivo
+def _compute_rolling_lags(df_work: pd.DataFrame) -> list[str]:
+    """Lags rolling por grupo (FF, F, FMT) x valor (KG_JR_H, KG_HA) x ventana.
 
-    Flags:
-        LAG_FF_COLD                       1 si grupo FUNDO+FORMATO sin historia
+    Para cada (alias, group_cols) en GROUP_DEFS y cada ventana en WINDOWS,
+    calcula la mediana rolling EXCLUYENDO la fila actual (shift(1) +
+    rolling). Resultado: ~24 columnas (3 grupos x 2 valores x 4 ventanas).
     """
-    needed = [c for grp in GROUP_DEFS for c in grp[1]] + [DATE_COLUMN, TARGET, KG_HA_COL]
-    missing = [c for c in needed if c not in df.columns]
-    if missing:
-        raise ValueError(f"add_lag_features: columnas faltantes: {missing}")
-
-    # Para que groupby+rolling sea correcto, ordenamos POR cada agrupacion antes
-    # de cada calculo. Conservamos el index original para restaurarlo al final.
-    df_work = df.copy()
-
     new_cols: list[str] = []
-
     for alias, group_cols in GROUP_DEFS:
         df_sorted = df_work.sort_values(group_cols + [DATE_COLUMN])
         for value_col, vname in [(TARGET, "KG_JR_H"), (KG_HA_COL, "KG_HA")]:
@@ -152,54 +167,247 @@ def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
     # marcar filas sin historia. Se eliminaron tras permutation_importance
     # (mayo 2026) que mostro importance ~0 / negativa: el sentinel -1 ya
     # comunica el cold-start a los arboles, la flag binaria era redundante.
+    return new_cols
 
-    # Lag estacional (mismo periodo del año anterior, ventana +/-15d). Solo
-    # para grupo FF. Captura ciclo agronómico anual que rolling 90d no ve.
+
+def _compute_volatility_and_momentum_lags(df_work: pd.DataFrame) -> list[str]:
+    """Volatilidad + momentum + cadencia por FUNDO+FORMATO (no usa target).
+
+    Anade 3 features con senal unica verificada (corr <0.85 con cualquier
+    rolling lag existente):
+
+    - KG_HA_std_FF_30: desviacion estandar rolling con shift(1). Senal de
+      volatilidad del grupo. Aporta capacidad de modular prediccion segun
+      cuan estable es el FF y alimenta predict_with_std.
+    - KG_HA_slope_FF_30: pendiente de regresion lineal KG/HA vs t en
+      ultimas 30 obs (shift(1)). Captura momentum (alza/caida) que la
+      mediana rolling no ve. Calculado sobre indices 0..n-1 de cada
+      ventana, normalizado para que la unidad sea kg/HA por observacion.
+    - days_since_last_FF: gap en dias hasta la observacion previa en el
+      mismo FF. Cadencia agronomica: gap largo -> fruta mas madura.
+
+    Operan solo sobre KG/HA y FECHA (no target) -> CV-safe sin logica
+    adicional. KG/HA y FECHA estan disponibles en filas nuevas.
+    """
+    new_cols: list[str] = []
+    df_sorted = df_work.sort_values(["FUNDO", "FORMATO", DATE_COLUMN])
+    grouped_kgha = df_sorted.groupby(["FUNDO", "FORMATO"], sort=False)[KG_HA_COL]
+
+    # 1) std rolling 30 sobre KG/HA por FF
+    std_name = f"KG_HA_std_FF_{STD_WINDOW}"
+    df_work.loc[df_sorted.index, std_name] = grouped_kgha.transform(
+        lambda s: s.shift(1).rolling(STD_WINDOW, min_periods=MIN_PERIODS).std()
+    )
+    new_cols.append(std_name)
+
+    # 2) slope rolling 30: pendiente OLS sobre KG/HA(t) en ventana de 30
+    #    (shift(1) excluye self). Helper interno: recibe Series, devuelve
+    #    Series de slopes. Usa apply para mantener legibilidad; el costo
+    #    es aceptable porque la ventana es chica (30) y solo corre en
+    #    LagFeatureTransformer.fit_transform (no en cada predict).
+    def _rolling_slope(s: pd.Series) -> pd.Series:
+        s_shift = s.shift(1)
+        return s_shift.rolling(SLOPE_WINDOW, min_periods=MIN_PERIODS).apply(
+            _slope_of_window, raw=True
+        )
+
+    slope_name = f"KG_HA_slope_FF_{SLOPE_WINDOW}"
+    df_work.loc[df_sorted.index, slope_name] = grouped_kgha.transform(_rolling_slope)
+    new_cols.append(slope_name)
+
+    # 3) days_since_last_FF: diferencia en dias hasta la fila previa en
+    #    mismo FF. Primera fila del grupo => NaN (cold-start, captado por
+    #    sentinel -1 al final de add_lag_features).
+    days_name = "days_since_last_FF"
+    fechas_sorted = pd.to_datetime(df_sorted[DATE_COLUMN])
+    diffs = (
+        fechas_sorted.groupby(
+            [df_sorted["FUNDO"], df_sorted["FORMATO"]], sort=False
+        )
+        .diff()
+        .dt.days.astype(float)
+    )
+    df_work.loc[df_sorted.index, days_name] = diffs.values
+    new_cols.append(days_name)
+
+    # 4) tenure_FUNDO: dias desde la PRIMERA observacion del FUNDO en el
+    #    dataset. Captura "antiguedad" del fundo dentro del registro. Un
+    #    fundo nuevo (tenure chico) puede tener manejo agronomico distinto
+    #    a uno con anos de historia. Independiente de days_since_last_FF
+    #    (que es gap entre cosechas consecutivas dentro de un FF).
+    #
+    #    CV-safe: en LagFeatureTransformer.transform, el min(FECHA) por
+    #    FUNDO se calcula sobre el dataframe COMBINED (history + new). El
+    #    history ya tiene las fechas mas antiguas del train, asi que el
+    #    min coincide con el visto en fit -> tenure de filas nuevas usa
+    #    el origen del FUNDO en el train, no en el test.
+    tenure_name = "tenure_FUNDO_days"
+    fechas_full = pd.to_datetime(df_work[DATE_COLUMN])
+    first_per_fundo = fechas_full.groupby(df_work["FUNDO"]).transform("min")
+    df_work[tenure_name] = (fechas_full - first_per_fundo).dt.days.astype(float)
+    new_cols.append(tenure_name)
+
+    return new_cols
+
+
+def _slope_of_window(arr: np.ndarray) -> float:
+    """Pendiente OLS de arr[i] vs i (i=0..n-1). NaN-aware via mean centering.
+
+    Cerrada algebraica para evitar la sobrecarga de scipy/sklearn:
+        slope = sum((x - x_mean)(y - y_mean)) / sum((x - x_mean)^2)
+    """
+    n = len(arr)
+    if n < MIN_PERIODS:
+        return np.nan
+    # Saltar NaN en y (raro porque KG/HA no tiene NaN post-imputer, pero
+    # defensivo cuando el helper se llama via rolling.apply en init de fold)
+    mask = ~np.isnan(arr)
+    if mask.sum() < MIN_PERIODS:
+        return np.nan
+    y = arr[mask]
+    x = np.arange(n, dtype=float)[mask]
+    x_centered = x - x.mean()
+    denom = (x_centered ** 2).sum()
+    if denom <= 0.0:
+        return np.nan
+    return float((x_centered * (y - y.mean())).sum() / denom)
+
+
+def _compute_seasonal_lags(df_work: pd.DataFrame) -> list[str]:
+    """Lag estacional (mismo periodo del ano anterior, ventana +/-15d).
+
+    Solo para grupo FUNDO+FORMATO. Captura ciclo agronomico anual que
+    el rolling 90d no ve. Devuelve 2 columnas (KG_JR_H, KG_HA).
+    """
+    new_cols: list[str] = []
     df_sorted_ff = df_work.sort_values(["FUNDO", "FORMATO", DATE_COLUMN])
     dates_d_all = pd.to_datetime(df_sorted_ff[DATE_COLUMN]).values.astype("datetime64[D]")
-    seasonal_cols: list[str] = []
     for value_col, vname in [(TARGET, "KG_JR_H"), (KG_HA_COL, "KG_HA")]:
         name = f"{vname}_lag_FF_seasonal"
         seasonal_arr = np.full(len(df_sorted_ff), np.nan, dtype=float)
         vals_all = df_sorted_ff[value_col].values.astype(float)
-        for _, pos_arr in df_sorted_ff.groupby(["FUNDO", "FORMATO"], sort=False).indices.items():
+        for _, pos_arr in df_sorted_ff.groupby(
+            ["FUNDO", "FORMATO"], sort=False
+        ).indices.items():
             seasonal_arr[pos_arr] = _seasonal_lag_for_group(
                 dates_d_all[pos_arr], vals_all[pos_arr]
             )
         df_work.loc[df_sorted_ff.index, name] = seasonal_arr
-        seasonal_cols.append(name)
         new_cols.append(name)
+    return new_cols
 
-    # Conteo de filas con cold-start (solo informativo para el log).
-    n_cold_pre = int(df_work[[c for c in new_cols if "_lag_FF_" in c]].isna().all(axis=1).sum())
-    n_cold_seasonal_pre = int(df_work[seasonal_cols].isna().all(axis=1).sum())
 
-    # Ratios actual vs lag (solo KG_HA: NO usa el target)
-    a30, a90 = "KG_HA_lag_FF_30", "KG_HA_lag_FF_90"
-    df_work["KG_HA_ratio_FF_30"] = _safe_ratio(df_work[KG_HA_COL], df_work[a30])
-    df_work["KG_HA_ratio_FF_90"] = _safe_ratio(df_work[KG_HA_COL], df_work[a90])
+def _compute_ratios(df_work: pd.DataFrame) -> list[str]:
+    """Ratios "actual vs algo": locales (vs propio lag) y global (vs pool).
+
+    Locales (KG_HA solo: NO usa target):
+        KG_HA_ratio_FF_30 = KG_HA_actual / KG_HA_lag_FF_30
+        KG_HA_ratio_FF_90 = KG_HA_actual / KG_HA_lag_FF_90
+
+    Global pool (vectorizado con rolling 30 obs sobre dataset ordenado por
+    fecha, shift(1) excluye self):
+        KG_HA_REL_GLOBAL_30 = KG_HA_actual / median(KG_HA en ultimas 30 obs
+                              globales). Capta "este fundo rinde mejor o
+                              peor que el promedio del mercado". Sesgo de
+                              incluir self-fundo es chico (~1/n_fundos).
+                              CV-safe via shift(1).
+
+    Delta short/long del target (ratio entre lags FF, NO usa el target
+    actual -> sigue siendo CV-safe):
+        delta_KG_JR_H_30_90 = KG_JR_H_lag_FF_30 / KG_JR_H_lag_FF_90
+
+    Requiere que `_compute_rolling_lags` ya haya escrito los lags FF/30 y
+    FF/90 (de los cuales este helper depende).
+    """
+    new_cols: list[str] = []
+
+    # Locales (KG_HA actual vs su lag FF)
+    df_work["KG_HA_ratio_FF_30"] = _safe_ratio(
+        df_work[KG_HA_COL], df_work["KG_HA_lag_FF_30"]
+    )
+    df_work["KG_HA_ratio_FF_90"] = _safe_ratio(
+        df_work[KG_HA_COL], df_work["KG_HA_lag_FF_90"]
+    )
     new_cols += ["KG_HA_ratio_FF_30", "KG_HA_ratio_FF_90"]
 
-    # delta_KG_JR_H_30_90 (ratio short/long del target)
-    a, b = "KG_JR_H_lag_FF_30", "KG_JR_H_lag_FF_90"
-    df_work["delta_KG_JR_H_30_90"] = _safe_ratio(df_work[a], df_work[b])
+    # Global pool (KG_HA actual vs mediana cross-fundos rolling 30 obs)
+    df_sorted_date = df_work.sort_values(DATE_COLUMN)
+    rolling_global_30 = (
+        df_sorted_date[KG_HA_COL]
+        .shift(1)
+        .rolling(30, min_periods=MIN_PERIODS)
+        .median()
+    )
+    df_work.loc[df_sorted_date.index, "_KG_HA_lag_GLOBAL_30"] = rolling_global_30
+    df_work["KG_HA_REL_GLOBAL_30"] = _safe_ratio(
+        df_work[KG_HA_COL], df_work["_KG_HA_lag_GLOBAL_30"]
+    )
+    df_work.drop(columns=["_KG_HA_lag_GLOBAL_30"], inplace=True)
+    new_cols.append("KG_HA_REL_GLOBAL_30")
+
+    # Delta short/long del target (entre lags, no leakage)
+    df_work["delta_KG_JR_H_30_90"] = _safe_ratio(
+        df_work["KG_JR_H_lag_FF_30"], df_work["KG_JR_H_lag_FF_90"]
+    )
     new_cols.append("delta_KG_JR_H_30_90")
 
-    # Imputar sentinel en TODO lo nuevo (incluyendo ratios)
+    # Posicionamiento del FUNDO dentro de su cohorte de FORMATO en el lag 30:
+    # KG_HA_lag_F_30 / KG_HA_lag_FMT_30 -> >1 si el fundo rinde por encima
+    # del promedio de su formato en ese horizonte, <1 si por debajo. Auditado
+    # vs los lag base: corr <0.5 -> senal independiente.
+    df_work["KG_HA_REL_FORMATO_30"] = _safe_ratio(
+        df_work["KG_HA_lag_F_30"], df_work["KG_HA_lag_FMT_30"]
+    )
+    new_cols.append("KG_HA_REL_FORMATO_30")
+
+    return new_cols
+
+
+def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Orquestador thin: rolling lags + seasonal + ratios + sentinel fill.
+
+    Devuelve `df` con orden original preservado. Las columnas agregadas son
+    las listadas en `LAG_OUTPUT_COLUMNS` (35 columnas).
+
+    Pipeline:
+        1. _compute_rolling_lags                 : FF/F/FMT x KG_JR_H/KG_HA x 7/14/30/90
+        2. _compute_seasonal_lags                : FF x ano-1 +/-15d
+        3. _compute_volatility_and_momentum_lags : std + slope + days_since + tenure
+        4. _compute_ratios                       : ratios FF/30,FF/90 + global + delta + REL_FORMATO
+        5. Sentinel fill (-1)                    : reemplaza NaN cold-start
+    """
+    needed = [c for grp in GROUP_DEFS for c in grp[1]] + [DATE_COLUMN, TARGET, KG_HA_COL]
+    missing = [c for c in needed if c not in df.columns]
+    if missing:
+        raise ValueError(f"add_lag_features: columnas faltantes: {missing}")
+
+    df_work = df.copy()
+    new_cols: list[str] = []
+    new_cols.extend(_compute_rolling_lags(df_work))
+    seasonal_cols = _compute_seasonal_lags(df_work)
+    new_cols.extend(seasonal_cols)
+    new_cols.extend(_compute_volatility_and_momentum_lags(df_work))
+    new_cols.extend(_compute_ratios(df_work))
+
+    # Conteo de filas con cold-start (solo informativo para el log).
+    n_cold_pre = int(
+        df_work[[c for c in new_cols if "_lag_FF_" in c]].isna().all(axis=1).sum()
+    )
+    n_cold_seasonal_pre = int(df_work[seasonal_cols].isna().all(axis=1).sum())
+
+    # Sentinel en todas las features nuevas (incluyendo ratios). El -1 ya
+    # le comunica al arbol que la fila es cold-start sin necesidad de flag.
     for c in new_cols:
         df_work[c] = df_work[c].fillna(COLD_START_FILL_VALUE)
 
-    # Bajado a DEBUG porque ahora se llama POR cada pipeline.fit() dentro
-    # de Optuna nested CV (~4500 veces para tuning prod), antes era 1 vez
-    # en data_loader. Para verlo, configurar `logger.setLevel(DEBUG)` en
-    # el caller, o subir a INFO temporalmente para diagnostico.
+    # DEBUG porque se llama por cada pipeline.fit dentro de Optuna nested CV
+    # (~4500 veces en TUNING=prod). Subir a INFO temporal solo para diagnostico.
     logger.debug(
         f"Lag features agregadas | grupos={[g[0] for g in GROUP_DEFS]} | "
         f"cold_start_FF={n_cold_pre} ({n_cold_pre/len(df_work)*100:.1f}%) | "
         f"cold_seasonal={n_cold_seasonal_pre} ({n_cold_seasonal_pre/len(df_work)*100:.1f}%) | "
         f"n_nuevas_cols={len(new_cols)}"
     )
-
     return df_work
 
 
@@ -214,9 +422,15 @@ LAG_OUTPUT_COLUMNS: List[str] = [
 ] + [
     "KG_JR_H_lag_FF_seasonal",
     "KG_HA_lag_FF_seasonal",
+    f"KG_HA_std_FF_{STD_WINDOW}",
+    f"KG_HA_slope_FF_{SLOPE_WINDOW}",
+    "days_since_last_FF",
+    "tenure_FUNDO_days",
     "KG_HA_ratio_FF_30",
     "KG_HA_ratio_FF_90",
     "delta_KG_JR_H_30_90",
+    "KG_HA_REL_GLOBAL_30",
+    "KG_HA_REL_FORMATO_30",
 ]
 
 # Columnas raw que el transformer necesita para hacer su trabajo. El resto
