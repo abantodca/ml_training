@@ -93,9 +93,18 @@ def _load_sheet_aligned(
         )
     n_before = len(df)
     df = df.dropna(subset=[TARGET]).reset_index(drop=True)
-    n_dropped = n_before - len(df)
-    if n_dropped:
-        logger.warning(f"{n_dropped} filas descartadas por target NaN ({sheet_name})")
+    n_dropped_target = n_before - len(df)
+    if n_dropped_target:
+        logger.warning(f"{n_dropped_target} filas descartadas por target NaN ({sheet_name})")
+    # EDA POP 2026-05-09: 83 duplicados estructurales (mismas filas) inflaban
+    # CV metrics. Hashing sobre todas las columnas (no solo features) detecta
+    # filas identicas. Mantener el PRIMERO (orden Excel = orden temporal en
+    # POP). Si se detectan duplicados, loggear y dropear.
+    n_pre_dedup = len(df)
+    df = df.drop_duplicates(keep="first").reset_index(drop=True)
+    n_dropped_dup = n_pre_dedup - len(df)
+    if n_dropped_dup:
+        logger.warning(f"{n_dropped_dup} duplicados estructurales descartados ({sheet_name})")
     return df, file_path, sheet_name
 
 

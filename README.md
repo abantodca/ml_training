@@ -11,9 +11,10 @@ Implementado con **scikit-learn** (Pipeline + transformers `BaseEstimator`),
 servidor remoto) para tracking + Model Registry, y un **dashboard HTML
 ejecutivo** autocontenido por variedad.
 
-**Entorno:** local-only (Windows / Linux). MLflow `file://mlruns/` por
-default. `Taskfile.yml` orquesta data split, smoke, training, MLflow UI
-local, logs y auditoría entre runs.
+**Entorno:** Docker (Windows / Linux / Mac). El stack local levanta MLflow
+server con Postgres + LocalStack S3 + nginx para reports HTML. El mismo
+compose se traslada a producción cambiando endpoints (RDS, S3 real, Caddy).
+`Taskfile.yml` orquesta build, up, data split, training, logs y auditoría.
 
 > **Nota sobre el nombre del repo:** se llama `ml_random_forest` por razones
 > históricas. El pipeline actual entrena **XGBoost + LightGBM** (no Random
@@ -104,7 +105,7 @@ sobrescribir entre re-entrenamientos:
 - `artifacts/run_summary_AGGREGATE.json` — resumen multi-variety: campeones, fallos, tiempo total.
 - `reports/Winner_<variety>.html` — dashboard ejecutivo autocontenido (solo para el campeón).
 - `reports/Winner_<variety>.xlsx` — Excel multi-hoja con métricas y predicciones (solo campeón).
-- `mlruns/` — backend local de MLflow (run versionado por modelo dentro del experimento de la variedad).
+- MLflow server (Docker, `task up`) — runs versionados, métricas, params, Model Registry. UI en `http://localhost:5000`. Backend Postgres (`pg-data` volume) + S3 LocalStack (`localstack-data` volume).
 - `logs/pipeline_run.log`, `logs/variety_<variety>.log`, `logs/business_audit.jsonl`.
 
 ---
@@ -159,7 +160,7 @@ ml_training/
     │   ├── business_validation.py           # KG/JR (= KG/JR_H × H-EF) OOF + in-sample
     │   └── business_export.py               # Winner_<variety>.xlsx multi-hoja
     └── orchestration/
-        ├── cli.py                           # argparse + resolve_models / resolve_varieties / resolve_settings
+        ├── cli.py                           # argparse + resolve_varieties / resolve_settings
         ├── single_run.py                    # entrena UN modelo para UNA variedad → ModelResult
         ├── variety_runner.py                # orquesta multi-modelo + select_champion + render dashboard
         ├── runners.py                       # run_sequential / run_parallel (procesos independientes)
@@ -172,7 +173,7 @@ ml_training/
 
 ```
 main.main()
-└── parse_args + resolve_models (auto | xgb | lgb | xgb,lgb | all)
+└── parse_args + valid_backends() (siempre entrena todos los del registry)
 └── runners.run_sequential | run_parallel
         └── variety_runner.run_variety(variety)
                 ├── 1. data_loader.load_data(sheet=variety)

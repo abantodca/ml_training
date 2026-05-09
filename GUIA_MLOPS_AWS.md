@@ -150,6 +150,119 @@ NOTAS de optimizacion:
 
 ---
 
+## 0.1 Stack local (Docker compose) — usa S3 real
+
+`docker-compose.yml` levanta el mismo set de servicios que produccion:
+**Postgres + MLflow + nginx (reports) + trainer**. La unica diferencia
+con AWS es que en local Postgres y nginx corren en containers; en
+produccion son RDS y Caddy/ALB. **No hay LocalStack**: el stack local
+escribe a S3 real (cuesta centavos al mes y elimina la divergencia
+con produccion).
+
+### Servicios del compose y su equivalente AWS
+
+| Local (compose)                            | AWS                              | Como cambia |
+|---|---|---|
+| `mlflow` (`ghcr.io/mlflow/mlflow:v3.12.0`) | ECS Fargate (§7)                 | Misma imagen; deploy via Task Definition |
+| `postgres` (`postgres:15-alpine`)          | RDS Postgres (§6)                | Cambia `--backend-store-uri` al endpoint RDS |
+| `reports` (`nginx:alpine` :8080)           | Caddy / S3 static website (§7.5) | Caddy con TLS automatico o S3+CloudFront |
+| `trainer` (Dockerfile local)               | AWS Batch job (§8)               | Push imagen a ECR, definir Job Definition |
+| volumen `pg-data`                          | RDS storage gp3                  | Auto-managed |
+| (S3 real)                                  | (S3 real)                        | Mismo bucket o cambiar a uno de produccion |
+| bind mount `./data` (rw)                   | S3 `data-raw` bucket (§3)        | `main.py` ya hidrata desde S3 (`_hydrate_data_from_s3`); rw para que `data:split` escriba `data/training/` |
+| bind mount `./logs`                        | CloudWatch Logs                  | `awslogs` driver en Job Definition |
+| bind mount `./artifacts`                   | S3 `${S3_ARTIFACTS_BUCKET}/artifacts/` | `s3_sync.py` ya lo hace al final del run |
+| bind mount `./reports`                     | S3 `${S3_ARTIFACTS_BUCKET}/reports/`   | Idem `s3_sync.py` |
+
+### URLs equivalentes
+
+| Concern        | Local (Docker)                      | Produccion (AWS)                                  |
+|---|---|---|
+| MLflow UI      | http://localhost:5000               | https://mlflow.tudominio.com (ALB → Fargate)      |
+| Reports HTML   | http://localhost:8080/reports/      | https://reports.tudominio.com (Caddy / S3+CF)     |
+| Artifacts dir  | http://localhost:8080/artifacts/    | s3://${S3_ARTIFACTS_BUCKET}/artifacts/ + signed URLs |
+| S3 backend     | s3://${S3_MLFLOW_BUCKET}/artifacts (real AWS) | mismo bucket o uno separado de produccion |
+
+### Setup inicial (una vez)
+
+```bash
+# 1) Configurar AWS CLI (creds quedan en ~/.aws/credentials del host)
+aws configure
+# Access Key ID + Secret + region (us-east-1) + format (json)
+
+# 2) Crear los buckets si no existen (idempotente)
+aws s3 mb s3://cabanto-ml-mlflow    --region us-east-1
+aws s3 mb s3://cabanto-ml-artifacts --region us-east-1
+# (o seguir §3 para versioning + encryption + lifecycle policies)
+
+# 3) Copiar .env con nombres de bucket (sin secretos: AWS reads from ~/.aws)
+cp .env.example .env
+# editar S3_MLFLOW_BUCKET, S3_ARTIFACTS_BUCKET, AWS_DEFAULT_REGION
+
+# 4) Levantar el stack y generar la data de training
+task build           # build imagen + up servicios + URLs
+task data:split      # genera DB-HISTORICA.xlsx dentro del container
+```
+
+### Comandos
+
+```bash
+task build                               # build imagen + up + URLs (primera vez o tras code change)
+task up                                  # levanta servicios sin rebuild (dia a dia)
+task data:split                          # genera DB-HISTORICA.xlsx (corre en container)
+task train VARIETIES=POP TUNING=smoke    # entrena dentro del trainer
+task logs                                # tail trainer + mlflow
+task down                                # detiene servicios (preserva Postgres + S3)
+task clean:docker                        # DESTRUCTIVO: borra Postgres (S3 queda intacto)
+```
+
+**Todo corre en Docker — no se requiere Python en el host.** Los scripts
+del repo (`prepare_data.py`, etc.) se invocan via `docker compose run --rm
+--entrypoint python trainer -m scripts.<modulo>`.
+
+### Migracion del modo legacy (`sqlite:///mlruns/mlflow.db` + LocalStack)
+
+Antes el proyecto tenia dos fallbacks:
+- `sqlite:///mlruns/mlflow.db` para correr sin Docker.
+- `localstack` para simular S3 sin gastar.
+
+Ambos modos se eliminaron (decision 2026-05-09): el backend MLflow es
+**siempre** un server (Postgres + S3 real). Implicaciones:
+
+- La carpeta `./mlruns/` ya no se crea ni se monta.
+- `MLFLOW_TRACKING_URI` siempre apunta a un server HTTP. Default
+  `http://localhost:5000` (host); dentro del container del trainer
+  `http://mlflow:5000` (DNS interno de compose).
+- El cliente NO setea `artifact_location` al crear experimentos: el server
+  decide via `--default-artifact-root` (apunta a `s3://${S3_MLFLOW_BUCKET}/artifacts`).
+- LocalStack queda fuera del stack. Si necesitas dev sin internet,
+  re-agregar el servicio temporalmente — pero la divergencia con prod
+  (auth, IAM, latencia) hace que no valga la pena por defecto.
+- Si tenias runs viejos en `./mlruns/` o en LocalStack: no se migran.
+  Re-correr lo que importe es mas limpio que `mlflow-export-import`.
+
+---
+
+## 0.2 Contrato del proyecto: la maquina elige el modelo
+
+El pipeline siempre entrena TODOS los backends del registry (XGB + LGB
+hoy) y `champion.select_champion` elige el ganador por variedad (lex-order:
+**gap → full_mape → tiempo**). NO hay flag `--model` para forzar uno solo:
+el operador no decide que modelo gana, decide la metrica.
+
+Implicaciones operativas:
+- Un job de AWS Batch entrena XGB y LGB en paralelo dentro del mismo proceso
+  (un solo container, un solo job). El paralelismo de variedades se controla
+  con `--parallel-varieties N`.
+- Si en el futuro se agrega un backend al `BACKEND_REGISTRY` (ngboost,
+  tabnet, ...), entra automaticamente al torneo sin cambios en CLI ni en
+  Job Definition.
+- Los runs perdedores quedan **soft-deleted** en MLflow (Postgres, recuperables
+  con `client.restore_run`). El campeon queda como unico run visible y se
+  registra en Model Registry.
+
+---
+
 ## 1. Variables base (correr en CADA sesion)
 
 ```bash
@@ -583,6 +696,99 @@ NOTA: Para que Batch llame a MLflow vía DNS interno (sin pasar por ALB
 público), podés crear un ALB interno separado o usar Service Connect /
 Cloud Map. Para arrancar, el ALB público restringido por SG (solo desde
 SG_BATCH) ya alcanza.
+
+---
+
+### 7.5 Reports / artifacts: serving HTTP en produccion
+
+En local los reports HTML se sirven via nginx (servicio `reports` del
+compose, puerto 8080). En produccion las opciones, ordenadas por costo
+y simplicidad:
+
+#### Opcion A — S3 static website + CloudFront (recomendada)
+
+Costo casi cero (~$0.50-2/mes), CDN global, TLS automatico, escalable.
+`s3_sync.py` ya sube los reports a `s3://${S3_ARTIFACTS_BUCKET}/reports/`
+al final del training.
+
+```bash
+# 1) Habilitar static website hosting en el bucket
+aws s3 website s3://${S3_ARTIFACTS_BUCKET} \
+  --index-document index.html
+
+# 2) (Opcional) bucket policy para servir solo via CloudFront
+#    (se asocia al OAC de la distribucion en el step 3)
+
+# 3) CloudFront distribution con OAC apuntando al bucket
+aws cloudfront create-distribution \
+  --origin-domain-name ${S3_ARTIFACTS_BUCKET}.s3.${AWS_REGION}.amazonaws.com \
+  --default-root-object index.html \
+  --enabled \
+  --comment "ml-training reports"
+
+# 4) (Opcional) custom domain reports.tudominio.com:
+#    - ACM cert en us-east-1
+#    - Alias en CloudFront
+#    - Route 53 A-ALIAS al CloudFront
+```
+
+URL final: `https://d1abc123.cloudfront.net/reports/Winner_POP_2026-05-09.html`
+(o `https://reports.tudominio.com/...` con domain custom).
+
+#### Opcion B — Caddy en ECS Fargate (mismo patron que nginx local)
+
+Si querés mantener la estructura "una imagen por servicio" del compose, Caddy
+es el equivalente directo de nginx con TLS automatico via Let's Encrypt:
+
+```dockerfile
+# Dockerfile.reports
+FROM caddy:2-alpine
+COPY Caddyfile /etc/caddy/Caddyfile
+```
+
+```caddyfile
+# Caddyfile
+reports.tudominio.com {
+    root * /srv
+    file_server browse
+    encode gzip zstd
+    log {
+        output stdout
+    }
+}
+```
+
+Y la fuente de archivos puede ser:
+- **EFS mount** en la task (artifacts/reports leen desde EFS),
+- **`s3fs`** (lento, no recomendado),
+- O un sidecar que sincroniza S3 → volumen ephemeral cada N minutos.
+
+Costo: ~$15/mes (Fargate 0.5 vCPU 1 GB) + tráfico. Solo justifica si ya
+tenés Caddy en otros servicios.
+
+#### Opcion C — ALB + signed URLs (privado)
+
+Si los reports tienen info sensible y no querés exposicion publica:
+
+1. Reports quedan en S3 privado (bucket policy: deny public).
+2. Una Lambda detrás de ALB recibe `?run_id=XXX&variety=POP`,
+   genera una signed URL con `boto3.client('s3').generate_presigned_url`
+   (TTL 5 min) y devuelve un `302 Location: <signed-url>`.
+3. El usuario nunca ve el bucket; el link expira solo.
+
+Mas codigo, pero es la unica opcion que pasa auditoría si los reports
+contienen datos de cliente.
+
+#### Resumen
+
+| Opcion | Costo/mes | TLS  | Privacidad     | Cuando elegir |
+|---|---|---|---|---|
+| A: S3+CloudFront | ~$1     | Auto | Publico (o OAC)| Default. Reports compartidos al equipo de negocio. |
+| B: Caddy Fargate | ~$15    | Auto | Publico        | Ya tenes Caddy en el stack para otros services. |
+| C: ALB+Lambda+signed | ~$20 | Auto | Privado        | Compliance / datos sensibles. |
+
+`s3_sync.py` ya cubre la pieza de "subir a S3" para A y C. Para B necesitas
+sync adicional al volumen montado.
 
 ---
 

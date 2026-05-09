@@ -6,10 +6,10 @@ Cada llamada a `single_run.train_model` persiste 3 archivos versionados por
     artifacts/run_summary_<variety>_<model>_v<N>.json
     artifacts/best_params_<variety>_<model>_v<N>.json
 
-MLflow conserva el historial completo de runs (cada uno con su `run_id` y
-artifacts en `mlruns/`), asi que la limpieza local NO pierde informacion:
-solo libera disco. Para recuperar un run viejo borrado de aqui, descargar
-desde MLflow UI o via `mlflow.artifacts.download_artifacts`.
+MLflow conserva el historial completo de runs (Postgres + S3), asi que la
+limpieza local NO pierde informacion: solo libera disco del host. Para
+recuperar un run viejo borrado de aqui, descargar desde MLflow UI o via
+`mlflow.artifacts.download_artifacts`.
 
 Uso:
     python -m scripts.clean_artifacts --keep 10

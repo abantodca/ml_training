@@ -1,13 +1,9 @@
 """Wrappers thin sobre MLflow para mantener `main.py` legible.
 
-Modos soportados:
-    1. Backend LOCAL (file://mlruns/)         - default del proyecto.
-    2. Backend EXTERNO (http://host:5000)     - via MLFLOW_TRACKING_URI.
-    3. Model Registry                         - solo con backend SQL (no file://).
-
-El URI se resuelve UNA SOLA VEZ desde `src.config`, donde se lee la env var
-si existe; si no, file://mlruns/ local. La promocion al Model Registry
-requiere un backend SQL (file:// retorna None silenciosamente).
+Backend unico: MLflow server con Postgres (metadata + Registry) + S3
+(artifacts). En local lo sirve `docker compose up`. En produccion el
+mismo URI apunta al server real. Model Registry siempre habilitado
+(Postgres lo soporta nativamente; el viejo modo file://mlruns no).
 """
 from __future__ import annotations
 
@@ -21,7 +17,7 @@ import mlflow.sklearn
 from mlflow.exceptions import MlflowException
 from mlflow.models import infer_signature
 
-from src.config import MLFLOW_TRACKING_URI, MLRUNS_ARTIFACT_LOCATION, MODEL_REGISTRY_PREFIX
+from src.config import MLFLOW_TRACKING_URI, MODEL_REGISTRY_PREFIX
 
 _logger = logging.getLogger(__name__)
 
@@ -30,8 +26,8 @@ def _is_inactive_run_error(exc: MlflowException) -> bool:
     """True si la excepcion proviene de operar sobre un run no-activo.
 
     Pasa cuando el run fue marcado como `deleted` externamente (UI de MLflow,
-    rm -rf mlruns/, otro proceso) entre `start_run()` y la llamada de logging.
-    El mensaje de MLflow incluye 'active' lifecycle_stage en ese caso.
+    cliente paralelo, soft-delete via API) entre `start_run()` y la llamada
+    de logging. El mensaje de MLflow incluye 'active' lifecycle_stage.
     """
     msg = str(exc).lower()
     return "lifecycle_stage" in msg or "must be in 'active'" in msg
@@ -44,8 +40,8 @@ def safe_start_run(run_name: str) -> Iterator[mlflow.ActiveRun]:
 
     El `with mlflow.start_run()` nativo llama `set_terminated` en `__exit__`,
     y si el run fue marcado como `deleted` externamente (UI de MLflow,
-    `rm -rf mlruns/`, otro proceso) ese set_terminated lanza MlflowException
-    y derriba el train_model entero — perdiendo el modelo ya entrenado.
+    cliente paralelo) ese set_terminated lanza MlflowException y derriba
+    el train_model entero — perdiendo el modelo ya entrenado.
 
     Aqui hacemos start manual, dejamos que el cuerpo corra, y al salir
     intentamos `end_run()`; si falla por lifecycle_stage, lo absorbemos
@@ -103,25 +99,13 @@ def init_mlflow(
 
 
 def set_experiment(experiment_name: str) -> None:
-    """Wrapper sobre `mlflow.set_experiment` con artifact_location explicito.
+    """Wrapper sobre `mlflow.set_experiment`.
 
-    Si el experimento NO existe, lo crea con `artifact_location` apuntando a
-    `mlruns/artifacts/<exp_id>/` (consistente con backend sqlite local). Sin
-    esto MLflow usaria su default `./mlartifacts/`, fragmentando el store
-    local entre `mlruns/mlflow.db` (metadata sqlite) y `mlartifacts/`
-    (artifacts).
-
-    Si el experimento YA existe, conserva su `artifact_location` historico
-    (no lo modifica) -- evita romper experimentos creados antes de la
-    migracion sqlite.
+    El `artifact_location` lo decide el server con `--default-artifact-root`
+    (s3://ml-mlflow/artifacts en local; bucket real en produccion). El
+    cliente NO debe pasar artifact_location: si lo hace, MLflow usaria un
+    path del cliente que el server no puede leer.
     """
-    client = mlflow.tracking.MlflowClient()
-    exp = client.get_experiment_by_name(experiment_name)
-    if exp is None:
-        mlflow.create_experiment(
-            name=experiment_name,
-            artifact_location=MLRUNS_ARTIFACT_LOCATION,
-        )
     mlflow.set_experiment(experiment_name)
 
 

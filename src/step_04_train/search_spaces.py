@@ -27,7 +27,20 @@ import optuna
 
 
 def suggest_preprocessor_params(trial: optuna.Trial) -> Dict[str, object]:
-    """Hiperparametros del preprocesador que tambien tuneamos."""
+    """Hiperparametros del preprocesador que tambien tuneamos.
+
+    EDA POP 2026-05-09 incorporo dos transformers nuevos al preprocesador:
+        - `LOFOutlierScorer` (step_02_clean.outlier_score) — agrega
+          `lof_score` feature. Tuneamos `n_neighbors` (5-50) para que
+          Optuna decida cuanto contexto local usar.
+        - skew-mitigated features (log1p / sqrt) en FeatureGenerator no
+          requieren tuning — son determinísticas dado el dataset.
+
+    Los rangos de los hiperparametros del MODELO (XGB/LGB) NO se cambian
+    en esta revision: estan bien justificados con runs historicos. La
+    incorporacion de features nuevas (LOF + t_index + log1p/sqrt versions)
+    se valida via A/B en Phase 8 antes de retunear el modelo.
+    """
     return {
         "preprocessor__imputer__n_neighbors": trial.suggest_int(
             "preprocessor__imputer__n_neighbors", 3, 25
@@ -37,6 +50,9 @@ def suggest_preprocessor_params(trial: optuna.Trial) -> Dict[str, object]:
         ),
         "preprocessor__outliers__factor": trial.suggest_float(
             "preprocessor__outliers__factor", 1.5, 5.0
+        ),
+        "preprocessor__outlier_score__n_neighbors": trial.suggest_int(
+            "preprocessor__outlier_score__n_neighbors", 5, 50
         ),
     }
 

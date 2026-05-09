@@ -6,13 +6,14 @@ from sklearn.pipeline import Pipeline
 
 from src.step_02_clean.imputers import CustomKNNImputer
 from src.step_02_clean.missing_flags import MissingFlagger
+from src.step_02_clean.outlier_score import LOFOutlierScorer
 from src.step_02_clean.outliers import OutlierCapper
 from src.step_03_features.feature_engineering import FeatureGenerator
 from src.step_03_features.lag_features import LagFeatureTransformer
 
 
 def create_preprocessing_pipeline() -> Pipeline:
-    """Encadena: lags -> missing flags -> imputacion KNN -> capping -> ciclicas -> filtro varianza.
+    """Encadena: lags -> missing flags -> imputacion KNN -> capping -> LOF score -> ciclicas -> filtro varianza.
 
     Lag features (step 0): `LagFeatureTransformer` calcula rolling windows
     POR fold durante CV (sin leakage) y memoriza el historial para
@@ -38,6 +39,12 @@ def create_preprocessing_pipeline() -> Pipeline:
             ("missing_flags", MissingFlagger()),
             ("imputer", CustomKNNImputer()),
             ("outliers", OutlierCapper(group_col="FUNDO")),
+            # LOF como FEATURE (additive). EDA POP 2026-05-09 detecto kurt=158
+            # en DPC y 9.1% outliers IQR en KG/HA. LOF informa al modelo cuando
+            # una fila es atipica multivariadamente — los arboles deciden si lo
+            # usan o no. Va DESPUES del imputer (LOF no acepta NaN) y ANTES de
+            # FeatureGenerator (asi el score se conserva en el output final).
+            ("outlier_score", LOFOutlierScorer()),
             ("feature_engineering", FeatureGenerator()),
             (
                 "variance_filter",

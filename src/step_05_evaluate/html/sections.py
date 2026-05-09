@@ -588,6 +588,71 @@ def build_errors_detail_section(
     """
 
 
+def build_diagnostic_links_section(
+    variety: str,
+    reports_dir,
+) -> str:
+    """Linkea reportes diagnosticos (EDA + Residuals) si existen como hermanos.
+
+    Detecta automaticamente:
+      - reports/EDA_<variety>_*.html  (mas reciente por mtime)
+      - reports/residuals_<variety>_*.html (todas)
+
+    Si ninguno existe, devuelve cadena vacia (la seccion se omite).
+    """
+    from pathlib import Path
+
+    rdir = Path(reports_dir)
+    if not rdir.exists():
+        return ""
+
+    eda_candidates = sorted(rdir.glob(f"EDA_{variety}_*.html"),
+                            key=lambda p: p.stat().st_mtime, reverse=True)
+    residual_candidates = sorted(rdir.glob(f"residuals_{variety}_*.html"),
+                                 key=lambda p: p.stat().st_mtime, reverse=True)
+
+    cards = []
+    if eda_candidates:
+        latest_eda = eda_candidates[0].name
+        cards.append(
+            f'<a class="diag-link" href="{escape(latest_eda)}" target="_blank">'
+            f'<div class="diag-icon">📊</div>'
+            f'<div class="diag-meta">'
+            f'<div class="diag-title">EDA Diagnostico (data raw)</div>'
+            f'<div class="diag-sub">Distribuciones · ACF/PACF · BP/White · VIF · MI · drift PSI</div>'
+            f'</div></a>'
+        )
+    if residual_candidates:
+        # Mostrar todos los modelos (xgb_v1, lgb_v3, etc.)
+        for r in residual_candidates[:5]:
+            label = r.stem.replace(f"residuals_{variety}_", "")
+            cards.append(
+                f'<a class="diag-link" href="{escape(r.name)}" target="_blank">'
+                f'<div class="diag-icon">🔬</div>'
+                f'<div class="diag-meta">'
+                f'<div class="diag-title">Residual diagnostics — {escape(label)}</div>'
+                f'<div class="diag-sub">DW · Ljung-Box · BP/White · QQ · resid vs pred</div>'
+                f'</div></a>'
+            )
+
+    if not cards:
+        return ""
+
+    return f"""
+    <section>
+      <div class="eyebrow">Diagnosticos profundos</div>
+      <h2>Reportes vinculados</h2>
+      <p class="muted">
+        Reportes auxiliares con tests estadisticos detallados. Estan en
+        <code>reports/</code> y como artifacts en MLflow.
+      </p>
+      <div class="diag-grid">
+        {''.join(cards)}
+      </div>
+    </section>
+    """
+
+
 def build_actions_section(actions: List[Action]) -> str:
     items = "".join(
         f'<div class="action {escape(a.severity)}">'

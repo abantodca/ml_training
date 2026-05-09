@@ -11,10 +11,12 @@ Uso directo (CLI avanzado):
     python main.py --varieties POP
     python main.py --varieties POP,JUPITER
     python main.py --varieties all --tuning prod_xl
-    python main.py --varieties POP --model xgb   # fuerza un solo backend
 
-Defaults: --tuning prod | --model auto (entrena XGB y LGB, elige campeon por
-variedad). Cada variedad es independiente: si una falla, las demas continuan.
+El pipeline SIEMPRE entrena todos los backends del registry (XGB + LGB hoy)
+y `champion.select_champion` elige el ganador por variedad (lex-order:
+gap -> MAPE -> tiempo). No hay flag de usuario para forzar un modelo: ese
+es el contrato del proyecto. Default --tuning prod. Cada variedad es
+independiente: si una falla, las demas continuan.
 """
 
 from __future__ import annotations
@@ -38,11 +40,11 @@ from src.config import (
 )
 from src.orchestration.cli import (
     parse_args,
-    resolve_models,
     resolve_settings,
     resolve_varieties,
 )
 from src.orchestration.runners import run_parallel, run_sequential
+from src.step_04_train.registry import valid_backends
 from src.step_06_track.mlflow_registry import init_mlflow
 from src.utils.logger import setup_logging
 from src.utils.sklearn_helpers import dump_json_artifact
@@ -135,7 +137,7 @@ def _write_aggregate_summary(
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     settings = resolve_settings(args)
-    init_dirs()  # crea logs/, artifacts/, reports/, mlruns/ (idempotente)
+    init_dirs()  # crea logs/, artifacts/, reports/ (idempotente)
     logger = setup_logging()
 
     # En AWS Batch: descarga BD_HISTORICO_ACUMULADO.xlsx desde S3 y genera
@@ -155,12 +157,18 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         varieties = resolve_varieties(args.varieties)
-        models = resolve_models(args.model)
     except ValueError as exc:
         logger.error(str(exc))
         return 2
-    if not varieties or not models:
-        logger.error("varieties/models vacios; revisa --varieties y --model")
+    # El proyecto NO permite forzar un modelo: siempre entrena todos los
+    # backends del registry y `champion.select_champion` decide el ganador
+    # por variedad (lex-order: gap -> MAPE -> tiempo).
+    models = list(valid_backends())
+    if not varieties:
+        logger.error("varieties vacio; revisa --varieties")
+        return 2
+    if not models:
+        logger.error("BACKEND_REGISTRY vacio; revisa src/step_04_train/registry.py")
         return 2
 
     parallel = _resolve_parallelism(args, settings)

@@ -32,6 +32,7 @@ from src.step_05_evaluate.html.sections import (
     build_backends_comparison_section,
     build_bias_section,
     build_context_section,
+    build_diagnostic_links_section,
     build_errors_detail_section,
     build_guide_section,
     build_hero,
@@ -105,6 +106,7 @@ def render_winner_dashboard(
         except Exception:
             pdp_html = ""
     pdp_section = build_pdp_section(pdp_html)
+    diagnostic_links = build_diagnostic_links_section(variety, out_dir)
     technical = build_technical_section(
         results=results, champion=champion, decision=decision,
         X_aligned=kit.X_aligned, abs_errors=kit.abs_err, real=kit.real,
@@ -127,6 +129,7 @@ def render_winner_dashboard(
         {pdp_section}
         {bias_html}
         {errors_detail_html}
+        {diagnostic_links}
         {actions_html}
         {technical}
         <footer>Generado automáticamente por el pipeline de entrenamiento ML · {escape(ts)}</footer>

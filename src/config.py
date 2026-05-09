@@ -1,12 +1,21 @@
-"""Configuracion global del proyecto (LOCAL-ONLY).
+"""Configuracion global del proyecto.
 
 Centraliza rutas, esquema de datos, hiperparametros de CV y URI de MLflow.
 Cualquier modulo debe leer constantes desde aqui en vez de hardcodearlas.
 
+Backend MLflow:
+    El proyecto SIEMPRE usa un MLflow server (Postgres + S3 detras).
+    En local lo sirve `docker compose up` (servicio mlflow en :5000,
+    backend Postgres + LocalStack S3). En produccion apuntas la misma
+    env var `MLFLOW_TRACKING_URI` a tu server real (Fargate / EC2).
+    No hay backend file://mlruns ni sqlite local.
+
 Variables de entorno reconocidas (todas opcionales, con fallback sano):
-    MLFLOW_TRACKING_URI       : URI del tracking server. Default: file://
-                                hacia `mlruns/` local. Setear solo si se
-                                apunta a un MLflow externo.
+    MLFLOW_TRACKING_URI       : URI del tracking server. Default:
+                                http://localhost:5000 (servicio Docker
+                                expuesto al host). En el container del
+                                trainer se sobreescribe a http://mlflow:5000
+                                via docker-compose.yml.
     MLFLOW_EXPERIMENT_PREFIX  : prefijo de experimentos MLflow.
                                 Default vacio -> el experimento es la variedad.
     MODEL_REGISTRY_PREFIX     : prefijo del Model Registry.
@@ -45,29 +54,17 @@ DATA_DIR: Path = BASE_DIR / "data"
 LOGS_DIR: Path = BASE_DIR / "logs"
 ARTIFACTS_DIR: Path = BASE_DIR / "artifacts"
 REPORTS_DIR: Path = BASE_DIR / "reports"
-MLRUNS_DIR: Path = BASE_DIR / "mlruns"
 
 # ---------------------------------------------------------------------------
 # S3 — artifacts remotos (activo solo si S3_ARTIFACTS_BUCKET esta definido)
 # ---------------------------------------------------------------------------
-# En local queda vacio -> sin upload. En EC2/CI se inyecta via env var:
-#   S3_ARTIFACTS_BUCKET=mi-bucket
-#   S3_ARTIFACTS_PREFIX=ml-training/artifacts   (opcional, default '')
+# En docker-compose.yml se inyecta apuntando a LocalStack
+# (S3_ARTIFACTS_BUCKET=ml-artifacts, MLFLOW_S3_ENDPOINT_URL=http://localstack:4566).
+# En produccion (AWS Batch/EC2) se inyecta apuntando a un bucket S3 real.
 # El upload ocurre al final de main.py si el bucket esta configurado.
 S3_ARTIFACTS_BUCKET: str = os.environ.get("S3_ARTIFACTS_BUCKET", "")
 S3_ARTIFACTS_PREFIX: str = os.environ.get("S3_ARTIFACTS_PREFIX", "ml-training")
 S3_REPORTS_PREFIX: str = os.environ.get("S3_REPORTS_PREFIX", "ml-training/reports")
-
-# `mlruns/` se crea cuando el backend MLflow es local (file:// o sqlite://
-# apuntando a mlruns/mlflow.db). Si MLFLOW_TRACKING_URI apunta a un server
-# externo el dir queda inerte (no se crea para no producir ruido).
-_tracking_uri_raw = os.environ.get("MLFLOW_TRACKING_URI", "")
-_use_local_mlruns = (
-    (not _tracking_uri_raw)
-    or _tracking_uri_raw.startswith("file:")
-    or "mlruns/mlflow.db" in _tracking_uri_raw
-    or "mlruns\\mlflow.db" in _tracking_uri_raw
-)
 
 
 def init_dirs() -> None:
@@ -77,10 +74,7 @@ def init_dirs() -> None:
     side-effects al importar `src.config` (un test que solo importe TARGET
     no debe crear `logs/`, `artifacts/`, etc.).
     """
-    dirs: list[Path] = [LOGS_DIR, ARTIFACTS_DIR, REPORTS_DIR]
-    if _use_local_mlruns:
-        dirs.append(MLRUNS_DIR)
-    for d in dirs:
+    for d in (LOGS_DIR, ARTIFACTS_DIR, REPORTS_DIR):
         d.mkdir(parents=True, exist_ok=True)
 
 
@@ -121,20 +115,35 @@ USELESS_COLUMNS: list[str] = ["VARIEDAD", "DIA_SEM", "MES"]
 # pasar `cols=` explicito al constructor de `MissingFlagger` o ajustar aqui.
 MISSING_FLAG_COLS: list[str] = ["%INDUS", "P/BAYA"]
 
+# Skew mitigation por variable (EDA POP 2026-05-09).
+# Decision: AGREGAR versiones transformadas como features adicionales
+# (no reemplazar). El arbol decide si splitea sobre raw o transformado.
+# KNN imputer y LOF score se benefician igualmente en ambos casos.
+#
+# Criterio para listar una columna aqui:
+#   - LOG1P: |skew| > 1.5 con valores >= 0 (log1p maneja ceros sin -inf)
+#   - SQRT : kurtosis extrema (>50) y valores >= 0
+#   - Skip si distribucion ya es ~simetrica (|skew| < 1.0): agregar
+#     versiones transformadas seria ruido para el arbol.
+#
+# Si entrenas otra variedad con patrones distintos, regenerar EDA y
+# ajustar las listas aqui (o convertir a deteccion automatica via skew
+# threshold computado en fit).
+SKEW_LOG1P_COLS: list[str] = ["KG/HA", "%INDUS", "HA"]
+SKEW_SQRT_COLS: list[str] = ["DPC"]
+
 # ---------------------------------------------------------------------------
 # Hiperparametros de CV y tuning
 # ---------------------------------------------------------------------------
 RANDOM_STATE: int = 42
-# 'auto' = entrena TODOS los backends del registry (xgb + lgb hoy) cada uno
-# con su Optuna study independiente, y `champion.select_champion` elige el
-# mejor por variedad usando lex-order (gap -> full_mape -> tiempo). Si en
-# el futuro se agrega un nuevo backend al BACKEND_REGISTRY, "auto" lo
-# incluye automaticamente.
+# El pipeline siempre entrena TODOS los backends del registry (XGB + LGB
+# hoy) cada uno con su Optuna study independiente, y `champion.select_champion`
+# elige el mejor por variedad usando lex-order (gap -> full_mape -> tiempo).
+# Si en el futuro se agrega un nuevo backend al BACKEND_REGISTRY, queda
+# incluido automaticamente.
 #
-# Pasa "xgb" o "lgb" explicito para uno solo (ahorra ~50% tiempo). "xgb,lgb"
-# o "all" tambien validos. Nota: CatBoost fue evaluado y eliminado del
-# proyecto 2026-05-05 (no aportaba en POP; mismo patron que GAMM Phase 0).
-MODEL_TYPE_DEFAULT: str = "auto"
+# Nota: CatBoost fue evaluado y eliminado del proyecto 2026-05-05 (no
+# aportaba en POP; mismo patron que GAMM Phase 0).
 
 # ---------------------------------------------------------------------------
 # Quality gates del campeon (umbrales minimos para considerar un modelo util)
@@ -229,25 +238,20 @@ OOF_ENSEMBLE_K: int = 5
 # ---------------------------------------------------------------------------
 # MLflow
 # ---------------------------------------------------------------------------
-# Default: backend local SQLITE (sqlite:///mlruns/mlflow.db) -> habilita
-# Model Registry real con versionado y stage transitions. Antes era
-# file://mlruns/ que NO soporta Registry (register_model devolvia None).
-# Con el comparativo multi-backend (xgb + lgb hoy) tener registry funcional
-# es critico: cada training crea una nueva version del modelo registrado y
-# las versiones perdedoras quedan archivadas.
+# El proyecto SIEMPRE corre contra un MLflow server (Postgres backend +
+# S3 artifact-root). En local lo provee `docker compose up` (servicio
+# `mlflow`). En produccion apuntas la misma env var a tu server real.
 #
-# Si MLFLOW_TRACKING_URI esta en el entorno se respeta (apuntar a server
-# externo o forzar file:// para casos legacy).
+# Default = http://localhost:5000 = el servicio Docker expuesto al host
+# (asi corren scripts que ejecutan en el host, ej. utilidades manuales).
+# DENTRO del container del trainer se sobreescribe a http://mlflow:5000
+# via docker-compose.yml.
 #
-# `MLRUNS_ARTIFACT_LOCATION` se usa como `artifact_location` al crear
-# experimentos (ver `mlflow_registry.set_experiment`). Esto mantiene los
-# artifacts (pipelines, jsons, html) en `./mlruns/artifacts/<exp_id>/`,
-# en lugar del default de MLflow `./mlartifacts/`. Sin esto, sqlite
-# backend dispersaria metadata en mlruns/mlflow.db pero artifacts en
-# mlartifacts/, fragmentando el local store.
-MLFLOW_DEFAULT_DB: Path = MLRUNS_DIR / "mlflow.db"
-MLFLOW_TRACKING_URI: str = _tracking_uri_raw or f"sqlite:///{MLFLOW_DEFAULT_DB.as_posix()}"
-MLRUNS_ARTIFACT_LOCATION: str = (MLRUNS_DIR / "artifacts").as_uri()
+# El `artifact_location` lo decide el server (--default-artifact-root
+# s3://ml-mlflow/artifacts). El client NO debe pasarlo: si lo hiciera
+# rompe el modelo (apuntaria a un path local del cliente que el server
+# no puede leer).
+MLFLOW_TRACKING_URI: str = os.environ.get("MLFLOW_TRACKING_URI", "http://localhost:5000")
 
 # Prefijo del nombre de experimento. El experimento final por variedad sera
 # `f"{MLFLOW_EXPERIMENT_PREFIX}{variety}"`.

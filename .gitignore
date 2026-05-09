@@ -19,8 +19,11 @@ data/processed/
 # Salidas del pipeline
 artifacts/
 reports/
-mlruns/
 logs/
+
+# Legacy: el backend MLflow ahora es Postgres (Docker), `mlruns/` ya no se usa.
+# La regla queda por si alguien volvio de una rama vieja con la carpeta en disco.
+mlruns/
 
 # Editores
 .vscode/

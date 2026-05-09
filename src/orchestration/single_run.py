@@ -21,7 +21,9 @@ from typing import Dict, Optional
 import joblib
 import numpy as np
 
-from src.config import ARTIFACTS_DIR
+from src.config import ARTIFACTS_DIR, REPORTS_DIR, TRAINING_FILE
+from src.diagnostics.residuals import write_residual_report
+from src.diagnostics.run_metadata import collect_run_metadata
 from src.pipeline.build_pipeline import create_preprocessing_pipeline
 from src.step_01_load.data_loader import load_business_columns, load_data
 from src.step_04_train.tuning import perform_nested_cv
@@ -202,6 +204,18 @@ def train_model(
 
     with safe_start_run(run_name=run_name) as run:
         _set_initial_run_tags(variety, model_type, version, args)
+        # Trazabilidad: git commit + dataset hash + n_rows. Hace cada run
+        # reproducible y permite detectar drift automaticamente cuando
+        # dataset_sha256 cambia.
+        try:
+            metadata_tags = collect_run_metadata(
+                training_file=TRAINING_FILE,
+                n_rows=int(X.shape[0]),
+                n_cols=int(X.shape[1]),
+            )
+            set_tags(metadata_tags)
+        except Exception as exc:
+            log.warning(f"collect_run_metadata fallo (no critico): {exc}")
         log_params({
             "variety": variety,
             "tuning": args.tuning,
@@ -302,6 +316,23 @@ def train_model(
         # Recorded" aunque el modelo si este registrado.
         log_artifact(str(local_pipeline), artifact_path="pipeline")
         log_artifact(str(oof_arr_path), artifact_path="oof")
+
+        # Residual diagnostics post-fit: DW + Ljung-Box (autocorrelacion),
+        # BP + White (heteroscedasticidad), Shapiro/AD/JB (normalidad), plus
+        # 4 plots. Si rechaza autocorrelacion residual -> el modelo dejo
+        # patron temporal -> revisar lag features. Si rechaza
+        # heteroscedasticidad -> considerar log-target o regresion Gamma.
+        try:
+            residual_html = REPORTS_DIR / f"residuals_{variety}_{run_name}.html"
+            write_residual_report(
+                variety=variety, model_type=model_type,
+                y_true=oof["y_true"], y_pred=oof["y_pred"],
+                out_path=residual_html,
+            )
+            log_artifact(str(residual_html), artifact_path="residuals")
+            log.info(f"Residual diagnostics: {residual_html.name}")
+        except Exception:
+            log.warning("Residual diagnostics fallo (no aborta training)", exc_info=True)
 
         elapsed = time.perf_counter() - t0
         bv_oof_dump: Dict[str, float] = {}

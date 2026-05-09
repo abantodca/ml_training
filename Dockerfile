@@ -63,8 +63,9 @@ COPY --chown=mluser:mluser src/    ./src/
 COPY --chown=mluser:mluser scripts/ ./scripts/
 COPY --chown=mluser:mluser main.py  ./
 
-# Carpetas que init_dirs() asume (idempotente)
-RUN mkdir -p data/training logs artifacts reports mlruns \
+# Carpetas que init_dirs() asume (idempotente). Nota: NO creamos `mlruns/`
+# porque el backend MLflow es siempre el server (Postgres + S3).
+RUN mkdir -p data/training logs artifacts reports \
     && chown -R mluser:mluser ${APP_HOME}
 
 USER mluser

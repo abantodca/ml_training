@@ -1,40 +1,37 @@
 # =============================================================================
-# ml_training/Taskfile.yml — LOCAL-ONLY
+# ml_training — Taskfile.yml
+# Pipeline ML (XGB / LGB) con Optuna + MLflow Model Registry, sobre Docker.
 # =============================================================================
 #
-# Pipeline de etapas (src/):
-#   step_01_load       carga del acumulado / split por variedad
-#   step_02_clean      limpieza, missing flags, outlier capping (per-FUNDO)
-#   step_03_features   ratios estructurales + ciclicas + lags + one-hot
-#   step_04_train      tuning Optuna (XGB / LGB) + OOF ensemble (K=5)
-#   step_05_evaluate   metricas + champion lex-order + dashboard ejecutivo
-#   step_06_track      MLflow logging (sqlite:///mlruns/mlflow.db + Registry)
+# QUICK START (primera vez tras clonar):
+#   task setup           Instala deps Python en el host (para data:split / IDE)
+#   task data:split      Genera data/training/DB-HISTORICA.xlsx
+#   task build           Build de la imagen + arranca servicios (postgres,
+#                          mlflow, localstack). Imprime URLs al final.
+#   task train           Entrena dentro del container (default POP smoke)
+#                          UI MLflow: http://localhost:5000
 #
-# ENTORNO: corre en Windows / Linux local. MLflow sqlite en mlruns/mlflow.db.
+# DIA A DIA:
+#   task up                                 levanta servicios (sin rebuild)
+#   task train VARIETIES=POP TUNING=prod    entrena con perfil de produccion
+#   task logs                               tail logs de trainer + mlflow
+#   task down                               detiene servicios (preserva data)
 #
-# Uso normal:
-#   task train VARIETIES=POP                           # entrena 1 variedad
-#   task train VARIETIES=POP TUNING=dev                # baseline rapido (~20 min)
-#   task train VARIETIES=POP TUNING=prod               # produccion (~1.5h)
-#   task train VARIETIES=POP,VENTURA                   # varias variedades
-#   task train VARIETIES=all                           # todas
+# VARIABLES (override por CLI, ej: `task train VARIETIES=POP,VENTURA`):
+#   VARIETIES = "POP" | "POP,VENTURA" | "all"            (default POP)
+#   TUNING    = smoke | dev | prod | prod_xl             (default prod)
+#   MODEL     = auto | xgb | lgb | "xgb,lgb"             (default auto)
+#   PARALLEL  = N variedades en paralelo                 (default 1)
 #
-# Variables overrideables por CLI (defaults vienen aqui mismo):
-#   VARIETIES = lista CSV de variedades o "all" (default POP)
-#   TUNING    = smoke (~1 min, 2x2 CV)   | dev (~20 min, 3x3 CV) |
-#               prod (~1.5-2.5h, 5x3 CV) | prod_xl (~5-6h, 6x3 CV)
-#               prod_xl escala trials Y CV (caso extremo). Default: prod.
-#   MODEL     = auto (default, xgb + lgb compiten lex-order) | xgb | lgb |
-#               combinaciones CSV ("xgb,lgb")
-#   PARALLEL  = variedades a entrenar en paralelo (default 1).
-#               2-4 segun cores. >1 setea automaticamente MODEL_N_JOBS=1
-#               para evitar oversubscription.
+# PERFILES DE TUNING (presupuesto Optuna):
+#   smoke    ~1 min       2x2 CV    sanity check
+#   dev      ~20 min      3x3 CV    baseline rapido
+#   prod     ~1.5-2.5 h   5x3 CV    produccion (default)
+#   prod_xl  ~5-6 h       6x3 CV    busqueda exhaustiva (overnight)
 #
-# Otros:
-#   task setup                                         # 1 vez tras clonar
-#   task data:split                                    # genera training xlsx
-#   task mlflow:ui                                     # UI en localhost:5000 (sqlite)
-#   task audit:compare -- --variety POP --last 5       # comparativa entre runs
+# Cada variedad es un proceso independiente: si una falla, las demas siguen.
+# MODEL=auto entrena XGB y LGB y elige campeon por variedad (lex-order:
+# gap -> MAPE -> tiempo). Los losers quedan soft-deleted en MLflow.
 # =============================================================================
 
 version: "3"
@@ -45,140 +42,165 @@ dotenv: [ ".env" ]
 vars:
   PY: "{{.PYTHON | default \"python\"}}"
 
-  # BASH: forzamos Git Bash en Windows (no WSL). En Windows, 'bash' del PATH
-  # suele ser el launcher de WSL, que no comparte filesystem/home con el resto
-  # del proyecto. Git Bash usa el mismo $HOME que el resto del sistema.
-  # En Linux/Mac esta variable es inofensiva si Git Bash no existe: el shell
-  # cae al `bash` del PATH a traves de la regla de fallback de Task.
+  # BASH: en Windows forzamos Git Bash (no WSL) para que comparta $HOME / FS
+  # con el resto del proyecto. En Linux/Mac es inofensivo: Task cae al `bash`
+  # del PATH si esta ruta no existe.
   BASH: "\"C:/Program Files/Git/usr/bin/bash.exe\""
 
-  # Defaults overrideables por CLI:
-  #   task train:local VARIETIES=VENTURA
-  #   task train:local VARIETIES=all PARALLEL=4 TUNING=prod
   TUNING: "{{.TUNING | default \"prod\"}}"
-  MODEL: "{{.MODEL | default \"auto\"}}"
   VARIETIES: "{{.VARIETIES | default \"POP\"}}"
   PARALLEL: "{{.PARALLEL | default \"1\"}}"
-  STAGE: "{{.STAGE | default \"\"}}"
 
 tasks:
 
   # ═══ Ayuda ══════════════════════════════════════════════════════════════
 
   default:
-    desc: Indice navegable (usa `task --list` para listado plano)
+    desc: "Indice guiado del proyecto: workflow, ejemplos y URLs (vs `task --list`, que es listado plano alfabetico)"
     silent: true
     cmds:
-      - "{{.BASH}} scripts/sh/help.sh"
-
-  setup:
-    desc: Instala deps Python desde requirements.txt
-    cmds:
-      - "{{.PY}} -m pip install -r requirements.txt"
+      - |
+        echo ""
+        echo "============================================================================="
+        echo " ml_training - pipeline ML (XGB / LGB) sobre Docker"
+        echo "============================================================================="
+        echo ""
+        echo "PRIMERA VEZ (todo corre en Docker, sin Python en el host):"
+        echo "   task build           Build de imagen + arranca servicios + URLs"
+        echo "   task data:split      Genera DB-HISTORICA.xlsx (dentro del container)"
+        echo ""
+        echo "DIA A DIA:"
+        echo "   task up                                     levanta servicios sin rebuild"
+        echo "   task build                                  rebuild + up (tras cambio de codigo)"
+        echo "   task eda VARIETIES=POP                      EDA estadistico (BP/DW/ADF/VIF/MI/PSI)"
+        echo "   task train VARIETIES=POP TUNING=smoke       sanity check        (~1 min)"
+        echo "   task train VARIETIES=POP TUNING=dev         baseline           (~20 min)"
+        echo "   task train VARIETIES=all PARALLEL=3         todas en paralelo"
+        echo "   task logs                                   tail trainer + mlflow"
+        echo "   task down                                   detiene servicios"
+        echo ""
+        echo "   El sistema entrena XGB y LGB y elige el campeon por variedad."
+        echo "   No se puede forzar un modelo: el contrato del proyecto es"
+        echo "   que la maquina decida (lex-order: gap -> MAPE -> tiempo)."
+        echo ""
+        echo "VARIABLES (override por CLI):"
+        echo "   VARIETIES = \"POP\" | \"POP,VENTURA\" | \"all\"            (default POP)"
+        echo "   TUNING    = smoke (~1m) | dev (~20m) | prod (~2h) | prod_xl (~6h)"
+        echo "   PARALLEL  = N variedades en paralelo                  (default 1)"
+        echo ""
+        echo "URLS (servicios up):"
+        echo "   http://localhost:5000              MLflow UI (tracking + Registry)"
+        echo "   http://localhost:8080/reports/     Dashboards HTML por variedad"
+        echo "   http://localhost:8080/artifacts/   joblib + run_summary + best_params"
+        echo "   s3://...                           Backend de artifacts MLflow (S3 real)"
+        echo ""
+        echo "CLEANUP:   task clean:docker  |  task clean:outputs  |  task clean:artifacts"
+        echo ""
+        echo "   Tip: task --list    listado plano de TODAS las tasks (audit, cleanup, ...)"
+        echo "============================================================================="
+        echo ""
 
   # ═══ Datos ══════════════════════════════════════════════════════════════
 
   data:split:
-    desc: "Split del Excel acumulado por VARIEDAD"
+    desc: "Genera data/training/DB-HISTORICA.xlsx desde data/BD_HISTORICO_ACUMULADO.xlsx. Corre dentro del container (no requiere Python en el host)"
     cmds:
-      - "{{.BASH}} scripts/sh/data_split.sh"
+      - docker compose run --rm --no-deps --entrypoint python trainer
+        -m scripts.prepare_data
+        --input  data/BD_HISTORICO_ACUMULADO.xlsx
+        --output data/training/DB-HISTORICA.xlsx
+        --min-rows 100
+
+  # ═══ EDA / Diagnostico ══════════════════════════════════════════════════
+
+  eda:
+    desc: "EDA estadistico standalone (Shapiro/AD/JB, BP/White, ACF/PACF/DW/LB, ADF/KPSS, VIF, MI, PSI). Args: VARIETIES=POP. Genera reports/EDA_<variety>_<ts>.html"
+    cmds:
+      - docker compose run --rm --no-deps --entrypoint python trainer
+        -m src.diagnostics.eda
+        --variety {{.VARIETIES}}
+
+  # ═══ Docker stack ═══════════════════════════════════════════════════════
+  # Servicios:
+  #   postgres   backend de MLflow (metadata + Model Registry)
+  #   mlflow     tracking server v3.12 (UI en :5000, artifacts -> S3 real)
+  #   reports    nginx static (sirve reports/ y artifacts/ del host en :8080)
+  #   trainer    imagen del pipeline (one-shot, se invoca via `task train`)
+  #
+  # Storage de artifacts: S3 real (parametrizado en .env via S3_MLFLOW_BUCKET y
+  # S3_ARTIFACTS_BUCKET). Los buckets deben existir antes de `task up`. Ver
+  # .env.example o GUIA_MLOPS_AWS.md §3 para crearlos.
+
+  build:
+    desc: "Rebuild de la imagen del trainer + arranca TODOS los servicios. Usar tras cambios de codigo o requirements"
+    cmds:
+      - docker compose build trainer
+      - docker compose up -d postgres mlflow reports
+      - task: _print_urls
+
+  up:
+    desc: "Levanta todos los servicios sin rebuild (postgres + mlflow + reports). Para arranque diario"
+    cmds:
+      - docker compose up -d postgres mlflow reports
+      - task: _print_urls
+
+  down:
+    desc: "Detiene los servicios. Preserva volumen Postgres (los artifacts viven en S3 real, no se tocan)"
+    cmds:
+      - docker compose down
+
+  clean:docker:
+    desc: "DESTRUCTIVO: detiene servicios y borra volumen Postgres. Pierde TODO el historial MLflow (metadata). Los artifacts en S3 real NO se tocan. La imagen del trainer se conserva"
+    cmds:
+      - docker compose down -v
+
+  logs:
+    desc: "tail en vivo de logs Docker (trainer + mlflow). Ctrl-C para salir"
+    cmds:
+      - docker compose logs -f --tail=200 trainer mlflow
+
+  _print_urls:
+    internal: true
+    silent: true
+    cmds:
+      - 'echo ""'
+      - 'echo "==============================================================="'
+      - 'echo " Servicios listos:"'
+      - 'echo "   MLflow UI       http://localhost:5000   (tracking + Registry)"'
+      - 'echo "   Reports / HTML  http://localhost:8080/reports/   (dashboards)"'
+      - 'echo "   Artifacts       http://localhost:8080/artifacts/ (joblib/json)"'
+      - 'echo "   S3 backend      s3://${S3_MLFLOW_BUCKET}/   (real AWS, region ${AWS_DEFAULT_REGION:-us-east-1})"'
+      - 'echo "==============================================================="'
+      - 'echo ""'
+
+  # ═══ Training ═══════════════════════════════════════════════════════════
+
+  train:
+    desc: "Entrena dentro del container. Vars: VARIETIES TUNING PARALLEL. El sistema entrena XGB y LGB y elige el campeon (no se puede forzar un modelo). Si cambiaste codigo, corre `task build` primero"
+    deps: [up]
+    cmds:
+      - docker compose run --rm trainer
+        --varieties {{.VARIETIES}}
+        --tuning {{.TUNING}}
+        --parallel-varieties {{.PARALLEL}}
+
+  # ═══ Auditoria ══════════════════════════════════════════════════════════
+
+  audit:compare:
+    desc: "Tabla comparativa entre runs (lee logs/business_audit.jsonl). Args: -- --variety POP --last 5"
+    cmds:
+      - "{{.BASH}} scripts/sh/audit_compare.sh {{.CLI_ARGS}}"
 
   # ═══ Cleanup local ══════════════════════════════════════════════════════
 
   clean:outputs:
-    desc: "Borra artifacts/, logs/, reports/ y __pycache__/. NO toca data/ ni
-      mlruns/"
+    desc: "Borra artifacts/, logs/, reports/ y __pycache__/ del host. NO toca data/ ni el volumen Postgres ni S3"
     cmds:
       - "{{.BASH}} scripts/sh/clean_outputs.sh"
 
   clean:artifacts:
-    desc: "Borra artifacts/ viejos conservando los ultimos N por (variety, model).
-      Args: KEEP=10 [--dry-run]"
+    desc: "Borra artifacts/ viejos conservando los ultimos N por (variety, model). Args: KEEP=10 [--dry-run]"
     vars:
       KEEP: "{{.KEEP | default \"10\"}}"
     cmds:
       - "{{.BASH}} scripts/sh/clean_artifacts.sh {{.KEEP}} {{.CLI_ARGS}}"
-
-  # ═══ Training ═══════════════════════════════════════════════════════════
-  # Uso:
-  #   task train VARIETIES=POP                   # una variedad (TUNING=prod)
-  #   task train VARIETIES=POP TUNING=dev        # baseline rapido (~20 min)
-  #   task train VARIETIES=POP MODEL=lgb         # solo LGB
-  #   task train VARIETIES=POP,VENTURA           # varias variedades
-  #   task train VARIETIES=all PARALLEL=3        # todas, 3 en paralelo
-  #
-  # Cada variedad es independiente: si una falla, las demas continuan.
-  # Defaults: TUNING=prod, MODEL=auto (xgb + lgb compiten lex-order),
-  # PARALLEL=1.
-
-  train:
-    desc: "Entrena variedades. Vars: VARIETIES=POP|POP,VENTURA|all  TUNING=smoke(2x2 CV)|dev(3x3)|prod(5x3, default)|prod_xl(6x3, exhaustivo)  MODEL=auto|lgb|xgb|xgb,lgb  PARALLEL=N"
-    env:
-      MLFLOW_TRACKING_URI: ""
-    cmds:
-      - "{{.BASH}} scripts/sh/train_local.sh {{.TUNING}} {{.MODEL}} {{.VARIETIES}} {{.PARALLEL}}"
-
-  # ═══ MLflow UI (local) ══════════════════════════════════════════════════
-
-  mlflow:ui:
-    desc: "Abre la UI de MLflow local en http://localhost:5000 (Ctrl-C para cerrar)"
-    cmds:
-      - "{{.PY}} -m mlflow ui
-        --backend-store-uri sqlite:///mlruns/mlflow.db
-        --default-artifact-root file:./mlruns/artifacts
-        --host 127.0.0.1 --port 5000"
-
-  # ═══ Logs / Auditoria ═══════════════════════════════════════════════════
-
-  logs:local:
-    desc: "tail al log del orquestador (logs/pipeline_run.log)"
-    cmds:
-      - "{{.BASH}} scripts/sh/logs_local.sh"
-
-  logs:variety:
-    desc: "tail al log de UNA variedad (VARIETY=POP)"
-    vars:
-      VARIETY: "{{default \"\" .VARIETY}}"
-    cmds:
-      - tail -f logs/variety_{{.VARIETY}}.log
-
-  audit:compare:
-    desc: "Tabla comparativa entre runs (lee logs/business_audit.jsonl). Args: --
-      --variety POP --last 5"
-    cmds:
-      - "{{.BASH}} scripts/sh/audit_compare.sh {{.CLI_ARGS}}"
-
-  # ═══ Docker stack ═══════════════════════════════════════════════════════
-  # Mismo flow que `task train`, pero dentro del container del Dockerfile.
-  # Levanta postgres + mlflow (server v3.12) + localstack + trainer.
-  # MLflow UI: http://localhost:5000 (apunta al server Docker, no al sqlite local).
-
-  docker:build:
-    desc: "Build de la imagen del trainer (`docker compose build trainer`)"
-    cmds:
-      - docker compose build trainer
-
-  docker:up:
-    desc: "Levanta postgres + mlflow + localstack en background"
-    cmds:
-      - docker compose up -d postgres mlflow s3-init
-
-  docker:train:
-    desc: "Entrena dentro del container. Vars: VARIETIES=POP TUNING=smoke"
-    cmds:
-      - docker compose run --rm -e VARIETIES={{.VARIETIES}} -e TUNING={{.TUNING}} trainer
-
-  docker:logs:
-    desc: "tail logs de los servicios docker (trainer + mlflow)"
-    cmds:
-      - docker compose logs -f --tail=200 trainer mlflow
-
-  docker:down:
-    desc: "Para todos los servicios docker (no borra volumenes ni imagen)"
-    cmds:
-      - docker compose down
-
-  docker:clean:
-    desc: "DESTRUCTIVO: para servicios y borra volumenes (postgres + localstack data)"
-    cmds:
-      - docker compose down -v

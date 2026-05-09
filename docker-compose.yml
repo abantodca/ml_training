@@ -12,56 +12,57 @@ services:
       interval: 5s
       retries: 10
 
-  localstack:
-    image: localstack/localstack:latest
-    environment:
-      SERVICES: s3
-      AWS_DEFAULT_REGION: us-east-1
-      PERSISTENCE: 1
-      DEBUG: 0
-    ports:
-      - "4566:4566"   # endpoint S3 unico
-    volumes:
-      - localstack-data:/var/lib/localstack
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:4566/_localstack/health"]
-      interval: 5s
-      retries: 10
-
-  s3-init:
-    image: amazon/aws-cli:latest
-    depends_on:
-      localstack: { condition: service_healthy }
-    environment:
-      AWS_ACCESS_KEY_ID: test
-      AWS_SECRET_ACCESS_KEY: test
-      AWS_DEFAULT_REGION: us-east-1
-    entrypoint: >
-      /bin/sh -c "
-      aws --endpoint-url=http://localstack:4566 s3 mb s3://ml-mlflow    || true &&
-      aws --endpoint-url=http://localstack:4566 s3 mb s3://ml-artifacts || true &&
-      aws --endpoint-url=http://localstack:4566 s3 mb s3://ml-data-raw  || true
-      "
-
   mlflow:
-    # Última estable a 2026-05-05. Ver ADR-005 sobre la política de pin
-    # y la compatibilidad client/server entre majors.
-    image: ghcr.io/mlflow/mlflow:v3.12.0
+    # Imagen custom: ghcr.io/mlflow/mlflow:v3.12.0 + psycopg2-binary (driver
+    # Postgres) + boto3 (S3). El upstream no incluye psycopg2, sin el cual
+    # `--backend-store-uri postgresql://...` falla al arrancar.
+    # v3.12.0 es la ultima estable a 2026-05-05. Ver ADR-005 sobre la
+    # politica de pin y compatibilidad client/server entre majors.
+    build:
+      context: .
+      dockerfile: docker/mlflow/Dockerfile
     depends_on:
       postgres: { condition: service_healthy }
-      s3-init:  { condition: service_completed_successfully }
     environment:
-      AWS_ACCESS_KEY_ID: test
-      AWS_SECRET_ACCESS_KEY: test
-      AWS_DEFAULT_REGION: us-east-1
-      MLFLOW_S3_ENDPOINT_URL: http://localstack:4566
+      # Credenciales AWS: leemos del ~/.aws del host (montado abajo). El
+      # AWS SDK encuentra las creds via AWS_SHARED_CREDENTIALS_FILE +
+      # AWS_PROFILE. Asi NO hay que duplicar secretos en .env.
+      AWS_SHARED_CREDENTIALS_FILE: /aws/credentials
+      AWS_CONFIG_FILE: /aws/config
+      AWS_PROFILE: ${AWS_PROFILE:-default}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+    volumes:
+      # Montar ~/.aws del host como :ro adentro del container.
+      # En Windows docker compose expande ~ a %USERPROFILE%.
+      - ~/.aws:/aws:ro
+    # MLflow 3.x activa por default un security middleware que valida el
+    # Host header (anti DNS-rebinding) y solo acepta localhost. El trainer
+    # conecta como `mlflow:5000` (DNS interno de la red Compose).
+    #
+    # La comparacion en mlflow/server/security_utils.py es strict equality
+    # cuando el patron no tiene wildcard: `host == allowed`. El cliente
+    # envia el header con puerto (`mlflow:5000`), asi que hay que listar
+    # `mlflow:*` (igual que el default interno hace con `localhost:*`).
     command: >
       mlflow server
       --host 0.0.0.0 --port 5000
+      --allowed-hosts mlflow,mlflow:*,localhost,localhost:*,127.0.0.1,127.0.0.1:*
       --backend-store-uri postgresql://mlflow:mlflow@postgres:5432/mlflow
-      --default-artifact-root s3://ml-mlflow/artifacts
+      --default-artifact-root s3://${S3_MLFLOW_BUCKET:?Set S3_MLFLOW_BUCKET in .env}/artifacts
     ports:
       - "5000:5000"
+
+  reports:
+    # Sirve reports/ y artifacts/ del host como HTTP estatico (autoindex on).
+    # Local: http://localhost:8080/reports/  http://localhost:8080/artifacts/
+    # Produccion: mismo patron pero con Caddy/ALB+CloudFront sobre S3.
+    image: nginx:alpine
+    volumes:
+      - ./reports:/usr/share/nginx/html/reports:ro
+      - ./artifacts:/usr/share/nginx/html/artifacts:ro
+      - ./docker/nginx-reports.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "8080:80"
 
   trainer:
     build: .
@@ -69,17 +70,24 @@ services:
       mlflow: { condition: service_started }
     environment:
       MLFLOW_TRACKING_URI: http://mlflow:5000
-      AWS_ACCESS_KEY_ID: test
-      AWS_SECRET_ACCESS_KEY: test
-      AWS_DEFAULT_REGION: us-east-1
-      MLFLOW_S3_ENDPOINT_URL: http://localstack:4566
-      S3_ARTIFACTS_BUCKET: ml-artifacts
+      # Mismas creds que mlflow: leemos del ~/.aws del host (montado abajo).
+      AWS_SHARED_CREDENTIALS_FILE: /aws/credentials
+      AWS_CONFIG_FILE: /aws/config
+      AWS_PROFILE: ${AWS_PROFILE:-default}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      # Bucket destino del s3_sync (artifacts + reports al final del run).
+      # Tipicamente el mismo que S3_MLFLOW_BUCKET, pero se separan para
+      # permitir politicas IAM / lifecycle distintas si hace falta.
+      S3_ARTIFACTS_BUCKET: ${S3_ARTIFACTS_BUCKET:?Set S3_ARTIFACTS_BUCKET in .env}
       S3_ARTIFACTS_PREFIX: artifacts
       S3_REPORTS_PREFIX: reports
     volumes:
-      - ./data:/app/data:ro     # tu Excel local
+      - ~/.aws:/aws:ro               # creds AWS leidas del host (no en .env)
+      - ./data:/app/data              # Excel de entrada + data/training/ generado por data:split
+      - ./logs:/app/logs             # pipeline_run.log + business_audit.jsonl + variety_*.log
+      - ./artifacts:/app/artifacts   # joblib + run_summary + best_params por (variety, model)
+      - ./reports:/app/reports       # dashboards HTML / Excel exports
     command: ["--varieties", "${VARIETIES:-POP}", "--tuning", "${TUNING:-smoke}"]
 
 volumes:
   pg-data:
-  localstack-data:

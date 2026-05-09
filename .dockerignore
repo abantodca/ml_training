@@ -4,12 +4,14 @@
 
 # Datos locales (se montan como volumen en runtime, no van en la imagen)
 data/
-mlruns/
 
-# Salidas (se generan en runtime)
+# Salidas (se generan en runtime, montadas como volumen)
 artifacts/
 logs/
 reports/
+
+# Legacy del modo file:// (ya no se usa, pero lo excluimos por si quedo en disco)
+mlruns/
 
 # Notebooks y experimentacion
 notebooks/

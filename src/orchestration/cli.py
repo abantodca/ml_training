@@ -2,10 +2,15 @@
 
 Vive aqui (separado de `main.py`) porque es la unica capa que:
   - Conoce el contrato CLI (argparse).
-  - Traduce strings ("all", "xgb,lgb") a listas tipadas.
+  - Traduce strings ("all") a listas tipadas.
   - Resuelve overrides de tuning profile (n_trials, folds, etc.).
 
 `main.py` queda thin: parse + delega en `orchestration.runners`.
+
+Nota: el pipeline SIEMPRE entrena todos los backends del registry
+(`valid_backends()`) y delega la eleccion del campeon a
+`champion.select_champion`. No hay flag de usuario para forzar un modelo:
+ese es el contrato del proyecto (la maquina elige, no el operador).
 """
 from __future__ import annotations
 
@@ -15,13 +20,9 @@ from src.config import (
     DEFAULT_TUNING,
     DEFAULT_VARIETIES,
     MLFLOW_EXPERIMENT_PREFIX,
-    MODEL_TYPE_DEFAULT,
     TUNING_PROFILES,
 )
 from src.step_01_load.data_loader import list_varieties
-from src.step_04_train.registry import valid_backends
-
-VALID_MODELS = valid_backends()
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -34,16 +35,6 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         choices=list(TUNING_PROFILES),
         default=DEFAULT_TUNING,
         help="Presupuesto de Optuna: smoke (~1 min) | dev (~10 min) | prod (~1.5 h).",
-    )
-    parser.add_argument(
-        "--model",
-        default=MODEL_TYPE_DEFAULT,
-        help=(
-            'Modelos a entrenar (CSV). Ej: "xgb", "lgb", "xgb,lgb", "all", "auto". '
-            '"auto" (default) = entrena todos los backends, cada uno con su Optuna '
-            "independiente, y elige campeon por variedad (composite_score). "
-            'Pasa "xgb" o "lgb" si quieres forzar uno solo.'
-        ),
     )
     parser.add_argument(
         "--varieties",
@@ -124,17 +115,3 @@ def resolve_varieties(arg: str) -> list[str]:
     if arg.strip().lower() == "all":
         return list_varieties()
     return [v.strip() for v in arg.split(",") if v.strip()]
-
-
-def resolve_models(arg: str) -> list[str]:
-    token = arg.strip().lower()
-    if token in ("all", "auto"):
-        return list(VALID_MODELS)
-    models = [m.strip().lower() for m in arg.split(",") if m.strip()]
-    invalid = [m for m in models if m not in VALID_MODELS]
-    if invalid:
-        raise ValueError(
-            f"--model invalido: {invalid}. Validos: {VALID_MODELS} + 'all' / 'auto'."
-        )
-    seen: set[str] = set()
-    return [m for m in models if not (m in seen or seen.add(m))]

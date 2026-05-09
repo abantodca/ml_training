@@ -148,9 +148,10 @@ def train_variety(
 
         # Eliminar runs de modelos NO campeon de MLflow Experiments. El usuario
         # quiere ver UN solo run por training (el ganador), no los candidatos.
-        # Los runs eliminados van a mlruns/.trash/ (soft delete, recuperables
-        # con client.restore_run). El ModelResult sigue vivo en memoria asi
-        # que el dashboard HTML/Excel comparativos NO se afectan.
+        # Soft delete via API: MLflow marca lifecycle_stage='deleted' en
+        # Postgres (recuperable con client.restore_run). El ModelResult sigue
+        # vivo en memoria asi que el dashboard HTML/Excel comparativos NO se
+        # afectan.
         # Limpiar mlflow_run_id="" en el ModelResult evita que _tag_champion
         # intente operar sobre runs que ya no existen.
         losers = [r for r in results if r is not champion]

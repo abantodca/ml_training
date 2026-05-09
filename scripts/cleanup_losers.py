@@ -4,8 +4,8 @@ Recorre experimentos (uno o todos) y elimina runs con tag
 `is_champion=false`, dejando solo los campeones visibles. Por defecto
 corre en modo DRY-RUN: reporta sin tocar nada. Usar `--apply` para ejecutar.
 
-Los runs eliminados van a `mlruns/.trash/` (soft delete, recuperables
-con `client.restore_run(run_id)` o moviendo manualmente la carpeta).
+Los runs se marcan como `deleted` via la API (soft delete en Postgres).
+Recuperables con `client.restore_run(run_id)`.
 
 Uso
 ---
@@ -149,7 +149,7 @@ def main() -> None:
             print(f"Errores:                {total_errors}")
         if total_deleted > 0:
             print()
-            print(f"Los runs eliminados estan en mlruns/.trash/ (recuperables).")
+            print(f"Runs marcados como `deleted` en Postgres (soft delete).")
             print(f"Para recuperar: client.restore_run(run_id) en Python.")
             print(f"Para purgar definitivamente: `mlflow gc` en CLI.")
     else:

@@ -374,6 +374,33 @@ details.technical .body { padding: 22px 26px; }
 
 footer { text-align:center; color: var(--gray-500); font-size: 12px;
   padding: 16px 0; margin-top: 8px; }
+
+/* Diagnostic links section (EDA + Residuals) */
+.diag-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px; margin-top: 12px; }
+.diag-link { display: flex; align-items: center; gap: 12px;
+  padding: 14px 16px; border: 1px solid var(--gray-200); border-radius: 10px;
+  text-decoration: none; color: var(--navy); background: white;
+  transition: transform .12s ease, box-shadow .12s ease, border-color .12s ease; }
+.diag-link:hover { transform: translateY(-1px); border-color: var(--blue-500);
+  box-shadow: 0 4px 12px rgba(37,99,235,.12); }
+.diag-icon { font-size: 24px; line-height: 1; }
+.diag-meta { flex: 1; min-width: 0; }
+.diag-title { font-weight: 600; font-size: 13px; margin-bottom: 2px;
+  color: var(--navy); }
+.diag-sub { font-size: 11px; color: var(--gray-500); }
+
+/* Print mode: optimizado para imprimir o exportar a PDF */
+@media print {
+  body { background: white; padding: 0; }
+  section { box-shadow: none !important; page-break-inside: avoid; }
+  .diag-link { border: 1px solid #cbd5e1; }
+  .diag-grid { page-break-inside: avoid; }
+  * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+  .modebar { display: none !important; }
+  details { open: ""; }
+  details summary { display: none; }
+}
 """
 
 
