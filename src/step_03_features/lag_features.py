@@ -54,7 +54,7 @@ cold-start a los arboles, la flag binaria era redundante.
 from __future__ import annotations
 
 import logging
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Tuple
 
 import numpy as np
 import pandas as pd

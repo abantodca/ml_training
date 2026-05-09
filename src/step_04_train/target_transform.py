@@ -16,7 +16,7 @@ predicciones extremas sin perder estabilidad.
 from __future__ import annotations
 
 import numpy as np
-from sklearn.base import BaseEstimator, RegressorMixin
+from sklearn.base import BaseEstimator
 from sklearn.compose import TransformedTargetRegressor
 
 CAP_PERCENTILE: float = 99.5  # p99.5 -> ~0.5% de filas aplastadas en train

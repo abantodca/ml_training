@@ -32,6 +32,7 @@ from src.step_05_evaluate.html.sections import (
     build_backends_comparison_section,
     build_bias_section,
     build_context_section,
+    build_errors_detail_section,
     build_guide_section,
     build_hero,
     build_mega_kpis,
@@ -76,6 +77,11 @@ def render_winner_dashboard(
         calibration_df=kit.calibration,
     )
     bias_html = build_bias_section(kit.fundo_bias)
+    errors_detail_html = build_errors_detail_section(
+        business_validation=champion.business_validation,
+        X_aligned=kit.X_aligned,
+        excel_path=excel_path,
+    )
     actions_html = build_actions_section(kit.actions)
 
     # PDP (Partial Dependence Plots): defensivo, requiere cargar pipeline +
@@ -120,6 +126,7 @@ def render_winner_dashboard(
         {stat_diag}
         {pdp_section}
         {bias_html}
+        {errors_detail_html}
         {actions_html}
         {technical}
         <footer>Generado automáticamente por el pipeline de entrenamiento ML · {escape(ts)}</footer>

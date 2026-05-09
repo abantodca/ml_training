@@ -15,6 +15,7 @@ from html import escape
 from typing import List, Optional
 
 import numpy as np
+import pandas as pd
 
 from src.config import (
     REPORT_BUSINESS_UNIT,
@@ -404,6 +405,185 @@ def build_pdp_section(pdp_html: str) -> str:
         depende fuerte de ella en ese rango.
       </p>
       {pdp_html}
+    </section>
+    """
+
+
+def build_errors_detail_section(
+    *,
+    business_validation,
+    X_aligned,
+    excel_path: Optional[str] = None,
+    top_n: int = 20,
+) -> str:
+    """Sección 'Errores detallados': MAE/MAPE OOF totales + top N peores +
+    histograma + residuos + serie temporal.
+
+    Sustenta visualmente "donde se equivoca el modelo" sin tener que abrir
+    el Excel. La hoja 'Predicciones_OOF' del Excel sigue siendo la fuente
+    autoritativa con todas las filas (filtrable, ordenable).
+    """
+    if business_validation is None or business_validation.is_empty():
+        return ""
+
+    real = getattr(business_validation, "kg_jr_real_oof", None)
+    pred = getattr(business_validation, "kg_jr_pred_oof", None)
+    if real is None or pred is None or len(real) == 0:
+        return ""
+
+    real_arr = np.asarray(real, dtype=float)
+    pred_arr = np.asarray(pred, dtype=float)
+    abs_err = np.abs(real_arr - pred_arr)
+    residuals = real_arr - pred_arr
+    nz = real_arr != 0
+    pct_err = np.where(nz, abs_err / np.abs(real_arr) * 100.0, np.nan)
+
+    # KPIs globales (OOF, sobre TODA la data alineada)
+    n = abs_err.size
+    mae = float(abs_err.mean())
+    mape = float(np.nanmean(pct_err)) if np.any(nz) else float("nan")
+    p50 = float(np.percentile(abs_err, 50))
+    p90 = float(np.percentile(abs_err, 90))
+    p99 = float(np.percentile(abs_err, 99))
+    err_max = float(abs_err.max())
+
+    metrics_cards = (
+        '<div class="ctx-grid">'
+        f'<div class="ctx-card"><div class="label">N filas evaluadas (OOF)</div>'
+        f'<div class="value">{n:,}</div>'
+        f'<div class="sub">cada predicción de un modelo que NO la vio en train</div></div>'
+        f'<div class="ctx-card"><div class="label">MAE OOF</div>'
+        f'<div class="value">{mae:.2f}</div>'
+        f'<div class="sub">kg/jornal · error promedio</div></div>'
+        f'<div class="ctx-card"><div class="label">MAPE OOF</div>'
+        f'<div class="value">{mape:.1f}%</div>'
+        f'<div class="sub">error porcentual promedio</div></div>'
+        f'<div class="ctx-card"><div class="label">Mediana (p50)</div>'
+        f'<div class="value">{p50:.2f}</div>'
+        f'<div class="sub">kg/jornal · 50% del error está debajo</div></div>'
+        f'<div class="ctx-card"><div class="label">p90 (severos)</div>'
+        f'<div class="value">{p90:.2f}</div>'
+        f'<div class="sub">kg/jornal · 10% peor</div></div>'
+        f'<div class="ctx-card"><div class="label">p99 (cola)</div>'
+        f'<div class="value">{p99:.2f}</div>'
+        f'<div class="sub">kg/jornal · casos extremos</div></div>'
+        '</div>'
+    )
+
+    # Top-N peores predicciones
+    order = np.argsort(abs_err)[::-1][:top_n]
+    has_X = (X_aligned is not None
+             and hasattr(X_aligned, "iloc")
+             and len(X_aligned) == n)
+    rows_html = ""
+    for rank, i in enumerate(order, start=1):
+        i = int(i)
+        fecha = "—"
+        fundo = "—"
+        formato = "—"
+        if has_X:
+            try:
+                row = X_aligned.iloc[i]
+                if "FECHA" in row.index and pd.notna(row["FECHA"]):
+                    fecha = pd.to_datetime(row["FECHA"]).strftime("%Y-%m-%d")
+                if "FUNDO" in row.index and pd.notna(row["FUNDO"]):
+                    fundo = str(row["FUNDO"])
+                if "FORMATO" in row.index and pd.notna(row["FORMATO"]):
+                    formato = str(row["FORMATO"])
+            except Exception:
+                pass
+        signo = "↑ sobreestima" if pred_arr[i] > real_arr[i] else "↓ subestima"
+        rows_html += (
+            f'<tr>'
+            f'<td class="num">{rank}</td>'
+            f'<td>{escape(fecha)}</td>'
+            f'<td>{escape(fundo)}</td>'
+            f'<td>{escape(formato)}</td>'
+            f'<td class="num">{real_arr[i]:.2f}</td>'
+            f'<td class="num">{pred_arr[i]:.2f}</td>'
+            f'<td class="num">{abs_err[i]:.2f}</td>'
+            f'<td class="num">{pct_err[i]:.1f}%</td>'
+            f'<td>{signo}</td>'
+            f'</tr>'
+        )
+
+    table_html = f"""
+    <table class="backends-table" style="margin-top:8px">
+      <thead><tr>
+        <th>#</th><th>Fecha</th><th>FUNDO</th><th>FORMATO</th>
+        <th class="num">Real (kg/jr)</th>
+        <th class="num">Predicho (kg/jr)</th>
+        <th class="num">Error abs.</th>
+        <th class="num">Error %</th>
+        <th>Dirección</th>
+      </tr></thead>
+      <tbody>{rows_html}</tbody>
+    </table>
+    """
+
+    # Plots: histograma + residuos + serie temporal
+    from src.step_05_evaluate.diagnostics import (
+        plot_error_histogram_plotly,
+        plot_error_over_time_plotly,
+        plot_residuals_vs_predicted_plotly,
+    )
+    hist_html = plot_error_histogram_plotly(abs_err, p50, p90, p99)
+    resid_html = plot_residuals_vs_predicted_plotly(pred_arr, residuals)
+
+    time_html = ""
+    if has_X and "FECHA" in X_aligned.columns:
+        try:
+            time_html = plot_error_over_time_plotly(
+                X_aligned["FECHA"].to_numpy(), abs_err,
+            )
+        except Exception:
+            time_html = ""
+
+    excel_link = ""
+    if excel_path:
+        from pathlib import Path as _P
+        fname = _P(excel_path).name
+        excel_link = (
+            f'<p style="margin-top:8px;font-size:12px;color:#475569">'
+            f'Para inspeccionar las {n:,} filas con sus errores fila por fila, '
+            f'abri la hoja <b>Predicciones_OOF</b> en el Excel adjunto: '
+            f'<a href="{escape(fname)}" download style="color:#1f4e8a;'
+            f'text-decoration:none;border-bottom:1px dashed #1f4e8a">'
+            f'{escape(fname)}</a>.</p>'
+        )
+
+    return f"""
+    <section>
+      <div class="eyebrow">Errores detallados · OOF sobre toda la data</div>
+      <h2>¿Dónde se equivoca el modelo?</h2>
+      <p class="lead">
+        Estas son las métricas de error con TODAS las {n:,} cosechas evaluadas
+        out-of-fold (cada una predicha por un modelo que NO la vio en train).
+        Es la perspectiva honesta del rendimiento esperado en producción.
+      </p>
+      {metrics_cards}
+
+      <h3 style="margin-top:24px">Top {top_n} peores predicciones</h3>
+      <p class="lead">
+        Filas con el mayor error absoluto. Investiga estas para entender
+        las causas: ¿son outliers reales? ¿errores de captura? ¿segmentos
+        que el modelo no aprendió?
+      </p>
+      {table_html}
+      {excel_link}
+
+      <h3 style="margin-top:24px">Distribución y patrón del error</h3>
+      <p class="lead">
+        Tres lecturas complementarias: <b>(1)</b> distribución del error
+        (¿cola larga?), <b>(2)</b> residuos vs predicción (¿sesgo
+        sistemático?, ¿heteroscedasticidad?), <b>(3)</b> error en el
+        tiempo (¿el modelo se está degradando?).
+      </p>
+      <div class="charts-grid">
+        {f'<div class="chart-block">{hist_html}</div>' if hist_html else ''}
+        {f'<div class="chart-block">{resid_html}</div>' if resid_html else ''}
+      </div>
+      {f'<div class="chart-block" style="margin-top:8px">{time_html}</div>' if time_html else ''}
     </section>
     """
 

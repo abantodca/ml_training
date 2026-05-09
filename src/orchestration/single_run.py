@@ -294,6 +294,14 @@ def train_model(
 
         log.info("[5/6] Persistiendo pipeline en MLflow...")
         _log_pipeline_with_signature(final_pipeline, X)
+        # MLflow 3.x guarda log_model en LoggedModel separado (visible en
+        # tab "Models" del experimento). Subimos tambien el .joblib y el OOF
+        # como artifacts tradicionales para que sean visibles bajo la
+        # pestaña "Artifacts" del run, tanto en MLflow local como en
+        # produccion (Fargate). Sin esto la pestaña aparece "No Artifacts
+        # Recorded" aunque el modelo si este registrado.
+        log_artifact(str(local_pipeline), artifact_path="pipeline")
+        log_artifact(str(oof_arr_path), artifact_path="oof")
 
         elapsed = time.perf_counter() - t0
         bv_oof_dump: Dict[str, float] = {}

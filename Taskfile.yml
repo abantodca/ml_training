@@ -147,3 +147,38 @@ tasks:
       --variety POP --last 5"
     cmds:
       - "{{.BASH}} scripts/sh/audit_compare.sh {{.CLI_ARGS}}"
+
+  # ═══ Docker stack ═══════════════════════════════════════════════════════
+  # Mismo flow que `task train`, pero dentro del container del Dockerfile.
+  # Levanta postgres + mlflow (server v3.12) + localstack + trainer.
+  # MLflow UI: http://localhost:5000 (apunta al server Docker, no al sqlite local).
+
+  docker:build:
+    desc: "Build de la imagen del trainer (`docker compose build trainer`)"
+    cmds:
+      - docker compose build trainer
+
+  docker:up:
+    desc: "Levanta postgres + mlflow + localstack en background"
+    cmds:
+      - docker compose up -d postgres mlflow s3-init
+
+  docker:train:
+    desc: "Entrena dentro del container. Vars: VARIETIES=POP TUNING=smoke"
+    cmds:
+      - docker compose run --rm -e VARIETIES={{.VARIETIES}} -e TUNING={{.TUNING}} trainer
+
+  docker:logs:
+    desc: "tail logs de los servicios docker (trainer + mlflow)"
+    cmds:
+      - docker compose logs -f --tail=200 trainer mlflow
+
+  docker:down:
+    desc: "Para todos los servicios docker (no borra volumenes ni imagen)"
+    cmds:
+      - docker compose down
+
+  docker:clean:
+    desc: "DESTRUCTIVO: para servicios y borra volumenes (postgres + localstack data)"
+    cmds:
+      - docker compose down -v

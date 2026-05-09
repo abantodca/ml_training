@@ -1,0 +1,39 @@
+# Git
+.git/
+.gitignore
+
+# Datos locales (se montan como volumen en runtime, no van en la imagen)
+data/
+mlruns/
+
+# Salidas (se generan en runtime)
+artifacts/
+logs/
+reports/
+
+# Notebooks y experimentacion
+notebooks/
+
+# Cache Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+*.pyo
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# IDE
+.vscode/
+.idea/
+
+# Variables de entorno locales (NUNCA en la imagen)
+.env
+.env.*
+!.env.example
+
+# Archivos temporales
+*.log
+*.tmp

@@ -144,6 +144,160 @@ def plot_calibration_plotly(calibration_df) -> str:
     return _plotly_div(fig, div_id="calibration_plot")
 
 
+def plot_error_histogram_plotly(
+    abs_errors: np.ndarray,
+    p50: float,
+    p90: float,
+    p99: float,
+) -> str:
+    """Histograma del error absoluto con marcadores p50/p90/p99.
+
+    Una distribucion ancha o con cola larga indica que el modelo se
+    equivoca mucho en algunos casos (worst-case scenario peor que el
+    promedio). El p99 muestra el tope realista de error.
+    """
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        return ""
+    if abs_errors.size == 0:
+        return ""
+
+    fig = go.Figure()
+    fig.add_trace(go.Histogram(
+        x=abs_errors, nbinsx=60, marker=dict(color=_PRIMARY, opacity=0.78),
+        hovertemplate="Error [%{x:.2f}, %{x:.2f}+]<br>n: %{y}<extra></extra>",
+        name="Distribución",
+    ))
+    # Lineas verticales para percentiles clave
+    for pct, val, color, label in [
+        (50, p50, "#2ca02c", f"p50: {p50:.2f}"),
+        (90, p90, "#f59e0b", f"p90: {p90:.2f}"),
+        (99, p99, _DANGER, f"p99: {p99:.2f}"),
+    ]:
+        fig.add_vline(
+            x=val, line_dash="dash", line_color=color, line_width=2,
+            annotation_text=label,
+            annotation_position="top",
+            annotation_font=dict(size=10, color=color),
+        )
+    fig.update_layout(
+        title=dict(text="Distribución del error absoluto (OOF · KG/JR)",
+                   font=dict(size=14, color=_PRIMARY)),
+        xaxis_title="Error absoluto (kg/jornal)",
+        yaxis_title="Cantidad de cosechas",
+        height=320, showlegend=False,
+        bargap=0.04,
+        **_PLOTLY_LAYOUT_DEFAULTS,
+    )
+    fig.update_xaxes(gridcolor="#e7eaf0", zerolinecolor="#cbd5e0")
+    fig.update_yaxes(gridcolor="#e7eaf0", zerolinecolor="#cbd5e0")
+    return _plotly_div(fig, div_id="error_hist")
+
+
+def plot_residuals_vs_predicted_plotly(
+    y_pred: np.ndarray,
+    residuals: np.ndarray,
+) -> str:
+    """Scatter de residuos (real - predicho) vs prediccion.
+
+    Lectura:
+      - Nube alrededor de y=0 sin patron -> modelo OK.
+      - Banda que se ensancha al subir x -> heteroscedasticidad
+        (errores mas grandes para predicciones grandes; el modelo es
+        menos confiable en extremos).
+      - Tendencia (linea de regresion no plana) -> sesgo sistematico:
+        el modelo sub o sobreestima en cierto rango.
+    """
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        return ""
+    if y_pred.size == 0:
+        return ""
+    Trace = go.Scattergl if y_pred.size > 5000 else go.Scatter
+
+    fig = go.Figure()
+    fig.add_trace(Trace(
+        x=y_pred, y=residuals, mode="markers",
+        marker=dict(color=_PRIMARY, size=4, opacity=0.4),
+        name="residuos",
+        hovertemplate=(
+            "Predicción: %{x:.2f}<br>Residuo: %{y:+.2f}<extra></extra>"
+        ),
+    ))
+    fig.add_hline(
+        y=0, line_dash="dash", line_color=_DANGER, line_width=1.5,
+        annotation_text="ideal (residuo = 0)",
+        annotation_position="top right",
+        annotation_font=dict(size=10, color=_DANGER),
+    )
+    fig.update_layout(
+        title=dict(text="Residuos vs predicción (KG/JR)",
+                   font=dict(size=14, color=_PRIMARY)),
+        xaxis_title="Predicción del modelo (kg/jornal)",
+        yaxis_title="Residuo = real - predicho (kg/jornal)",
+        height=340, showlegend=False,
+        **_PLOTLY_LAYOUT_DEFAULTS,
+    )
+    fig.update_xaxes(gridcolor="#e7eaf0", zerolinecolor="#cbd5e0")
+    fig.update_yaxes(gridcolor="#e7eaf0", zerolinecolor="#cbd5e0")
+    return _plotly_div(fig, div_id="residuals_plot")
+
+
+def plot_error_over_time_plotly(
+    dates,
+    abs_errors: np.ndarray,
+    rolling_window: int = 30,
+) -> str:
+    """Error absoluto a lo largo del tiempo + media movil 30d.
+
+    Si la media movil tiene pendiente positiva al final del periodo, el
+    modelo empeoro en el tiempo (drift): puede ser senal de que el
+    re-entrenamiento esta tardando o que la realidad cambio.
+    """
+    try:
+        import plotly.graph_objects as go
+        import pandas as _pd
+    except ImportError:
+        return ""
+    try:
+        s = _pd.Series(abs_errors, index=_pd.to_datetime(dates))
+        s = s.dropna().sort_index()
+        if s.empty:
+            return ""
+        rolling = s.rolling(f"{rolling_window}D", min_periods=5).mean()
+    except Exception:
+        return ""
+
+    fig = go.Figure()
+    Trace = go.Scattergl if s.size > 5000 else go.Scatter
+    fig.add_trace(Trace(
+        x=s.index, y=s.values, mode="markers",
+        marker=dict(color=_PRIMARY, size=3, opacity=0.35),
+        name="Error por cosecha",
+        hovertemplate="Fecha: %{x|%Y-%m-%d}<br>Error: %{y:.2f} kg/jornal<extra></extra>",
+    ))
+    fig.add_trace(go.Scatter(
+        x=rolling.index, y=rolling.values, mode="lines",
+        line=dict(color=_DANGER, width=2.2),
+        name=f"Media móvil {rolling_window}d",
+        hovertemplate="Fecha: %{x|%Y-%m-%d}<br>Media móvil: %{y:.2f}<extra></extra>",
+    ))
+    fig.update_layout(
+        title=dict(text=f"Error absoluto en el tiempo (KG/JR · ventana {rolling_window}d)",
+                   font=dict(size=14, color=_PRIMARY)),
+        xaxis_title="Fecha de cosecha", yaxis_title="Error absoluto (kg/jornal)",
+        height=320, showlegend=True,
+        legend=dict(font=dict(size=10), x=0.02, y=0.98,
+                    bgcolor="rgba(255,255,255,.7)"),
+        **_PLOTLY_LAYOUT_DEFAULTS,
+    )
+    fig.update_xaxes(gridcolor="#e7eaf0", zerolinecolor="#cbd5e0")
+    fig.update_yaxes(gridcolor="#e7eaf0", zerolinecolor="#cbd5e0")
+    return _plotly_div(fig, div_id="error_time")
+
+
 def plot_partial_dependence_plotly(
     pipeline,
     X_sample,

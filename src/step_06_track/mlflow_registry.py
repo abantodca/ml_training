@@ -295,13 +295,17 @@ def register_model(
         for k, v in tags.items():
             client.set_model_version_tag(model_name, mv.version, k, v)
 
-        # ---- Stage transition ----
-        if stage in ("Staging", "Production", "Archived"):
-            client.transition_model_version_stage(
+        # ---- Promocion via alias (MLflow 3.x) ----
+        # `transition_model_version_stage` fue deprecado en 2.9 y eliminado
+        # de la API publica en 3.x. `set_registered_model_alias` reasigna el
+        # alias atomicamente: la version anterior pierde el alias automatico
+        # (mismo efecto que `archive_existing_versions` del flujo legacy).
+        # "Archived" en el modelo aliases = no setear alias activo.
+        if stage in ("Staging", "Production"):
+            client.set_registered_model_alias(
                 name=model_name,
+                alias=stage.lower(),
                 version=mv.version,
-                stage=stage,
-                archive_existing_versions=(stage == "Production"),
             )
 
         return f"{model_name} v{mv.version}"

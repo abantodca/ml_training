@@ -25,7 +25,9 @@ import time
 from datetime import datetime
 
 from src.config import (
+    ACCUMULATED_FILE,
     ARTIFACTS_DIR,
+    MIN_ROWS_PER_VARIETY,
     MLFLOW_TRACKING_URI,
     REPORTS_DIR,
     S3_ARTIFACTS_BUCKET,
@@ -44,6 +46,52 @@ from src.orchestration.runners import run_parallel, run_sequential
 from src.step_06_track.mlflow_registry import init_mlflow
 from src.utils.logger import setup_logging
 from src.utils.sklearn_helpers import dump_json_artifact
+
+
+def _hydrate_data_from_s3(logger) -> bool:
+    """Descarga el Excel acumulado desde S3 y genera DB-HISTORICA.xlsx.
+
+    Solo se activa si las env vars `S3_DATA_BUCKET` y `S3_DATA_KEY` estan
+    presentes (e.g. inyectadas por el Lambda dispatcher de AWS Batch). El
+    flujo es:
+
+        s3://bucket/key  (BD_HISTORICO_ACUMULADO.xlsx)
+            └─> data/BD_HISTORICO_ACUMULADO.xlsx
+                  └─> scripts.prepare_data.split_workbook(...)
+                        └─> data/training/DB-HISTORICA.xlsx
+
+    En local (sin esas env vars) no hace nada y el pipeline asume que el
+    usuario ya ejecuto `task data:split`. Devuelve True si hidrato (o no
+    hizo falta), False si fallo.
+    """
+    bucket = os.environ.get("S3_DATA_BUCKET")
+    key = os.environ.get("S3_DATA_KEY")
+    if not (bucket and key):
+        return True  # local: prepare_data ya corrio offline
+
+    logger.info(f"Hydratando data desde s3://{bucket}/{key}...")
+    try:
+        import boto3
+        from scripts.prepare_data import split_workbook
+
+        ACCUMULATED_FILE.parent.mkdir(parents=True, exist_ok=True)
+        boto3.client("s3").download_file(bucket, key, str(ACCUMULATED_FILE))
+        logger.info(f"Acumulado descargado: {ACCUMULATED_FILE} ({ACCUMULATED_FILE.stat().st_size} bytes)")
+
+        summary = split_workbook(
+            input_path=ACCUMULATED_FILE,
+            output_path=TRAINING_FILE,
+            min_rows=MIN_ROWS_PER_VARIETY,
+        )
+        logger.info(
+            f"Split OK | hojas={summary['varieties_written']} "
+            f"({summary['rows_written']} filas) -> {TRAINING_FILE} | "
+            f"descartadas={summary['varieties_skipped']} (<{summary['min_rows']} filas)"
+        )
+        return True
+    except Exception as exc:
+        logger.exception(f"Hydrate desde S3 fallo: {exc}")
+        return False
 
 
 def _resolve_parallelism(args, settings: dict) -> int:
@@ -90,10 +138,18 @@ def main(argv: list[str] | None = None) -> int:
     init_dirs()  # crea logs/, artifacts/, reports/, mlruns/ (idempotente)
     logger = setup_logging()
 
+    # En AWS Batch: descarga BD_HISTORICO_ACUMULADO.xlsx desde S3 y genera
+    # DB-HISTORICA.xlsx via scripts.prepare_data.split_workbook. En local
+    # (sin S3_DATA_BUCKET/S3_DATA_KEY) es no-op: asume que `task data:split`
+    # ya corrio offline.
+    if not _hydrate_data_from_s3(logger):
+        logger.error("Hydrate de data desde S3 fallo; abortando.")
+        return 2
+
     if not TRAINING_FILE.exists():
         logger.error(
             f"No existe el archivo de training: {TRAINING_FILE}. "
-            f"Corre `task data:split` (o data:prepare en EC2) primero."
+            f"Corre `task data:split` (o seteá S3_DATA_BUCKET+S3_DATA_KEY)."
         )
         return 2
 
