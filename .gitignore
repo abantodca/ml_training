@@ -13,7 +13,6 @@ venv/
 *.egg-info/
 
 # Datos (los reales viven en S3)
-data/*.xlsx
 data/training/*.xlsx
 data/processed/
 
