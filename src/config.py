@@ -115,22 +115,25 @@ USELESS_COLUMNS: list[str] = ["VARIEDAD", "DIA_SEM", "MES"]
 # pasar `cols=` explicito al constructor de `MissingFlagger` o ajustar aqui.
 MISSING_FLAG_COLS: list[str] = ["%INDUS", "P/BAYA"]
 
-# Skew mitigation por variable (EDA POP 2026-05-09).
-# Decision: AGREGAR versiones transformadas como features adicionales
-# (no reemplazar). El arbol decide si splitea sobre raw o transformado.
-# KNN imputer y LOF score se benefician igualmente en ambos casos.
+# Skew mitigation: thresholds para auto-deteccion en FeatureGenerator.fit.
+# Reemplazo las listas hardcoded por variedad (eran fragiles cuando se entrena
+# variedades nuevas con distribuciones distintas). FeatureGenerator decide
+# por columna si log1p / sqrt aplica, basado en skew y kurtosis del fit data.
 #
-# Criterio para listar una columna aqui:
-#   - LOG1P: |skew| > 1.5 con valores >= 0 (log1p maneja ceros sin -inf)
-#   - SQRT : kurtosis extrema (>50) y valores >= 0
-#   - Skip si distribucion ya es ~simetrica (|skew| < 1.0): agregar
-#     versiones transformadas seria ruido para el arbol.
+# Politica de transformacion (additive: no reemplaza la columna raw):
+#   - kurt > SKEW_KURT_THRESHOLD       -> agrega <col>_SQRT
+#   - |skew| > SKEW_THRESHOLD          -> agrega <col>_LOG1P
+#   - else                              -> nada (distribucion sana)
 #
-# Si entrenas otra variedad con patrones distintos, regenerar EDA y
-# ajustar las listas aqui (o convertir a deteccion automatica via skew
-# threshold computado en fit).
-SKEW_LOG1P_COLS: list[str] = ["KG/HA", "%INDUS", "HA"]
-SKEW_SQRT_COLS: list[str] = ["DPC"]
+# El shift por columna se memoiza en fit -> transform usa el mismo shift.
+# Sin esto, la misma fila podia dar valores distintos en train vs inference
+# cuando los rangos diferian (bug latente de la version anterior).
+#
+# SKEW_AUTO_DETECT permite desactivar para comparar contra baseline sin
+# transformaciones (A/B test informativo).
+SKEW_AUTO_DETECT: bool = True
+SKEW_THRESHOLD: float = 1.5      # |skew| above this -> log1p
+SKEW_KURT_THRESHOLD: float = 50.0  # kurtosis above this -> sqrt (mas agresivo)
 
 # ---------------------------------------------------------------------------
 # Hiperparametros de CV y tuning

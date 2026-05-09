@@ -30,7 +30,14 @@ import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 
-from src.config import CATEGORICAL_FEATURES, DATE_COLUMN, SKEW_LOG1P_COLS, SKEW_SQRT_COLS
+from src.config import (
+    CATEGORICAL_FEATURES,
+    DATE_COLUMN,
+    NUMERIC_FEATURES,
+    SKEW_AUTO_DETECT,
+    SKEW_KURT_THRESHOLD,
+    SKEW_THRESHOLD,
+)
 
 
 class FeatureGenerator(BaseEstimator, TransformerMixin):
@@ -91,46 +98,75 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
         return names
 
     @staticmethod
-    def _resolve_skew_features(X: pd.DataFrame) -> List[str]:
-        """Lista los nombres de skew-mitigated features que vamos a generar.
+    def _detect_skew_features(X: pd.DataFrame) -> tuple[List[str], List[str], dict]:
+        """Auto-detecta features que se beneficiarian de log1p o sqrt.
 
-        Para cada col en SKEW_LOG1P_COLS o SKEW_SQRT_COLS que efectivamente
-        existe en X, agrega `<col>_LOG1P` o `<col>_SQRT` al feature set.
+        Reglas (corren SOLO en `fit`, no en `transform`):
+          - LOG1P: |skew| > SKEW_THRESHOLD (default 1.5) Y kurtosis razonable
+            (< SKEW_KURT_THRESHOLD * 10, default 50). Clasica skewness moderada.
+          - SQRT : kurtosis EXTREMA (> SKEW_KURT_THRESHOLD, default 50).
+            Para distribuciones con outliers brutales en colas (ej. DPC en
+            POP tenia kurt=158).
+          - Skip si distribucion ya es ~simetrica.
 
-        EDA POP 2026-05-09: las recomendaciones por variable provienen de
-        Box-Cox lambda + |skew| analysis. Ver config.py para criterios.
+        Tambien computa el SHIFT por columna (memo per-fit) para que
+        train/test apliquen la misma transformacion sin importar
+        diferencias de min entre splits.
+
+        Devuelve (log1p_names, sqrt_names, shifts_dict).
+        Ej: (["KG/HA_LOG1P", "%INDUS_LOG1P"], ["DPC_SQRT"], {"KG/HA": 0.0, ...})
         """
-        names: List[str] = []
-        for c in SKEW_LOG1P_COLS:
-            if c in X.columns:
-                names.append(f"{c}_LOG1P")
-        for c in SKEW_SQRT_COLS:
-            if c in X.columns:
-                names.append(f"{c}_SQRT")
-        return names
+        log1p_names: List[str] = []
+        sqrt_names: List[str] = []
+        shifts: dict = {}
+
+        candidates = [c for c in NUMERIC_FEATURES if c in X.columns]
+        for c in candidates:
+            v = pd.to_numeric(X[c], errors="coerce").dropna()
+            if len(v) < 30 or v.std() == 0:
+                continue
+            sk = float(v.skew())
+            kt = float(v.kurtosis())
+            min_v = float(v.min())
+            # Shift por columna: memoizado para evitar inconsistencia
+            # train/test cuando cambian los rangos.
+            shift = -min_v if min_v < 0 else 0.0
+
+            if abs(kt) > SKEW_KURT_THRESHOLD:
+                # Kurtosis extrema -> sqrt comprime mas las colas
+                sqrt_names.append(f"{c}_SQRT")
+                shifts[c] = shift
+            elif abs(sk) > SKEW_THRESHOLD:
+                # Skew moderada-alta -> log1p estabiliza
+                log1p_names.append(f"{c}_LOG1P")
+                shifts[c] = shift
+            # else: skip (distribucion sana)
+
+        return log1p_names, sqrt_names, shifts
 
     @staticmethod
-    def _skew_mitigated(X: pd.DataFrame, names: List[str]) -> pd.DataFrame:
-        """Aplica log1p / sqrt a las columnas listadas. NaN-safe; valores
-        negativos se shiftean (col + |min| + 1) antes de log1p / sqrt para
-        evitar -inf y mantener monotonia."""
+    def _skew_mitigated(X: pd.DataFrame, names: List[str], shifts: dict) -> pd.DataFrame:
+        """Aplica log1p / sqrt a las columnas listadas usando los SHIFTS
+        memoizados del fit (no recomputa min sobre la data de transform).
+
+        Esto garantiza que la misma fila produzca el mismo valor en train
+        y en inference, aunque los rangos de los datasets difieran.
+        """
         out = pd.DataFrame(index=X.index)
         for name in names:
             if name.endswith("_LOG1P"):
                 src_col = name[: -len("_LOG1P")]
                 v = pd.to_numeric(X[src_col], errors="coerce").astype(float)
-                # Shift defensivo si hay negativos (no esperado en POP, pero
-                # generaliza a otras variedades): mover a >=0 antes de log1p.
-                min_v = v.min(skipna=True)
-                if pd.notna(min_v) and min_v < 0:
-                    v = v - float(min_v)
+                v = v + float(shifts.get(src_col, 0.0))
+                # Defensivo en transform: si una fila nueva quedo < 0 tras el
+                # shift del fit (data drift), clip a 0 para evitar log1p(-x).
+                v = v.clip(lower=0.0)
                 out[name] = np.log1p(v)
             elif name.endswith("_SQRT"):
                 src_col = name[: -len("_SQRT")]
                 v = pd.to_numeric(X[src_col], errors="coerce").astype(float)
-                min_v = v.min(skipna=True)
-                if pd.notna(min_v) and min_v < 0:
-                    v = v - float(min_v)
+                v = v + float(shifts.get(src_col, 0.0))
+                v = v.clip(lower=0.0)
                 out[name] = np.sqrt(v)
         return out
 
@@ -236,11 +272,19 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
         # set sin re-evaluar.
         self.structural_feature_names_ = self._resolve_structural(X)
 
-        # Skew-mitigated features (EDA POP 2026-05-09: KG/HA, %INDUS, HA log1p;
-        # DPC sqrt por kurt extremo). Memorizado en fit para que transform
-        # produzca SIEMPRE el mismo set. Anchor temporal para t_index_*
-        # se memoriza tambien (primer dia visto en fit).
-        self.skew_feature_names_ = self._resolve_skew_features(X)
+        # Skew-mitigated features auto-detectadas (sin hardcoded list por
+        # variedad): para cada numeric feature de NUMERIC_FEATURES, decide en
+        # fit si necesita log1p (|skew|>threshold) o sqrt (kurt>threshold).
+        # Tambien memoiza el SHIFT por columna para garantizar consistencia
+        # train/test (sin esto, _skew_mitigated calculaba min per-call y la
+        # misma fila daba valores distintos en train vs inference).
+        if SKEW_AUTO_DETECT:
+            log1p_names, sqrt_names, shifts = self._detect_skew_features(X)
+            self.skew_feature_names_ = log1p_names + sqrt_names
+            self.skew_shifts_ = shifts
+        else:
+            self.skew_feature_names_ = []
+            self.skew_shifts_ = {}
 
         # Trend anchor: primer dia visto durante el fit. Se usa en transform
         # para que t_index_days/years sean consistentes entre training y
@@ -286,7 +330,11 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
 
         passthrough_part = X[self.passthrough_cols_].copy()
         structural_part = self._structural_ratios(X, self.structural_feature_names_)
-        skew_part = self._skew_mitigated(X, getattr(self, "skew_feature_names_", []))
+        skew_part = self._skew_mitigated(
+            X,
+            getattr(self, "skew_feature_names_", []),
+            getattr(self, "skew_shifts_", {}),
+        )
 
         if self.date_col_ is not None:
             date_part = self._date_features(

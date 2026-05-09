@@ -25,7 +25,13 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
-from src.diagnostics.html_renderer import _CSS, _badge, _fig_to_html, _format_p, _test_row
+from src.diagnostics.html_renderer import (
+    BASE_CSS,
+    fig_to_html_div,
+    format_pvalue,
+    render_badge,
+    renderrender_test_row,
+)
 from src.diagnostics.plots import _style
 from src.diagnostics.statistical_tests import (
     anderson_darling,
@@ -153,7 +159,7 @@ def render_residual_report(
     # Render
     test_blocks = []
     for group_title, tests_in_group in tests:
-        rows = "".join(_test_row(t) for t in tests_in_group)
+        rows = "".join(render_test_row(t) for t in tests_in_group)
         test_blocks.append(f"""
         <h3>{escape(group_title)}</h3>
         <table class="summary">
@@ -170,7 +176,7 @@ def render_residual_report(
             "Modelo dejo patron temporal sin capturar — considerar mas lags o STL features."))
     if lb.rejects_h0:
         summary_findings.append(("severity-high",
-            f"Ljung-Box rechaza no-autocorrelacion (p={_format_p(lb.p_value)})."))
+            f"Ljung-Box rechaza no-autocorrelacion (p={format_pvalue(lb.p_value)})."))
     if bp.rejects_h0 or wt.rejects_h0:
         summary_findings.append(("severity-medium",
             "Heteroscedasticidad residual: varianza no constante con la prediccion. "
@@ -213,10 +219,10 @@ def render_residual_report(
       <section class="card">
         <h2>Plots diagnosticos</h2>
         <div class="grid-2">
-          {_fig_to_html(fig_rvp, 'rvp')}
-          {_fig_to_html(fig_arvp, 'arvp')}
-          {_fig_to_html(fig_hist, 'hist')}
-          {_fig_to_html(fig_qq, 'qq')}
+          {fig_to_html_div(fig_rvp, 'rvp')}
+          {fig_to_html_div(fig_arvp, 'arvp')}
+          {fig_to_html_div(fig_hist, 'hist')}
+          {fig_to_html_div(fig_qq, 'qq')}
         </div>
       </section>
 
@@ -239,7 +245,7 @@ def render_residual_report(
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Residual diagnostics — {escape(variety)} / {escape(model_type)}</title>
   {plotly_cdn}
-  {_CSS}
+  {BASE_CSS}
 </head>
 <body>{body}</body>
 </html>"""

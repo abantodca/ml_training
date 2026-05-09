@@ -26,14 +26,32 @@ logger = logging.getLogger(__name__)
 
 
 def _git_info(repo_root: Optional[Path] = None) -> Dict[str, str]:
-    """SHA del HEAD + flag de dirty. Silent fallback si no hay git/.git."""
+    """SHA del HEAD + flag de dirty.
+
+    Resolucion en orden:
+      1. Env vars GIT_SHA / GIT_DIRTY -> tiene prioridad (inyectado en
+         docker run via Taskfile, ya que el container no monta .git).
+      2. `git -C <repo>` binary -> funciona en host con repo git real.
+      3. Fallback "unknown".
+
+    Esto resuelve el caso "container sin .git montado" sin necesidad de
+    bind-mount del .git (ahorra I/O en Windows + Docker Desktop).
+    """
+    # 1) Env var explicita gana
+    env_sha = os.environ.get("GIT_SHA", "").strip()
+    if env_sha and env_sha != "unknown":
+        return {
+            "git_commit": env_sha[:12],
+            "git_dirty": os.environ.get("GIT_DIRTY", "unknown"),
+        }
+
+    # 2) git binary contra repo en disco
     cwd = repo_root or Path.cwd()
     try:
         sha = subprocess.check_output(
             ["git", "-C", str(cwd), "rev-parse", "HEAD"],
             stderr=subprocess.DEVNULL,
         ).decode("utf-8").strip()
-        # `git status --porcelain` empty => clean
         status = subprocess.check_output(
             ["git", "-C", str(cwd), "status", "--porcelain"],
             stderr=subprocess.DEVNULL,

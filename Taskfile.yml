@@ -178,8 +178,20 @@ tasks:
   train:
     desc: "Entrena dentro del container. Vars: VARIETIES TUNING PARALLEL. El sistema entrena XGB y LGB y elige el campeon (no se puede forzar un modelo). Si cambiaste codigo, corre `task build` primero"
     deps: [up]
+    vars:
+      # Capturamos el git SHA del host AHORA y lo pasamos al container
+      # via env var. El container no monta .git/ (excluido por .dockerignore)
+      # asi que sin esto run_metadata loggea git_commit=unknown.
+      # Sintaxis POSIX (mvdan/sh interpreter de Task, cross-platform).
+      GIT_SHA:
+        sh: git rev-parse HEAD 2>/dev/null || echo unknown
+      GIT_DIRTY:
+        sh: git diff --quiet HEAD 2>/dev/null && echo false || echo true
     cmds:
-      - docker compose run --rm trainer
+      - docker compose run --rm
+        -e GIT_SHA={{.GIT_SHA}}
+        -e GIT_DIRTY={{.GIT_DIRTY}}
+        trainer
         --varieties {{.VARIETIES}}
         --tuning {{.TUNING}}
         --parallel-varieties {{.PARALLEL}}
@@ -187,10 +199,16 @@ tasks:
   # ═══ Reports dashboard ════════════════════════════════════════════════════
 
   reports:dashboard:
-    desc: "Regenera reports/index.html (dashboard unificado con sidebar de todos los HTML/Excel/JSON). Abre en http://localhost:8080/reports/index.html"
+    desc: "Regenera reports/index_static.html (snapshot estatico, no pisa el index.html JS-dinamico). Para emailar / archivar / abrir via file://"
     cmds:
       - docker compose run --rm --no-deps --entrypoint python trainer
         -m src.diagnostics.dashboard_index
+
+  registry:audit:
+    desc: "Lista versions de cada modelo en MLflow Registry con metricas y recomendacion de archivado. Read-only (no transiciona nada)"
+    cmds:
+      - docker compose run --rm --no-deps --entrypoint python trainer
+        -m scripts.registry_audit
 
   # ═══ Auditoria ══════════════════════════════════════════════════════════
 

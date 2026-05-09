@@ -1,4 +1,22 @@
-"""Generador de `reports/index.html` — dashboard unificado de reportes.
+"""Generador de `reports/index.html` — dashboard unificado de reportes (estatico).
+
+Coexiste con la version JS-dinamica en `reports/index.html` (que reports/
+ya tiene cuando arrancas con `task up`). Cuando usar cada uno:
+
+    JS dinamico (siempre presente como `reports/index.html`):
+      Pro:  auto-refresh al click en boton, descubre archivos sobre la marcha
+      Contra: requiere nginx + autoindex (no funciona file://)
+      Uso:  workflow de desarrollo, dashboards live durante training
+
+    Python estatico (este modulo, escribe `reports/index_static.html`):
+      Pro:  snapshot archivable, funciona file://, emailable, no depende de infra
+      Contra: stale al agregar archivo nuevo (re-correr `task reports:dashboard`)
+      Uso:  reports compartidos por email, archivos para auditoria, deploy S3 static
+
+Para que NO se pisen, este modulo escribe a `index_static.html` (no
+`index.html`). Asi ambos coexisten en `reports/`.
+
+
 
 Escanea `reports/` y produce un HTML self-contained con:
     - Header (project + contador de reportes + timestamp de regeneracion)
@@ -150,8 +168,8 @@ def scan_reports(reports_dir: Path) -> dict[str, List[ReportItem]]:
     for path in reports_dir.iterdir():
         if not path.is_file():
             continue
-        if path.name == "index.html":
-            continue  # no se referencia a si mismo
+        if path.name in ("index.html", "index_static.html"):
+            continue  # no listamos los dashboards mismos
         if path.name.startswith("."):
             continue
 
@@ -179,6 +197,11 @@ def scan_reports(reports_dir: Path) -> dict[str, List[ReportItem]]:
 # ---------------------------------------------------------------------------
 # HTML render
 # ---------------------------------------------------------------------------
+# NOTE: el palette `:root` (--primary, --gray-*, etc) se duplica con
+# `html_renderer.BASE_CSS`. Future-work: extraer a `src/diagnostics/_palette.py`
+# como constantes Python f-string-able. Por ahora aceptamos duplicacion
+# porque los layouts (sidebar/topbar vs cards/tables) son fundamentalmente
+# distintos y compartir todo el CSS no aporta.
 _CSS = """
 :root {
   --primary: #2563eb;
@@ -405,11 +428,17 @@ def render_dashboard(grouped: dict[str, List[ReportItem]]) -> str:
 </html>"""
 
 
-def write_dashboard(reports_dir: Path) -> Path:
-    """Escanea reports_dir y escribe reports_dir/index.html. Devuelve el path."""
+def write_dashboard(reports_dir: Path,
+                    *, filename: str = "index_static.html") -> Path:
+    """Escanea reports_dir y escribe reports_dir/<filename>. Devuelve el path.
+
+    Default `filename='index_static.html'` para NO pisar el `index.html`
+    JS-dinamico que vive en reports/. Si alguien quiere reemplazarlo,
+    pasar `filename='index.html'` explicito.
+    """
     grouped = scan_reports(reports_dir)
     html = render_dashboard(grouped)
-    out = reports_dir / "index.html"
+    out = reports_dir / filename
     out.write_text(html, encoding="utf-8")
     total = sum(len(v) for v in grouped.values())
     logger.info(f"Dashboard regenerado: {out} ({total} reportes indexados)")

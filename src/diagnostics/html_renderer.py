@@ -22,7 +22,9 @@ from typing import Iterable, List
 import plotly.graph_objects as go
 
 
-_CSS = """
+#: API publica del modulo. Otros modulos (residuals.py, dashboard_index)
+#: importan estos symbols, asi que NO llevan underscore prefix.
+BASE_CSS = """
 <style>
   :root {
     --primary: #2563eb;
@@ -124,11 +126,12 @@ _CSS = """
 """
 
 
-def _badge(text: str, kind: str = "info") -> str:
+def render_badge(text: str, kind: str = "info") -> str:
+    """Span con badge tipado (kind: info/ok/warn/danger)."""
     return f'<span class="badge badge-{kind}">{escape(text)}</span>'
 
 
-def _fig_to_html(fig: go.Figure, div_id: str) -> str:
+def fig_to_html_div(fig: go.Figure, div_id: str) -> str:
     """Plotly fig -> HTML div sin redundar plotly.js (se carga UNA vez en head)."""
     return fig.to_html(
         include_plotlyjs=False,
@@ -138,7 +141,8 @@ def _fig_to_html(fig: go.Figure, div_id: str) -> str:
     )
 
 
-def _format_p(p) -> str:
+def format_pvalue(p) -> str:
+    """Formatea p-value: notacion cientifica si <0.001, decimal si no."""
     if p is None:
         return "—"
     if p < 0.001:
@@ -146,15 +150,24 @@ def _format_p(p) -> str:
     return f"{p:.4f}"
 
 
-def _test_row(test) -> str:
-    """Fila <tr> para una tabla de tests estadisticos."""
+def render_test_row(test) -> str:
+    """Fila <tr> para una tabla de tests estadisticos. Ver TestResult."""
     stat = "—" if test.statistic is None else f"{test.statistic:.4f}"
     return (
         f"<tr><td>{test.status_emoji()} {escape(test.name)}</td>"
         f"<td class='num'>{stat}</td>"
-        f"<td class='num'>{_format_p(test.p_value)}</td>"
+        f"<td class='num'>{format_pvalue(test.p_value)}</td>"
         f"<td>{escape(test.notes)}</td></tr>"
     )
+
+
+# Backward-compat aliases (deprecadas, usar las publicas).
+# Removerlas cuando todos los callers migren.
+_CSS = BASE_CSS
+_badge = render_badge
+_fig_to_html = fig_to_html_div
+_format_p = format_pvalue
+_test_row = render_test_row
 
 
 def _hero(variety: str, n_rows: int, n_cols: int) -> str:
@@ -196,25 +209,25 @@ def _variable_card(profile, fig_hist: go.Figure, fig_qq: go.Figure,
         f"<span><b>kurt</b>={profile.kurtosis:+.2f}</span>"
     )
     bc = (
-        f'{_badge("Box-Cox: " + profile.boxcox_recommendation, "info")}'
+        f'{render_badge("Box-Cox: " + profile.boxcox_recommendation, "info")}'
         if profile.boxcox_lambda is not None else
-        f'{_badge("Box-Cox: " + profile.boxcox_recommendation, "warn")}'
+        f'{render_badge("Box-Cox: " + profile.boxcox_recommendation, "warn")}'
     )
     outliers = (
         f'<span><b>outliers</b> IQR={profile.n_outliers_iqr} '
         f'· Z={profile.n_outliers_zscore} '
         f'· MAD={profile.n_outliers_mad}</span>'
     )
-    test_rows = "".join(_test_row(t) for t in profile.normality_tests)
+    test_rows = "".join(render_test_row(t) for t in profile.normality_tests)
     return f"""
     <div class="var-card">
       <div class="var-name">{escape(profile.name)}</div>
       <div class="var-stats">{stats}{outliers}</div>
       <div>{bc}</div>
       <div class="grid-3">
-        {_fig_to_html(fig_hist, f'hist_{idx}')}
-        {_fig_to_html(fig_qq, f'qq_{idx}')}
-        {_fig_to_html(fig_box, f'box_{idx}')}
+        {fig_to_html_div(fig_hist, f'hist_{idx}')}
+        {fig_to_html_div(fig_qq, f'qq_{idx}')}
+        {fig_to_html_div(fig_box, f'box_{idx}')}
       </div>
       <h3>Tests de normalidad</h3>
       <table class="summary">
@@ -228,7 +241,7 @@ def _variable_card(profile, fig_hist: go.Figure, fig_qq: go.Figure,
 def _temporal_card(profile, fig_acf: go.Figure, idx: int) -> str:
     tests = [profile.durbin_watson, profile.ljung_box_10,
              profile.adf, profile.kpss]
-    test_rows = "".join(_test_row(t) for t in tests)
+    test_rows = "".join(render_test_row(t) for t in tests)
     stl = ""
     if profile.stl_trend_strength is not None:
         stl = (
@@ -243,7 +256,7 @@ def _temporal_card(profile, fig_acf: go.Figure, idx: int) -> str:
     <div class="var-card">
       <div class="var-name">{escape(profile.name)} — temporal</div>
       {stl}
-      {_fig_to_html(fig_acf, f'acf_{idx}')}
+      {fig_to_html_div(fig_acf, f'acf_{idx}')}
       <table class="summary">
         <thead><tr><th>Test</th><th class='num'>Statistic</th><th class='num'>p-value</th><th>Notas</th></tr></thead>
         <tbody>{test_rows}</tbody>
@@ -331,16 +344,16 @@ def render_eda_html(
       <section class="card">
         <h2>4. Multivariado</h2>
         <div class="grid-2">
-          {_fig_to_html(corr_fig, 'corr_heatmap')}
-          {_fig_to_html(vif_fig, 'vif_bars')}
+          {fig_to_html_div(corr_fig, 'corr_heatmap')}
+          {fig_to_html_div(vif_fig, 'vif_bars')}
         </div>
-        {_fig_to_html(mi_fig, 'mi_bars')}
+        {fig_to_html_div(mi_fig, 'mi_bars')}
         {high_pairs_table}
       </section>
 
       <section class="card">
         <h2>5. Drift entre anios (Population Stability Index)</h2>
-        {_fig_to_html(psi_fig, 'psi_heatmap')}
+        {fig_to_html_div(psi_fig, 'psi_heatmap')}
         <p style="font-size:11px; color:var(--gray-500); margin-top:8px;">
           PSI &lt; 0.10 sin drift · 0.10-0.25 moderado · &gt; 0.25 severo.
         </p>
@@ -360,7 +373,7 @@ def render_eda_html(
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>EDA — {escape(variety)}</title>
   {plotly_cdn}
-  {_CSS}
+  {BASE_CSS}
 </head>
 <body>{body}</body>
 </html>"""

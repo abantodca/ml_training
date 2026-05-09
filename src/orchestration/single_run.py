@@ -214,8 +214,11 @@ def train_model(
                 n_cols=int(X.shape[1]),
             )
             set_tags(metadata_tags)
-        except Exception as exc:
-            log.warning(f"collect_run_metadata fallo (no critico): {exc}")
+        except Exception:
+            # Trazabilidad rota es un finding de auditoria; loggear con
+            # traceback para que el siguiente sysadmin sepa que arreglar.
+            log.warning("collect_run_metadata fallo (no aborta training)",
+                        exc_info=True)
         log_params({
             "variety": variety,
             "tuning": args.tuning,

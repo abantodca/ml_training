@@ -95,7 +95,12 @@ def shapiro_wilk(x: pd.Series, alpha: float = 0.05) -> TestResult:
 
 
 def anderson_darling(x: pd.Series, alpha: float = 0.05) -> TestResult:
-    """Anderson-Darling normality test. Devuelve estadistica y p estimado."""
+    """Anderson-Darling normality test. Devuelve estadistica + p-value.
+
+    scipy 1.15+ requiere `method=` explicito (FutureWarning sin el).
+    Intentamos primero la API nueva (`method='interpolate'` da p-value
+    directo); si scipy es viejo, caemos al legacy de critical_values.
+    """
     from scipy.stats import anderson
 
     name = "Anderson-Darling"
@@ -104,8 +109,23 @@ def anderson_darling(x: pd.Series, alpha: float = 0.05) -> TestResult:
     if len(x_clean) < 8:
         return _safe_test(name, h0, is_finding=True)
     try:
+        # API nueva (scipy >= 1.15): da pvalue directo, mas preciso
+        try:
+            result = anderson(x_clean, dist="norm", method="interpolate")
+            stat = float(result.statistic)
+            p = float(result.pvalue) if hasattr(result, "pvalue") else None
+            if p is not None:
+                return TestResult(
+                    name=name, statistic=stat, p_value=p,
+                    rejects_h0=p < alpha, h0_meaning=h0, is_finding=True,
+                    notes=f"n={len(x_clean)}",
+                )
+        except TypeError:
+            # scipy < 1.15: method param no existe, cae al legacy abajo
+            pass
+
+        # API legacy (scipy < 1.15): critical_values + significance_level
         result = anderson(x_clean, dist="norm")
-        # critical values son arrays, mapeamos al alpha mas cercano
         sig_levels = list(result.significance_level)  # [15.0, 10.0, 5.0, 2.5, 1.0]
         crit_at_alpha = result.critical_values[sig_levels.index(alpha * 100)]
         rejects = result.statistic > crit_at_alpha

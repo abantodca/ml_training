@@ -43,9 +43,14 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
     APP_HOME=/app
 
-# Runtime deps + tini para reaping/SIGTERM correcto en Batch
+# Runtime deps + tini para reaping/SIGTERM correcto en Batch.
+# `git` se instala porque mlflow.utils.git_utils + collect_run_metadata
+# dependen de el para taggear el run con git_commit. Sin git en el
+# container, todos los runs salen con git_commit=unknown -> auditoria
+# de compliance rota (no podes vincular un modelo en Registry a un SHA).
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 ca-certificates tini \
+    && apt-get install -y --no-install-recommends \
+        libgomp1 ca-certificates tini git \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --system --gid 1001 mluser \
     && useradd  --system --uid 1001 --gid mluser --home ${APP_HOME} mluser
