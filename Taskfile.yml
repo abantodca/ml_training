@@ -173,7 +173,7 @@ tasks:
       - 'echo "==============================================================="'
       - 'echo ""'
 
-  # ═══ Training ═══════════════════════════════════════════════════════════
+  # ═══ Training ══════════════════════════════════════════════════════════
 
   train:
     desc: "Entrena dentro del container. Vars: VARIETIES TUNING PARALLEL. El sistema entrena XGB y LGB y elige el campeon (no se puede forzar un modelo). Si cambiaste codigo, corre `task build` primero"
@@ -183,6 +183,14 @@ tasks:
         --varieties {{.VARIETIES}}
         --tuning {{.TUNING}}
         --parallel-varieties {{.PARALLEL}}
+
+  # ═══ Reports dashboard ════════════════════════════════════════════════════
+
+  reports:dashboard:
+    desc: "Regenera reports/index.html (dashboard unificado con sidebar de todos los HTML/Excel/JSON). Abre en http://localhost:8080/reports/index.html"
+    cmds:
+      - docker compose run --rm --no-deps --entrypoint python trainer
+        -m src.diagnostics.dashboard_index
 
   # ═══ Auditoria ══════════════════════════════════════════════════════════
 
