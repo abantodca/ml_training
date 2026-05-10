@@ -11,15 +11,14 @@ producirian metricas absurdas:
   - columnas con varianza cero (todas las filas con el mismo valor; no
     aporta nada al modelo)
 
-El comportamiento por default es STRICT (raise al primer fallo). El caller
-puede pasar `strict=False` para que reporte warnings en lugar de fallar.
-
-Sin dependencias nuevas: solo pandas + numpy.
+Comportamiento: solo loguea warnings y devuelve la lista de issues. NO
+aborta el pipeline. Los sintomas reales aparecen en el modelo (training
+fallido, MAPE alto). Sin dependencias nuevas: solo pandas + numpy.
 """
 from __future__ import annotations
 
 import logging
-from typing import List, Optional
+from typing import List
 
 import pandas as pd
 
@@ -43,19 +42,14 @@ _NUMERIC_RANGES: dict = {
     "P/BAYA": (0.0, None),     # peso por baya en gramos
     "HA": (0.0, None),         # hectareas cosechadas
     "DIA_COSECHA": (1, 366),   # dia desde inicio de campana (no DOY); cap >365 generoso
-    # Para validar H-EF (jornada efectiva) usamos un rango plausible:
-    "H-EF": (0.0, 24.0),       # horas efectivas en una jornada
-    "KG/JR": (0.0, None),      # kilos por jornal
+    "H-EF": (0.0, 24.0),       # horas efectivas en una jornada (validacion solo)
+    "KG/JR": (0.0, None),      # kilos por jornal (validacion solo)
 }
 
 
 class SchemaError(ValueError):
     """Error de validacion de schema. Heredamos de ValueError para que sea
     capturable como un input invalido del usuario, no un bug interno."""
-
-
-def _check_required_columns(df: pd.DataFrame, required: List[str]) -> List[str]:
-    return [c for c in required if c not in df.columns]
 
 
 def _check_dtypes(df: pd.DataFrame) -> List[str]:
@@ -97,11 +91,10 @@ def _check_numeric_ranges(df: pd.DataFrame) -> List[str]:
 def _check_full_row_duplicates(df: pd.DataFrame) -> List[str]:
     """Detecta filas COMPLETAMENTE duplicadas (todas las columnas iguales).
 
-    NOTA: NO chequeamos por (FUNDO+FORMATO+FECHA) porque en datos agricolas
-    varias cosechas el mismo dia para el mismo (fundo, formato) son
-    legitimas (distintas cuadrillas, turnos, lotes). Solo flaggeamos
-    filas exactamente duplicadas que probablemente vinieron de un export
-    duplicado del Excel.
+    NO chequeamos por (FUNDO+FORMATO+FECHA) porque en datos agricolas varias
+    cosechas el mismo dia para el mismo (fundo, formato) son legitimas
+    (distintas cuadrillas, turnos, lotes). Solo flaggeamos filas exactamente
+    duplicadas que probablemente vinieron de un export duplicado del Excel.
     """
     n_dup = df.duplicated(keep="first").sum()
     if n_dup > 0:
@@ -127,28 +120,12 @@ def _check_zero_variance(df: pd.DataFrame) -> List[str]:
     return issues
 
 
-def validate_dataset(
-    df: pd.DataFrame,
-    *,
-    required_columns: Optional[List[str]] = None,
-) -> List[str]:
+def validate_dataset(df: pd.DataFrame) -> List[str]:
     """Corre todos los chequeos de schema. Devuelve lista de issues encontrados.
 
-    Args
-    ----
-    df : DataFrame post-parseo Excel y pre-Pipeline.
-    required_columns : si se da, valida presencia. Si falta alguna, raise
-        SchemaError (este es el unico chequeo blocking).
-
-    El resto (dtypes, rangos, duplicados, varianza cero) son warnings: se
-    loguean y devuelven en la lista, pero no abortan el pipeline. Los
-    sintomas reales aparecen en el modelo (training fallido, MAPE alto).
+    Solo loguea warnings; NUNCA aborta. Si el caller quiere validar columnas
+    requeridas, usar `df.columns` directamente antes de invocar.
     """
-    if required_columns:
-        missing = _check_required_columns(df, required_columns)
-        if missing:
-            raise SchemaError(f"Columnas requeridas faltantes: {missing}")
-
     issues: List[str] = []
     issues.extend(_check_dtypes(df))
     issues.extend(_check_numeric_ranges(df))

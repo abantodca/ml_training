@@ -182,8 +182,8 @@ def load_data(
 
     # Validacion de schema antes de pasar al Pipeline. Detecta tipos
     # incorrectos, rangos imposibles, duplicados estructurales, etc.
-    # Solo loguea warnings; el unico raise viene de columnas requeridas
-    # faltantes (controlado en `validate_dataset`).
+    # Solo loguea warnings (las columnas requeridas ya se validaron
+    # arriba con `needed`/`missing`).
     validate_dataset(df)
 
     # NOTA: las lag features se calculan AHORA dentro del Pipeline via
