@@ -7,11 +7,11 @@ import numpy as np
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
-def calculate_regression_metrics(y_true, y_pred, prefix: str = "") -> Dict[str, float]:
-    """Devuelve {mae, rmse, r2, mape} con prefijo opcional.
+def calculate_regression_metrics(y_true, y_pred) -> Dict[str, float]:
+    """Devuelve {mae, rmse, r2, mape}.
 
     MAPE se calcula descartando observaciones con y_true == 0 para evitar
-    divisiones por cero.
+    divisiones por cero. Si no quedan observaciones validas, MAPE = NaN.
     """
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
@@ -28,10 +28,4 @@ def calculate_regression_metrics(y_true, y_pred, prefix: str = "") -> Dict[str, 
     else:
         mape = float("nan")
 
-    p = f"{prefix}_" if prefix else ""
-    return {
-        f"{p}mae": mae,
-        f"{p}rmse": rmse,
-        f"{p}r2": r2,
-        f"{p}mape": mape,
-    }
+    return {"mae": mae, "rmse": rmse, "r2": r2, "mape": mape}

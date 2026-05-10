@@ -54,12 +54,12 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
         Agrega columna `ANIO` (entero) para capturar deriva temporal.
     add_fundo_formato_interaction : bool
         Si FUNDO y FORMATO estan ambos en categorical_cols, agrega dummies
-        para la combinacion FUNDO__FORMATO. Default False (legacy LGB v3
-        baseline). Activar via flag ENABLE_FUNDO_FORMATO_INTERACTION para
-        ablation. Justificacion: EDA POP mostro Cramer's V vs target = 0.29
-        (FUNDO) y 0.23 (FORMATO), V(FUNDO,FORMATO)=0.26 (no redundancia).
-        Riesgo: el arbol PUEDE aprender la interaccion solo via 2 splits
-        sucesivos -> agregar dummies puede solo diluir importancia.
+        para la combinacion FUNDO__FORMATO. Default False (uso standalone);
+        en el pipeline real (`build_pipeline`) se pasa
+        `ENABLE_FUNDO_FORMATO_INTERACTION` que es True por defecto tras
+        validar gap -8% en prod_xl POP (2026-05-09). EDA POP mostro
+        Cramer's V vs target = 0.29 (FUNDO) y 0.23 (FORMATO),
+        V(FUNDO,FORMATO)=0.26 (no redundancia).
     """
 
     def __init__(

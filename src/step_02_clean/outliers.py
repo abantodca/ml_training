@@ -157,16 +157,6 @@ class OutlierCapper(BaseEstimator, TransformerMixin):
                 if small:
                     self.small_groups_[level_label] = small
 
-        # Aliases backward-compat para callers / tests que leen los antiguos.
-        # Reflejan el nivel mas especifico del cascade (si existe).
-        if self.cascade_:
-            self.group_col_: Optional[str] = "_".join(self.group_cols_)
-            self.group_lower_ = self.cascade_[0][1]
-            self.group_upper_ = self.cascade_[0][2]
-        else:
-            self.group_col_ = None
-            self.group_lower_ = {}
-            self.group_upper_ = {}
         return self
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:

@@ -69,10 +69,10 @@ python main.py --tuning dev --varieties POP --stacking gam
 
 | `--tuning` | n_trials | final_trials | outer × inner | trials totales | tiempo estimado* |
 |---|---|---|---|---|---|
-| `smoke`   | 5   | 3  | 2 × 2 | 13   | ~1 min   |
-| `dev`     | 20  | 10 | 3 × 3 | 70   | ~10 min  |
-| `prod`    | 60  | 30 | 5 × 3 | 330  | ~1.5 h   |
-| `prod_xl` | 100 | 50 | 5 × 3 | 550  | ~2.5 h   |
+| `smoke`   | 5   | 3  | 2 × 2 | 13   | ~1 min      |
+| `dev`     | 20  | 10 | 3 × 3 | 70   | ~20 min     |
+| `prod`    | 60  | 30 | 5 × 3 | 330  | ~1.5-2.5 h  |
+| `prod_xl` | 100 | 50 | 6 × 3 | 650  | ~5-6 h      |
 
 \* sobre 10 073 filas, **POR BACKEND**. Con `--model auto` (default) se duplica.
 Con `--parallel-varieties N` el wallclock por job se acerca a `total / N`

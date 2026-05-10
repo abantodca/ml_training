@@ -45,11 +45,3 @@ def wrap_with_log_target(regressor: BaseEstimator) -> TransformedTargetRegressor
         inverse_func=_expm1,
         check_inverse=False,
     )
-
-
-def unwrap_regressor(estimator: BaseEstimator) -> BaseEstimator:
-    """Devuelve el regresor 'real' (LGBM/XGB) si esta envuelto en TTR."""
-    if isinstance(estimator, TransformedTargetRegressor):
-        # Tras fit, el modelo entrenado vive en `regressor_` (con guion bajo).
-        return getattr(estimator, "regressor_", estimator.regressor)
-    return estimator

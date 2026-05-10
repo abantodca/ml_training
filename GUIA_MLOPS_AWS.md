@@ -1,1269 +1,963 @@
-# GUIA MLOPS AWS — ml-training
+# Guia MLOps AWS — Infra modular en Terraform
 
-Implementacion paso a paso de la arquitectura MLOps en AWS para el pipeline
-`ml_training` (regresion de productividad agricola, multi-variedad, batch).
+> Repositorio destino sugerido: `ml-training-infra/` (separado del repo del trainer).
+> Referencia rapida: `terraform init && terraform plan && terraform apply`.
 
-Este documento es **copy-paste secuencial**: cada bloque es ejecutable desde
-una shell con AWS CLI v2 ya configurada (`aws configure`). Los bloques
-exportan variables de entorno que reutilizan los siguientes — corre la
-sesion entera en una misma terminal o repite el bloque 1 al inicio.
+Esta guia describe la infra de produccion como **modulos Terraform**: cada
+modulo encapsula una capa (network, mlflow, batch, ...) con interface clara
+(variables / outputs). El compose se hace en `envs/prod/main.tf`.
+
+Diseño detras de la modularizacion:
+
+1. **Aislar blast-radius**: tocar un modulo (p.ej. `batch`) no obliga a re-aplicar otro (p.ej. `mlflow`).
+2. **Reutilizable**: el dia que necesites un `envs/dev/` o `envs/staging/`, copias el `prod/` y cambias `tfvars`.
+3. **Idempotente**: `terraform apply` se puede correr N veces; el estado vive en S3 + lock en DynamoDB.
+4. **Operacion declarativa**: la infra es codigo. PR = cambio de infra revisable.
 
 ---
 
 ## 0. Arquitectura objetivo
 
 ```
-                  ┌─────────────────┐         ┌──────────────────┐
-                  │  Desarrollador  │         │  Excel mensual   │
-                  │  (push a main)  │         │  (upload manual) │
-                  └────────┬────────┘         └─────────┬───────┘
-                           │                            │
-                           ▼                            ▼
-                  ┌──────────────────┐        ┌──────────────────┐
-                  │  GitHub          │        │  S3: data-raw/   │
-                  │  + Actions       │        │  *.xlsx          │
-                  └────────┬─────────┘        └─────────┬────────┘
-                           │ build+push                 │ S3 PutObject
-                           ▼                            ▼
-                  ┌──────────────────┐        ┌──────────────────┐
-                  │  ECR             │        │  EventBridge bus │◄───┐
-                  │  ml-training:tag │        │  + Schedule cron │    │
-                  └────────┬─────────┘        └─────────┬────────┘    │
-                           │                            │             │
-                           │      ┌────────────────────┘              │
-                           │      ▼                                   │
-                           │  ┌────────────┐                          │
-                           │  │  Lambda    │  resuelve --varieties    │
-                           │  │ dispatcher │  desde el evento         │
-                           │  └─────┬──────┘                          │
-                           │        │ batch:SubmitJob                 │
-                           ▼        ▼                                 │
-                ┌─────────────────────────────────────────┐           │
-                │  AWS Batch                              │           │
-                │  Compute Env: EC2 Spot c6i.2xlarge      │           │
-                │  Job Queue:   ml-training-queue         │           │
-                │  Job Def:     ml-training:N (image,cmd) │           │
-                │                                         │           │
-                │  python main.py --varieties POP,VENTURA │           │
-                │                 --tuning prod           │           │
-                └────────────┬────────────────────────────┘           │
-                             │                                        │
-            ┌────────────────┼─────────────────┐                      │
-            │                │                 │                      │
-            ▼                ▼                 ▼                      │
-     ┌──────────────┐ ┌──────────────┐ ┌──────────────┐               │
-     │  S3          │ │  MLflow      │ │ CloudWatch   │ ──── al       │
-     │  artifacts/  │ │  (Fargate)   │ │  Logs        │   terminar    │
-     │  reports/    │ │   ↑          │ │  + alarms    │   o fallar    │
-     └──────────────┘ │   │          │ └──────┬───────┘               │
-                      │   ▼          │        │                       │
-                      │ RDS Postgres │        │ EventBridge job       │
-                      │ (registry)   │        │ state-change event   ─┘
-                      └──────────────┘        │
-                                              ▼
-                                       ┌─────────────┐
-                                       │ Lambda      │
-                                       │ notifier    │ ──▶ SNS / Slack
-                                       └─────────────┘
+                                    ┌──────────────────────────────┐
+                                    │  EventBridge                 │
+                                    │  - cron 1 variedad/dia       │
+                                    │  - S3 PutObject (data-raw)   │
+                                    └────────────┬─────────────────┘
+                                                 │
+                                                 ▼
+                                          ┌──────────────┐
+                                          │  Lambda      │
+                                          │  dispatcher  │
+                                          └──────┬───────┘
+                                                 │ batch:SubmitJob
+                                                 ▼
+                              ┌─────────────────────────────────────┐
+                              │  AWS Batch                          │
+                              │  ┌──────────────┐  ┌──────────────┐ │
+                              │  │ queue-spot   │  │ queue-od     │ │
+                              │  └──────┬───────┘  └──────┬───────┘ │
+                              │  ┌──────▼───────┐  ┌──────▼───────┐ │
+                              │  │ ce-spot      │  │ ce-ondemand  │ │
+                              │  │ c6i.2xlarge  │  │ c6i.2xlarge  │ │
+                              │  └──────────────┘  └──────────────┘ │
+                              │  job-def: ml-training (8h, retry 2) │
+                              └────────────────────┬────────────────┘
+                                                   │
+                  ┌────────────────────────────────┼────────────────────────────┐
+                  ▼                                ▼                            ▼
+       ┌──────────────────┐              ┌──────────────────┐         ┌─────────────────┐
+       │ S3 data-raw      │              │ MLflow (Fargate) │         │ S3 mlflow-art   │
+       │  +EventBridge    │              │  ALB :80 -> :5000│         │  artifacts/     │
+       │  notifications   │              │  ↳ RDS Postgres  │         │  reports/       │
+       └──────────────────┘              └──────────────────┘         └─────────────────┘
+
+                              ┌──────────────────────────────────┐
+                              │  CloudWatch Logs (retention 30d) │
+                              │  + Alarms -> SNS -> Email/Slack  │
+                              └──────────────────────────────────┘
+
+                              ┌──────────────────────────────────┐
+                              │  Lambda notifier (SUCCEEDED/FAIL)│
+                              │  triggered by Batch state-change │
+                              └──────────────────────────────────┘
 ```
 
-### Compatibilidad Python 3.13 (todo el stack)
-
-El proyecto corre **Python 3.13** end-to-end. Tabla de versiones por componente:
-
-| Componente | Runtime | Cómo se fija |
-|---|---|---|
-| Local (Windows/Linux/Mac) | Python 3.13.9 | `python --version` (anaconda/pyenv) |
-| Container del trainer (local + AWS Batch) | `python:3.13-slim` | `Dockerfile` ARG `PYTHON_VERSION=3.13-slim` |
-| Lambda dispatcher | `python3.13` | Argumento `--runtime python3.13` en `aws lambda create-function` (§9.2) |
-| Lambda notifier | `python3.13` | Idem en §11.2 |
-| MLflow server (Fargate) | imagen oficial `ghcr.io/mlflow/mlflow:v3.12.0` | Self-contained; no depende del Python local. La compatibilidad cliente-servidor es por **versión de MLflow** (3.x ↔ 3.x), no por Python |
-| MLflow client (en trainer) | `mlflow==3.12.0` (alineado con el server) | `requirements.txt` |
-| GitHub Actions | El workflow solo hace `docker buildx`; el Python lo provee la imagen | `Dockerfile` |
-
-**Verificación rápida del stack local:**
-
-```bash
-# 1) Python local
-python --version    # debe imprimir 3.13.x
-
-# 2) Reinstalar deps (despues del bump a mlflow 3.12.0)
-pip install -r requirements.txt --upgrade
-
-# 3) Confirmar que mlflow client coincide con la imagen del server
-python -c "import mlflow; print(mlflow.__version__)"   # debe ser 3.12.0
-
-# 4) Smoke import
-python -c "import pandas, numpy, sklearn, lightgbm, xgboost, optuna, mlflow, plotly, statsmodels, boto3; print('OK')"
-
-# 5) Build + run del container con Python 3.13
-docker build -t ml-training:smoke .
-docker run --rm ml-training:smoke python --version    # debe imprimir 3.13.x
-```
-
-**Compatibilidad de cada dependencia con Python 3.13:**
-
-| Paquete | Versión | Soporta 3.13 desde |
-|---|---|---|
-| pandas | 2.2.3 | 2.2.3 (oficial) |
-| numpy | 2.2.3 | 2.1.0 |
-| scikit-learn | 1.6.1 | 1.6.0 |
-| lightgbm | 4.5.0 | 4.5.0 |
-| xgboost | 3.2.0 | 3.0.0 |
-| optuna | 4.8.0 | 4.0.0 |
-| mlflow | 3.12.0 | 3.0.0 |
-| matplotlib | 3.10.6 | 3.10.0 |
-| plotly | 6.3.0 | 5.x (pure Python) |
-| joblib | 1.5.2 | 1.4.0 |
-| boto3 | 1.38.0 | 1.35.x |
-| statsmodels | 0.14.4 | 0.14.4 |
-| openpyxl | 3.1.5 | siempre (pure Python) |
-| patsy | 1.0.1 | siempre (pure Python) |
-| scipy (dev) | 1.16.3 | 1.14.0 |
-
-**Costos: nada cambia por usar 3.13** (Lambda 3.13 cuesta lo mismo que 3.12; la imagen `python:3.13-slim` no es más cara que `3.12-slim`).
+**Operacion**: 1 variedad/dia, c6i.2xlarge satura sus 4 cores fisicos por
+job. La queue Spot cubre `smoke|dev|prod`. La queue on-demand se usa
+ad-hoc para `prod_xl` (5-6h) donde una interrupcion de Spot duele.
 
 ---
 
-### Costos estimados (mensual, region us-east-1)
+## 1. Estructura del repo de infra
 
-| Servicio | Recurso | Costo aprox |
-|---|---|---|
-| AWS Batch | EC2 Spot c6i.2xlarge × ~30h/mes | ~$8 |
-| ECS Fargate | MLflow 0.5 vCPU / 1 GB, 24/7 | ~$15 |
-| RDS Postgres | db.t4g.micro, 20 GB gp3 | ~$15 |
-| ALB (MLflow UI) | 1 ALB compartido | ~$18 |
-| S3 | ~5 GB artifacts + requests | ~$1 |
-| CloudWatch | Logs + 5 alarms + metrics | ~$3 |
-| Lambda | dispatcher + notifier (<1k invoc/mes) | ~$0 |
-| EventBridge | <1k events/mes | ~$0 |
-| Secrets Manager | 1 secret | ~$0.40 |
-| ECR | <1 GB storage | ~$0.10 |
-| **Total** | | **~$60/mes** |
+```
+ml-training-infra/
+├── envs/
+│   └── prod/
+│       ├── main.tf              # composicion: llama a los 6 modulos
+│       ├── variables.tf         # variables del entorno
+│       ├── outputs.tf           # urls/arns para humanos
+│       ├── versions.tf          # required_providers + aws default_tags
+│       ├── backend.tf           # state remoto (S3 + DynamoDB lock)
+│       └── terraform.tfvars     # valores reales (gitignored)
+├── modules/
+│   ├── network/      # VPC, 2x public/private subnets, NAT, IGW, SGs
+│   ├── storage/      # S3 (data + artifacts) + ECR
+│   ├── mlflow/       # RDS Postgres + ECS Fargate + ALB
+│   ├── batch/        # 2 compute envs (spot + on-demand) + queues + job-def + IAM
+│   ├── lambdas/      # dispatcher + notifier + EventBridge rules
+│   └── monitoring/   # SNS topic + CW alarms
+└── lambdas/
+    ├── dispatcher/dispatcher.py
+    └── notifier/notifier.py
+```
 
-NOTAS de optimizacion:
-- Si quitas el ALB y accedes a MLflow vía VPN/SSM port-forward: ahorras **~$18/mes**.
-- Si usas Aurora Serverless v2 con auto-scale-to-0 en lugar de RDS db.t4g.micro:
-  costo cae a ~$1-3/mes cuando idle (la mayoria del tiempo).
-- AWS Batch con Spot c6i.2xlarge cuesta ~$0.13/hora (vs $0.34 on-demand). Para
-  un training de 40min mensual, esto es trivial.
+Cada modulo tiene 3 archivos: `main.tf`, `variables.tf`, `outputs.tf`. Los
+modulos `network` y `batch` ademas separan IAM en `iam.tf` para legibilidad.
+
+**Convencion**: ningun modulo crea recursos por fuera de su capa. Si
+`mlflow` necesita una subnet, la recibe como variable; no la crea.
 
 ---
 
-## 0.1 Stack local (Docker compose) — usa S3 real
+## 2. Bootstrap del backend (UNA vez, antes de `terraform init`)
 
-`docker-compose.yml` levanta el mismo set de servicios que produccion:
-**Postgres + MLflow + nginx (reports) + trainer**. La unica diferencia
-con AWS es que en local Postgres y nginx corren en containers; en
-produccion son RDS y Caddy/ALB. **No hay LocalStack**: el stack local
-escribe a S3 real (cuesta centavos al mes y elimina la divergencia
-con produccion).
-
-### Servicios del compose y su equivalente AWS
-
-| Local (compose)                            | AWS                              | Como cambia |
-|---|---|---|
-| `mlflow` (`ghcr.io/mlflow/mlflow:v3.12.0`) | ECS Fargate (§7)                 | Misma imagen; deploy via Task Definition |
-| `postgres` (`postgres:15-alpine`)          | RDS Postgres (§6)                | Cambia `--backend-store-uri` al endpoint RDS |
-| `reports` (`nginx:alpine` :8080)           | Caddy / S3 static website (§7.5) | Caddy con TLS automatico o S3+CloudFront |
-| `trainer` (Dockerfile local)               | AWS Batch job (§8)               | Push imagen a ECR, definir Job Definition |
-| volumen `pg-data`                          | RDS storage gp3                  | Auto-managed |
-| (S3 real)                                  | (S3 real)                        | Mismo bucket o cambiar a uno de produccion |
-| bind mount `./data` (rw)                   | S3 `data-raw` bucket (§3)        | `main.py` ya hidrata desde S3 (`_hydrate_data_from_s3`); rw para que `data:split` escriba `data/training/` |
-| bind mount `./logs`                        | CloudWatch Logs                  | `awslogs` driver en Job Definition |
-| bind mount `./artifacts`                   | S3 `${S3_ARTIFACTS_BUCKET}/artifacts/` | `s3_sync.py` ya lo hace al final del run |
-| bind mount `./reports`                     | S3 `${S3_ARTIFACTS_BUCKET}/reports/`   | Idem `s3_sync.py` |
-
-### URLs equivalentes
-
-| Concern        | Local (Docker)                      | Produccion (AWS)                                  |
-|---|---|---|
-| MLflow UI      | http://localhost:5000               | https://mlflow.tudominio.com (ALB → Fargate)      |
-| Reports HTML   | http://localhost:8080/reports/      | https://reports.tudominio.com (Caddy / S3+CF)     |
-| Artifacts dir  | http://localhost:8080/artifacts/    | s3://${S3_ARTIFACTS_BUCKET}/artifacts/ + signed URLs |
-| S3 backend     | s3://${S3_MLFLOW_BUCKET}/artifacts (real AWS) | mismo bucket o uno separado de produccion |
-
-### Setup inicial (una vez)
+Terraform necesita un lugar donde guardar el state. Lo creamos a mano una
+sola vez (no podemos terraform-izar el bucket que guarda nuestro propio
+state — gallina y huevo). Despues, todo lo demas es Terraform puro.
 
 ```bash
-# 1) Configurar AWS CLI (creds quedan en ~/.aws/credentials del host)
-aws configure
-# Access Key ID + Secret + region (us-east-1) + format (json)
+PROJECT=ml-training
+AWS_REGION=us-east-1
+ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+TF_BUCKET="${PROJECT}-tfstate-${ACCOUNT}"
+TF_LOCK_TABLE="${PROJECT}-tflock"
 
-# 2) Crear los buckets si no existen (idempotente)
-aws s3 mb s3://cabanto-ml-mlflow    --region us-east-1
-aws s3 mb s3://cabanto-ml-artifacts --region us-east-1
-# (o seguir §3 para versioning + encryption + lifecycle policies)
-
-# 3) Copiar .env con nombres de bucket (sin secretos: AWS reads from ~/.aws)
-cp .env.example .env
-# editar S3_MLFLOW_BUCKET, S3_ARTIFACTS_BUCKET, AWS_DEFAULT_REGION
-
-# 4) Levantar el stack y generar la data de training
-task build           # build imagen + up servicios + URLs
-task data:split      # genera DB-HISTORICA.xlsx dentro del container
-```
-
-### Comandos
-
-```bash
-task build                               # build imagen + up + URLs (primera vez o tras code change)
-task up                                  # levanta servicios sin rebuild (dia a dia)
-task data:split                          # genera DB-HISTORICA.xlsx (corre en container)
-task train VARIETIES=POP TUNING=smoke    # entrena dentro del trainer
-task logs                                # tail trainer + mlflow
-task down                                # detiene servicios (preserva Postgres + S3)
-task clean:docker                        # DESTRUCTIVO: borra Postgres (S3 queda intacto)
-```
-
-**Todo corre en Docker — no se requiere Python en el host.** Los scripts
-del repo (`prepare_data.py`, etc.) se invocan via `docker compose run --rm
---entrypoint python trainer -m scripts.<modulo>`.
-
-### Migracion del modo legacy (`sqlite:///mlruns/mlflow.db` + LocalStack)
-
-Antes el proyecto tenia dos fallbacks:
-- `sqlite:///mlruns/mlflow.db` para correr sin Docker.
-- `localstack` para simular S3 sin gastar.
-
-Ambos modos se eliminaron (decision 2026-05-09): el backend MLflow es
-**siempre** un server (Postgres + S3 real). Implicaciones:
-
-- La carpeta `./mlruns/` ya no se crea ni se monta.
-- `MLFLOW_TRACKING_URI` siempre apunta a un server HTTP. Default
-  `http://localhost:5000` (host); dentro del container del trainer
-  `http://mlflow:5000` (DNS interno de compose).
-- El cliente NO setea `artifact_location` al crear experimentos: el server
-  decide via `--default-artifact-root` (apunta a `s3://${S3_MLFLOW_BUCKET}/artifacts`).
-- LocalStack queda fuera del stack. Si necesitas dev sin internet,
-  re-agregar el servicio temporalmente — pero la divergencia con prod
-  (auth, IAM, latencia) hace que no valga la pena por defecto.
-- Si tenias runs viejos en `./mlruns/` o en LocalStack: no se migran.
-  Re-correr lo que importe es mas limpio que `mlflow-export-import`.
-
----
-
-## 0.2 Contrato del proyecto: la maquina elige el modelo
-
-El pipeline siempre entrena TODOS los backends del registry (XGB + LGB
-hoy) y `champion.select_champion` elige el ganador por variedad (lex-order:
-**gap → full_mape → tiempo**). NO hay flag `--model` para forzar uno solo:
-el operador no decide que modelo gana, decide la metrica.
-
-Implicaciones operativas:
-- Un job de AWS Batch entrena XGB y LGB en paralelo dentro del mismo proceso
-  (un solo container, un solo job). El paralelismo de variedades se controla
-  con `--parallel-varieties N`.
-- Si en el futuro se agrega un backend al `BACKEND_REGISTRY` (ngboost,
-  tabnet, ...), entra automaticamente al torneo sin cambios en CLI ni en
-  Job Definition.
-- Los runs perdedores quedan **soft-deleted** en MLflow (Postgres, recuperables
-  con `client.restore_run`). El campeon queda como unico run visible y se
-  registra en Model Registry.
-
----
-
-## 1. Variables base (correr en CADA sesion)
-
-```bash
-# ============================================================
-# Variables de la sesion. Editar AWS_REGION si quieres otra.
-# ============================================================
-export AWS_REGION=us-east-1
-export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-
-export PROJECT=ml-training
-export S3_DATA_BUCKET=${PROJECT}-data-raw-${AWS_ACCOUNT_ID}
-export S3_ARTIFACTS_BUCKET=cabanto-ml-artifacts          # ya existe; reusamos
-export S3_MLFLOW_BUCKET=${PROJECT}-mlflow-${AWS_ACCOUNT_ID}
-
-export ECR_REPO=${PROJECT}
-export ECR_URI=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}
-
-export VPC_NAME=${PROJECT}-vpc
-export DB_NAME=mlflow
-export DB_USER=mlflow
-
-echo "Account=${AWS_ACCOUNT_ID} Region=${AWS_REGION}"
-```
-
----
-
-## 2. Networking — VPC, subnets, NAT, security groups
-
-```bash
-# ============================================================
-# VPC con 2 subnets publicas (NAT, ALB) + 2 privadas (Batch, RDS, Fargate)
-# ============================================================
-VPC_ID=$(aws ec2 create-vpc \
-  --cidr-block 10.20.0.0/16 \
-  --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=${VPC_NAME}}]" \
-  --query Vpc.VpcId --output text --region ${AWS_REGION})
-aws ec2 modify-vpc-attribute --vpc-id ${VPC_ID} --enable-dns-hostnames
-echo "VPC_ID=${VPC_ID}"
-
-# Internet Gateway
-IGW_ID=$(aws ec2 create-internet-gateway \
-  --tag-specifications "ResourceType=internet-gateway,Tags=[{Key=Name,Value=${VPC_NAME}-igw}]" \
-  --query InternetGateway.InternetGatewayId --output text)
-aws ec2 attach-internet-gateway --vpc-id ${VPC_ID} --internet-gateway-id ${IGW_ID}
-
-# 2 AZ
-AZ_A=$(aws ec2 describe-availability-zones --query 'AvailabilityZones[0].ZoneName' --output text)
-AZ_B=$(aws ec2 describe-availability-zones --query 'AvailabilityZones[1].ZoneName' --output text)
-
-# Subnets publicas (para NAT y ALB)
-SUBNET_PUB_A=$(aws ec2 create-subnet --vpc-id ${VPC_ID} --availability-zone ${AZ_A} \
-  --cidr-block 10.20.0.0/24 \
-  --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=${VPC_NAME}-pub-a}]" \
-  --query Subnet.SubnetId --output text)
-SUBNET_PUB_B=$(aws ec2 create-subnet --vpc-id ${VPC_ID} --availability-zone ${AZ_B} \
-  --cidr-block 10.20.1.0/24 \
-  --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=${VPC_NAME}-pub-b}]" \
-  --query Subnet.SubnetId --output text)
-aws ec2 modify-subnet-attribute --subnet-id ${SUBNET_PUB_A} --map-public-ip-on-launch
-aws ec2 modify-subnet-attribute --subnet-id ${SUBNET_PUB_B} --map-public-ip-on-launch
-
-# Subnets privadas (para Batch compute, RDS, Fargate task)
-SUBNET_PRV_A=$(aws ec2 create-subnet --vpc-id ${VPC_ID} --availability-zone ${AZ_A} \
-  --cidr-block 10.20.10.0/24 \
-  --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=${VPC_NAME}-prv-a}]" \
-  --query Subnet.SubnetId --output text)
-SUBNET_PRV_B=$(aws ec2 create-subnet --vpc-id ${VPC_ID} --availability-zone ${AZ_B} \
-  --cidr-block 10.20.11.0/24 \
-  --tag-specifications "ResourceType=subnet,Tags=[{Key=Name,Value=${VPC_NAME}-prv-b}]" \
-  --query Subnet.SubnetId --output text)
-
-# Route table publica
-RT_PUB=$(aws ec2 create-route-table --vpc-id ${VPC_ID} \
-  --tag-specifications "ResourceType=route-table,Tags=[{Key=Name,Value=${VPC_NAME}-rt-pub}]" \
-  --query RouteTable.RouteTableId --output text)
-aws ec2 create-route --route-table-id ${RT_PUB} --destination-cidr-block 0.0.0.0/0 --gateway-id ${IGW_ID}
-aws ec2 associate-route-table --subnet-id ${SUBNET_PUB_A} --route-table-id ${RT_PUB}
-aws ec2 associate-route-table --subnet-id ${SUBNET_PUB_B} --route-table-id ${RT_PUB}
-
-# NAT Gateway en SUBNET_PUB_A
-EIP_ALLOC=$(aws ec2 allocate-address --domain vpc --query AllocationId --output text)
-NAT_ID=$(aws ec2 create-nat-gateway --subnet-id ${SUBNET_PUB_A} --allocation-id ${EIP_ALLOC} \
-  --tag-specifications "ResourceType=natgateway,Tags=[{Key=Name,Value=${VPC_NAME}-nat}]" \
-  --query NatGateway.NatGatewayId --output text)
-echo "Esperando NAT..."
-aws ec2 wait nat-gateway-available --nat-gateway-ids ${NAT_ID}
-
-# Route table privada (sale por NAT)
-RT_PRV=$(aws ec2 create-route-table --vpc-id ${VPC_ID} \
-  --tag-specifications "ResourceType=route-table,Tags=[{Key=Name,Value=${VPC_NAME}-rt-prv}]" \
-  --query RouteTable.RouteTableId --output text)
-aws ec2 create-route --route-table-id ${RT_PRV} --destination-cidr-block 0.0.0.0/0 --nat-gateway-id ${NAT_ID}
-aws ec2 associate-route-table --subnet-id ${SUBNET_PRV_A} --route-table-id ${RT_PRV}
-aws ec2 associate-route-table --subnet-id ${SUBNET_PRV_B} --route-table-id ${RT_PRV}
-
-# Persistir IDs para sesiones siguientes
-cat > .aws_ids.env <<EOF
-export VPC_ID=${VPC_ID}
-export SUBNET_PUB_A=${SUBNET_PUB_A}
-export SUBNET_PUB_B=${SUBNET_PUB_B}
-export SUBNET_PRV_A=${SUBNET_PRV_A}
-export SUBNET_PRV_B=${SUBNET_PRV_B}
-EOF
-echo "IDs guardados en .aws_ids.env -- 'source .aws_ids.env' al volver a empezar."
-```
-
-### Security groups
-
-```bash
-source .aws_ids.env
-
-# SG para RDS Postgres (acepta solo trafico de Batch y Fargate)
-SG_RDS=$(aws ec2 create-security-group --group-name ${PROJECT}-rds \
-  --description "RDS Postgres for MLflow" --vpc-id ${VPC_ID} \
-  --query GroupId --output text)
-
-# SG para Fargate (MLflow server)
-SG_MLFLOW=$(aws ec2 create-security-group --group-name ${PROJECT}-mlflow \
-  --description "MLflow server (Fargate)" --vpc-id ${VPC_ID} \
-  --query GroupId --output text)
-
-# SG para Batch jobs (acceden a RDS y a internet via NAT)
-SG_BATCH=$(aws ec2 create-security-group --group-name ${PROJECT}-batch \
-  --description "Batch jobs" --vpc-id ${VPC_ID} \
-  --query GroupId --output text)
-
-# SG para ALB (acepta 80/443 desde tu IP)
-SG_ALB=$(aws ec2 create-security-group --group-name ${PROJECT}-alb \
-  --description "ALB for MLflow UI" --vpc-id ${VPC_ID} \
-  --query GroupId --output text)
-
-# Reglas
-MY_IP=$(curl -s https://checkip.amazonaws.com)/32
-aws ec2 authorize-security-group-ingress --group-id ${SG_ALB} \
-  --protocol tcp --port 80 --cidr ${MY_IP}
-# RDS acepta de Fargate y Batch
-aws ec2 authorize-security-group-ingress --group-id ${SG_RDS} \
-  --protocol tcp --port 5432 --source-group ${SG_MLFLOW}
-aws ec2 authorize-security-group-ingress --group-id ${SG_RDS} \
-  --protocol tcp --port 5432 --source-group ${SG_BATCH}
-# MLflow acepta de ALB y de Batch (Batch llama directo a la API)
-aws ec2 authorize-security-group-ingress --group-id ${SG_MLFLOW} \
-  --protocol tcp --port 5000 --source-group ${SG_ALB}
-aws ec2 authorize-security-group-ingress --group-id ${SG_MLFLOW} \
-  --protocol tcp --port 5000 --source-group ${SG_BATCH}
-
-cat >> .aws_ids.env <<EOF
-export SG_RDS=${SG_RDS}
-export SG_MLFLOW=${SG_MLFLOW}
-export SG_BATCH=${SG_BATCH}
-export SG_ALB=${SG_ALB}
-EOF
-echo "Security groups creados."
-```
-
----
-
-## 3. S3 buckets
-
-```bash
-source .aws_ids.env
-
-# Bucket para data raw (Excel mensual subido por usuario de negocio)
-aws s3api create-bucket --bucket ${S3_DATA_BUCKET} --region ${AWS_REGION}
-aws s3api put-bucket-versioning --bucket ${S3_DATA_BUCKET} \
+aws s3api create-bucket --bucket ${TF_BUCKET} --region ${AWS_REGION}
+aws s3api put-bucket-versioning --bucket ${TF_BUCKET} \
   --versioning-configuration Status=Enabled
-aws s3api put-bucket-encryption --bucket ${S3_DATA_BUCKET} \
-  --server-side-encryption-configuration '{
-    "Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+aws s3api put-bucket-encryption --bucket ${TF_BUCKET} \
+  --server-side-encryption-configuration \
+  '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
 
-# Bucket para MLflow artifacts (separado del de pipelines/reportes)
-aws s3api create-bucket --bucket ${S3_MLFLOW_BUCKET} --region ${AWS_REGION}
-aws s3api put-bucket-versioning --bucket ${S3_MLFLOW_BUCKET} \
-  --versioning-configuration Status=Enabled
-
-# El bucket ${S3_ARTIFACTS_BUCKET} (cabanto-ml-artifacts) ya existe. Verificar:
-aws s3 ls s3://${S3_ARTIFACTS_BUCKET}/ | head
-
-# Habilitar EventBridge en data-raw (para que un PutObject genere evento)
-aws s3api put-bucket-notification-configuration \
-  --bucket ${S3_DATA_BUCKET} \
-  --notification-configuration '{"EventBridgeConfiguration":{}}'
-```
-
----
-
-## 4. ECR — repositorio + push de imagen
-
-```bash
-source .aws_ids.env
-
-aws ecr create-repository --repository-name ${ECR_REPO} \
-  --image-scanning-configuration scanOnPush=true \
+aws dynamodb create-table \
+  --table-name ${TF_LOCK_TABLE} \
+  --attribute-definitions AttributeName=LockID,AttributeType=S \
+  --key-schema AttributeName=LockID,KeyType=HASH \
+  --billing-mode PAY_PER_REQUEST \
   --region ${AWS_REGION}
-
-# Login docker -> ECR
-aws ecr get-login-password --region ${AWS_REGION} \
-  | docker login --username AWS --password-stdin ${ECR_URI}
-
-# Build con build-args (los toma el Dockerfile actual)
-GIT_SHA=$(git rev-parse --short HEAD)
-BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-docker buildx build \
-  --platform linux/amd64 \
-  --build-arg GIT_SHA=${GIT_SHA} \
-  --build-arg BUILD_DATE=${BUILD_DATE} \
-  --build-arg VERSION=v0.1.0 \
-  -t ${ECR_URI}:${GIT_SHA} \
-  -t ${ECR_URI}:latest \
-  --push .
-
-echo "Imagen pushed: ${ECR_URI}:${GIT_SHA}"
 ```
 
----
-
-## 5. Secrets Manager — password de la DB
+Tambien creamos el SLR de Spot (necesario para que Batch use Spot Fleet):
 
 ```bash
-DB_PASSWORD=$(aws secretsmanager get-random-password \
-  --password-length 32 --exclude-characters '"@/\$%' \
-  --query RandomPassword --output text)
-
-DB_SECRET_ARN=$(aws secretsmanager create-secret \
-  --name ${PROJECT}/mlflow/db \
-  --description "MLflow Postgres credentials" \
-  --secret-string "{\"username\":\"${DB_USER}\",\"password\":\"${DB_PASSWORD}\",\"dbname\":\"${DB_NAME}\"}" \
-  --query ARN --output text)
-
-cat >> .aws_ids.env <<EOF
-export DB_SECRET_ARN=${DB_SECRET_ARN}
-EOF
-echo "Secret creado: ${DB_SECRET_ARN}"
-```
-
----
-
-## 6. RDS Postgres — backend de MLflow
-
-```bash
-source .aws_ids.env
-
-# DB subnet group sobre las 2 subnets privadas
-aws rds create-db-subnet-group \
-  --db-subnet-group-name ${PROJECT}-db-subnets \
-  --db-subnet-group-description "MLflow DB subnets" \
-  --subnet-ids ${SUBNET_PRV_A} ${SUBNET_PRV_B}
-
-# Recuperar password del secret
-DB_PASSWORD=$(aws secretsmanager get-secret-value --secret-id ${DB_SECRET_ARN} \
-  --query SecretString --output text | jq -r .password)
-
-aws rds create-db-instance \
-  --db-instance-identifier ${PROJECT}-mlflow \
-  --engine postgres \
-  --engine-version 15.7 \
-  --db-instance-class db.t4g.micro \
-  --allocated-storage 20 \
-  --storage-type gp3 \
-  --master-username ${DB_USER} \
-  --master-user-password "${DB_PASSWORD}" \
-  --db-name ${DB_NAME} \
-  --vpc-security-group-ids ${SG_RDS} \
-  --db-subnet-group-name ${PROJECT}-db-subnets \
-  --backup-retention-period 7 \
-  --no-publicly-accessible \
-  --storage-encrypted
-
-echo "Esperando RDS (5-10 min)..."
-aws rds wait db-instance-available --db-instance-identifier ${PROJECT}-mlflow
-
-DB_ENDPOINT=$(aws rds describe-db-instances \
-  --db-instance-identifier ${PROJECT}-mlflow \
-  --query 'DBInstances[0].Endpoint.Address' --output text)
-
-cat >> .aws_ids.env <<EOF
-export DB_ENDPOINT=${DB_ENDPOINT}
-EOF
-echo "RDS endpoint: ${DB_ENDPOINT}"
-```
-
----
-
-## 7. MLflow en ECS Fargate
-
-### 7.1 Crear cluster + IAM roles
-
-```bash
-source .aws_ids.env
-
-aws ecs create-cluster --cluster-name ${PROJECT}-cluster
-
-# Trust policy ECS task
-cat > /tmp/ecs-trust.json <<'JSON'
-{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
-  "Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}
-JSON
-
-# Execution role (pull ECR, escribir Logs, leer Secret)
-aws iam create-role --role-name ${PROJECT}-ecs-exec \
-  --assume-role-policy-document file:///tmp/ecs-trust.json
-aws iam attach-role-policy --role-name ${PROJECT}-ecs-exec \
-  --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
-
-# Permiso extra para leer el secret de la DB
-aws iam put-role-policy --role-name ${PROJECT}-ecs-exec \
-  --policy-name read-db-secret --policy-document '{
-    "Version":"2012-10-17","Statement":[{"Effect":"Allow",
-    "Action":["secretsmanager:GetSecretValue"],
-    "Resource":"'${DB_SECRET_ARN}'"}]}'
-
-# Task role (la app accede a S3 para artifacts)
-aws iam create-role --role-name ${PROJECT}-mlflow-task \
-  --assume-role-policy-document file:///tmp/ecs-trust.json
-aws iam put-role-policy --role-name ${PROJECT}-mlflow-task \
-  --policy-name s3-mlflow --policy-document '{
-    "Version":"2012-10-17","Statement":[{"Effect":"Allow",
-    "Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket"],
-    "Resource":["arn:aws:s3:::'${S3_MLFLOW_BUCKET}'",
-                "arn:aws:s3:::'${S3_MLFLOW_BUCKET}'/*"]}]}'
-
-ECS_EXEC_ARN=arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT}-ecs-exec
-MLFLOW_TASK_ARN=arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT}-mlflow-task
-echo "Roles creados."
-```
-
-### 7.2 Task definition + service
-
-```bash
-# Log group
-aws logs create-log-group --log-group-name /ecs/${PROJECT}-mlflow || true
-
-# Task definition (MLflow oficial v3.12.0, mismo pin que tu compose)
-cat > /tmp/mlflow-task.json <<JSON
-{
-  "family": "${PROJECT}-mlflow",
-  "networkMode": "awsvpc",
-  "requiresCompatibilities": ["FARGATE"],
-  "cpu": "512",
-  "memory": "1024",
-  "executionRoleArn": "${ECS_EXEC_ARN}",
-  "taskRoleArn": "${MLFLOW_TASK_ARN}",
-  "containerDefinitions": [{
-    "name": "mlflow",
-    "image": "ghcr.io/mlflow/mlflow:v3.12.0",
-    "essential": true,
-    "portMappings": [{"containerPort": 5000, "protocol": "tcp"}],
-    "secrets": [
-      {"name":"DB_USER",     "valueFrom":"${DB_SECRET_ARN}:username::"},
-      {"name":"DB_PASSWORD", "valueFrom":"${DB_SECRET_ARN}:password::"},
-      {"name":"DB_NAME",     "valueFrom":"${DB_SECRET_ARN}:dbname::"}
-    ],
-    "environment": [
-      {"name":"DB_HOST","value":"${DB_ENDPOINT}"},
-      {"name":"AWS_DEFAULT_REGION","value":"${AWS_REGION}"}
-    ],
-    "command": ["sh","-c",
-      "pip install psycopg2-binary boto3 && mlflow server --host 0.0.0.0 --port 5000 --backend-store-uri postgresql://\$DB_USER:\$DB_PASSWORD@\$DB_HOST:5432/\$DB_NAME --default-artifact-root s3://${S3_MLFLOW_BUCKET}/artifacts"
-    ],
-    "logConfiguration": {
-      "logDriver":"awslogs",
-      "options":{
-        "awslogs-group":"/ecs/${PROJECT}-mlflow",
-        "awslogs-region":"${AWS_REGION}",
-        "awslogs-stream-prefix":"mlflow"
-      }
-    }
-  }]
-}
-JSON
-
-aws ecs register-task-definition --cli-input-json file:///tmp/mlflow-task.json
-```
-
-### 7.3 ALB + target group + listener
-
-```bash
-# ALB en subnets publicas
-ALB_ARN=$(aws elbv2 create-load-balancer \
-  --name ${PROJECT}-alb \
-  --subnets ${SUBNET_PUB_A} ${SUBNET_PUB_B} \
-  --security-groups ${SG_ALB} \
-  --scheme internet-facing --type application \
-  --query 'LoadBalancers[0].LoadBalancerArn' --output text)
-
-TG_ARN=$(aws elbv2 create-target-group \
-  --name ${PROJECT}-mlflow-tg \
-  --protocol HTTP --port 5000 \
-  --vpc-id ${VPC_ID} \
-  --target-type ip \
-  --health-check-path /health \
-  --health-check-interval-seconds 30 \
-  --query 'TargetGroups[0].TargetGroupArn' --output text)
-
-aws elbv2 create-listener --load-balancer-arn ${ALB_ARN} \
-  --protocol HTTP --port 80 \
-  --default-actions Type=forward,TargetGroupArn=${TG_ARN}
-
-ALB_DNS=$(aws elbv2 describe-load-balancers --load-balancer-arns ${ALB_ARN} \
-  --query 'LoadBalancers[0].DNSName' --output text)
-
-cat >> .aws_ids.env <<EOF
-export ALB_ARN=${ALB_ARN}
-export TG_ARN=${TG_ARN}
-export ALB_DNS=${ALB_DNS}
-EOF
-echo "MLflow UI estara en: http://${ALB_DNS}"
-```
-
-### 7.4 Service ECS
-
-```bash
-aws ecs create-service \
-  --cluster ${PROJECT}-cluster \
-  --service-name ${PROJECT}-mlflow \
-  --task-definition ${PROJECT}-mlflow \
-  --desired-count 1 \
-  --launch-type FARGATE \
-  --network-configuration "awsvpcConfiguration={subnets=[${SUBNET_PRV_A},${SUBNET_PRV_B}],securityGroups=[${SG_MLFLOW}],assignPublicIp=DISABLED}" \
-  --load-balancers "targetGroupArn=${TG_ARN},containerName=mlflow,containerPort=5000"
-
-echo "Esperando que el service llegue a steady state (~3 min)..."
-aws ecs wait services-stable --cluster ${PROJECT}-cluster --services ${PROJECT}-mlflow
-
-# Internal DNS para que Batch llame a MLflow sin pasar por ALB
-MLFLOW_INTERNAL_URI="http://${ALB_DNS}"  # via ALB tambien funciona desde Batch
-echo "MLFLOW_TRACKING_URI = ${MLFLOW_INTERNAL_URI}"
-```
-
-NOTA: Para que Batch llame a MLflow vía DNS interno (sin pasar por ALB
-público), podés crear un ALB interno separado o usar Service Connect /
-Cloud Map. Para arrancar, el ALB público restringido por SG (solo desde
-SG_BATCH) ya alcanza.
-
----
-
-### 7.5 Reports / artifacts: serving HTTP en produccion
-
-En local los reports HTML se sirven via nginx (servicio `reports` del
-compose, puerto 8080). En produccion las opciones, ordenadas por costo
-y simplicidad:
-
-#### Opcion A — S3 static website + CloudFront (recomendada)
-
-Costo casi cero (~$0.50-2/mes), CDN global, TLS automatico, escalable.
-`s3_sync.py` ya sube los reports a `s3://${S3_ARTIFACTS_BUCKET}/reports/`
-al final del training.
-
-```bash
-# 1) Habilitar static website hosting en el bucket
-aws s3 website s3://${S3_ARTIFACTS_BUCKET} \
-  --index-document index.html
-
-# 2) (Opcional) bucket policy para servir solo via CloudFront
-#    (se asocia al OAC de la distribucion en el step 3)
-
-# 3) CloudFront distribution con OAC apuntando al bucket
-aws cloudfront create-distribution \
-  --origin-domain-name ${S3_ARTIFACTS_BUCKET}.s3.${AWS_REGION}.amazonaws.com \
-  --default-root-object index.html \
-  --enabled \
-  --comment "ml-training reports"
-
-# 4) (Opcional) custom domain reports.tudominio.com:
-#    - ACM cert en us-east-1
-#    - Alias en CloudFront
-#    - Route 53 A-ALIAS al CloudFront
-```
-
-URL final: `https://d1abc123.cloudfront.net/reports/Winner_POP_2026-05-09.html`
-(o `https://reports.tudominio.com/...` con domain custom).
-
-#### Opcion B — Caddy en ECS Fargate (mismo patron que nginx local)
-
-Si querés mantener la estructura "una imagen por servicio" del compose, Caddy
-es el equivalente directo de nginx con TLS automatico via Let's Encrypt:
-
-```dockerfile
-# Dockerfile.reports
-FROM caddy:2-alpine
-COPY Caddyfile /etc/caddy/Caddyfile
-```
-
-```caddyfile
-# Caddyfile
-reports.tudominio.com {
-    root * /srv
-    file_server browse
-    encode gzip zstd
-    log {
-        output stdout
-    }
-}
-```
-
-Y la fuente de archivos puede ser:
-- **EFS mount** en la task (artifacts/reports leen desde EFS),
-- **`s3fs`** (lento, no recomendado),
-- O un sidecar que sincroniza S3 → volumen ephemeral cada N minutos.
-
-Costo: ~$15/mes (Fargate 0.5 vCPU 1 GB) + tráfico. Solo justifica si ya
-tenés Caddy en otros servicios.
-
-#### Opcion C — ALB + signed URLs (privado)
-
-Si los reports tienen info sensible y no querés exposicion publica:
-
-1. Reports quedan en S3 privado (bucket policy: deny public).
-2. Una Lambda detrás de ALB recibe `?run_id=XXX&variety=POP`,
-   genera una signed URL con `boto3.client('s3').generate_presigned_url`
-   (TTL 5 min) y devuelve un `302 Location: <signed-url>`.
-3. El usuario nunca ve el bucket; el link expira solo.
-
-Mas codigo, pero es la unica opcion que pasa auditoría si los reports
-contienen datos de cliente.
-
-#### Resumen
-
-| Opcion | Costo/mes | TLS  | Privacidad     | Cuando elegir |
-|---|---|---|---|---|
-| A: S3+CloudFront | ~$1     | Auto | Publico (o OAC)| Default. Reports compartidos al equipo de negocio. |
-| B: Caddy Fargate | ~$15    | Auto | Publico        | Ya tenes Caddy en el stack para otros services. |
-| C: ALB+Lambda+signed | ~$20 | Auto | Privado        | Compliance / datos sensibles. |
-
-`s3_sync.py` ya cubre la pieza de "subir a S3" para A y C. Para B necesitas
-sync adicional al volumen montado.
-
----
-
-## 8. AWS Batch — compute env, queue, job definition
-
-### 8.1 IAM roles para Batch
-
-```bash
-source .aws_ids.env
-
-# Trust policy para EC2
-cat > /tmp/ec2-trust.json <<'JSON'
-{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
-  "Principal":{"Service":"ec2.amazonaws.com"},"Action":"sts:AssumeRole"}]}
-JSON
-
-# Trust policy para ECS (job container role)
-cat > /tmp/ecs-tasks-trust.json <<'JSON'
-{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
-  "Principal":{"Service":"ecs-tasks.amazonaws.com"},"Action":"sts:AssumeRole"}]}
-JSON
-
-# Instance role (EC2 host de Batch)
-aws iam create-role --role-name ${PROJECT}-batch-instance \
-  --assume-role-policy-document file:///tmp/ec2-trust.json
-aws iam attach-role-policy --role-name ${PROJECT}-batch-instance \
-  --policy-arn arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role
-aws iam create-instance-profile --instance-profile-name ${PROJECT}-batch-instance
-aws iam add-role-to-instance-profile --instance-profile-name ${PROJECT}-batch-instance \
-  --role-name ${PROJECT}-batch-instance
-
-# Job role (lo que el container puede hacer: S3 + MLflow no requiere IAM)
-aws iam create-role --role-name ${PROJECT}-batch-job \
-  --assume-role-policy-document file:///tmp/ecs-tasks-trust.json
-aws iam put-role-policy --role-name ${PROJECT}-batch-job \
-  --policy-name s3-rw --policy-document '{
-    "Version":"2012-10-17","Statement":[{"Effect":"Allow",
-    "Action":["s3:GetObject","s3:PutObject","s3:ListBucket"],
-    "Resource":["arn:aws:s3:::'${S3_DATA_BUCKET}'","arn:aws:s3:::'${S3_DATA_BUCKET}'/*",
-                "arn:aws:s3:::'${S3_ARTIFACTS_BUCKET}'","arn:aws:s3:::'${S3_ARTIFACTS_BUCKET}'/*",
-                "arn:aws:s3:::'${S3_MLFLOW_BUCKET}'","arn:aws:s3:::'${S3_MLFLOW_BUCKET}'/*"]}]}'
-
-# Execution role (pull ECR, escribir CW Logs)
-aws iam create-role --role-name ${PROJECT}-batch-exec \
-  --assume-role-policy-document file:///tmp/ecs-tasks-trust.json
-aws iam attach-role-policy --role-name ${PROJECT}-batch-exec \
-  --policy-arn arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
-
-# Service-linked role para Batch (idempotente)
+aws iam create-service-linked-role --aws-service-name spotfleet.amazonaws.com 2>/dev/null || true
 aws iam create-service-linked-role --aws-service-name batch.amazonaws.com 2>/dev/null || true
 ```
 
-### 8.2 Compute environment (Spot c6i.2xlarge)
+---
 
-```bash
-BATCH_INSTANCE_PROFILE_ARN=arn:aws:iam::${AWS_ACCOUNT_ID}:instance-profile/${PROJECT}-batch-instance
+## 3. `envs/prod/` — la composicion
 
-aws batch create-compute-environment \
-  --compute-environment-name ${PROJECT}-ce \
-  --type MANAGED \
-  --state ENABLED \
-  --compute-resources "type=EC2,allocationStrategy=BEST_FIT_PROGRESSIVE,minvCpus=0,maxvCpus=32,desiredvCpus=0,instanceTypes=c6i.2xlarge,subnets=${SUBNET_PRV_A},${SUBNET_PRV_B},securityGroupIds=${SG_BATCH},instanceRole=${BATCH_INSTANCE_PROFILE_ARN},bidPercentage=70,spotIamFleetRole=arn:aws:iam::${AWS_ACCOUNT_ID}:role/aws-service-role/spotfleet.amazonaws.com/AWSServiceRoleForEC2SpotFleet"
+### 3.1 `versions.tf`
 
-echo "Esperando compute env VALID..."
-sleep 20
+```hcl
+terraform {
+  required_version = ">= 1.7.0"
 
-aws batch create-job-queue \
-  --job-queue-name ${PROJECT}-queue \
-  --priority 1 --state ENABLED \
-  --compute-environment-order order=1,computeEnvironment=${PROJECT}-ce
-```
-
-NOTA: si tu cuenta no tiene `AWSServiceRoleForEC2SpotFleet` creado,
-ejecutalo con:
-```bash
-aws iam create-service-linked-role --aws-service-name spotfleet.amazonaws.com
-```
-
-### 8.3 Job definition
-
-El comando del container respeta el `ENTRYPOINT` del Dockerfile actual:
-`["/usr/bin/tini","--","python","main.py"]`. Pasamos solo los args.
-
-```bash
-aws logs create-log-group --log-group-name /aws/batch/${PROJECT} || true
-
-BATCH_EXEC_ARN=arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT}-batch-exec
-BATCH_JOB_ARN=arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT}-batch-job
-
-cat > /tmp/job-def.json <<JSON
-{
-  "jobDefinitionName": "${PROJECT}",
-  "type": "container",
-  "platformCapabilities": ["EC2"],
-  "containerProperties": {
-    "image": "${ECR_URI}:latest",
-    "command": ["--varieties","POP","--tuning","prod"],
-    "executionRoleArn": "${BATCH_EXEC_ARN}",
-    "jobRoleArn": "${BATCH_JOB_ARN}",
-    "resourceRequirements": [
-      {"type":"VCPU","value":"8"},
-      {"type":"MEMORY","value":"15000"}
-    ],
-    "environment": [
-      {"name":"MLFLOW_TRACKING_URI","value":"http://${ALB_DNS}"},
-      {"name":"S3_ARTIFACTS_BUCKET","value":"${S3_ARTIFACTS_BUCKET}"},
-      {"name":"S3_ARTIFACTS_PREFIX","value":"artifacts"},
-      {"name":"S3_REPORTS_PREFIX","value":"reports"},
-      {"name":"AWS_DEFAULT_REGION","value":"${AWS_REGION}"}
-    ],
-    "logConfiguration": {
-      "logDriver":"awslogs",
-      "options":{
-        "awslogs-group":"/aws/batch/${PROJECT}",
-        "awslogs-region":"${AWS_REGION}",
-        "awslogs-stream-prefix":"job"
-      }
-    }
-  },
-  "retryStrategy": { "attempts": 2 },
-  "timeout": { "attemptDurationSeconds": 7200 }
+  required_providers {
+    aws     = { source = "hashicorp/aws",     version = "~> 5.60" }
+    archive = { source = "hashicorp/archive", version = "~> 2.4"  }
+    random  = { source = "hashicorp/random",  version = "~> 3.6"  }
+  }
 }
-JSON
 
-aws batch register-job-definition --cli-input-json file:///tmp/job-def.json
-echo "Job definition registrada (revision 1)."
+provider "aws" {
+  region = var.aws_region
+
+  default_tags {
+    tags = {
+      Project     = var.project
+      ManagedBy   = "terraform"
+      Environment = "prod"
+    }
+  }
+}
 ```
 
-### 8.4 Test manual del job
+### 3.2 `backend.tf`
 
-```bash
-JOB_ID=$(aws batch submit-job \
-  --job-name smoke-$(date +%s) \
-  --job-queue ${PROJECT}-queue \
-  --job-definition ${PROJECT} \
-  --container-overrides '{"command":["--varieties","POP","--tuning","smoke"]}' \
-  --query jobId --output text)
+```hcl
+terraform {
+  backend "s3" {
+    bucket         = "ml-training-tfstate-123456789012"   # del bootstrap
+    key            = "ml-training/prod/terraform.tfstate"
+    region         = "us-east-1"
+    encrypt        = true
+    dynamodb_table = "ml-training-tflock"
+  }
+}
+```
 
-echo "Job lanzado: ${JOB_ID}"
-echo "Logs: aws logs tail /aws/batch/${PROJECT} --follow"
+### 3.3 `variables.tf`
+
+```hcl
+variable "project"            { type = string  default = "ml-training" }
+variable "aws_region"         { type = string  default = "us-east-1" }
+variable "vpc_cidr"           { type = string  default = "10.20.0.0/16" }
+variable "alert_email"        { type = string }
+variable "varieties_schedule" { type = list(string)  default = ["POP","JUPITER","VENTURA","SEKOYA","ALLISON","STELLA"] }
+variable "default_tuning"     { type = string  default = "prod" }
+variable "trainer_image_tag"  { type = string  default = "latest" }
+variable "mlflow_image"       { type = string }                          # build via GH Actions
+variable "rds_instance_class" { type = string  default = "db.t4g.micro" }
+variable "spot_bid_percentage"{ type = number  default = 70 }
+variable "job_attempt_seconds"{ type = number  default = 28800 }         # 8h
+variable "log_retention_days" { type = number  default = 30 }
+variable "mape_alarm_threshold" { type = number  default = 25 }
+```
+
+### 3.4 `terraform.tfvars` (gitignored)
+
+```hcl
+alert_email  = "tu-email@ejemplo.com"
+mlflow_image = "123456789012.dkr.ecr.us-east-1.amazonaws.com/ml-training-mlflow:v3.12.0"
+```
+
+### 3.5 `main.tf` — la composicion
+
+```hcl
+module "network" {
+  source   = "../../modules/network"
+  project  = var.project
+  vpc_cidr = var.vpc_cidr
+}
+
+module "storage" {
+  source  = "../../modules/storage"
+  project = var.project
+}
+
+module "mlflow" {
+  source                   = "../../modules/mlflow"
+  project                  = var.project
+  vpc_id                   = module.network.vpc_id
+  public_subnet_ids        = module.network.public_subnet_ids
+  private_subnet_ids       = module.network.private_subnet_ids
+  sg_alb_id                = module.network.sg_alb_id
+  sg_mlflow_id             = module.network.sg_mlflow_id
+  sg_rds_id                = module.network.sg_rds_id
+  rds_instance_class       = var.rds_instance_class
+  rds_allocated_storage_gb = 20
+  mlflow_image             = var.mlflow_image
+  artifacts_bucket         = module.storage.artifacts_bucket
+  log_retention_days       = var.log_retention_days
+}
+
+module "batch" {
+  source                = "../../modules/batch"
+  project               = var.project
+  private_subnet_ids    = module.network.private_subnet_ids
+  sg_batch_id           = module.network.sg_batch_id
+  ecr_trainer_url       = module.storage.ecr_trainer_url
+  trainer_image_tag     = var.trainer_image_tag
+  spot_bid_percentage   = var.spot_bid_percentage
+  tracking_uri          = module.mlflow.tracking_uri
+  artifacts_bucket      = module.storage.artifacts_bucket
+  artifacts_bucket_arn  = module.storage.artifacts_bucket_arn
+  data_bucket           = module.storage.data_bucket
+  data_bucket_arn       = module.storage.data_bucket_arn
+  job_attempt_seconds   = var.job_attempt_seconds
+  log_retention_days    = var.log_retention_days
+}
+
+module "monitoring" {
+  source               = "../../modules/monitoring"
+  project              = var.project
+  alert_email          = var.alert_email
+  batch_job_queue_name = module.batch.job_queue_spot
+  alb_arn              = module.mlflow.alb_arn
+  tg_arn               = module.mlflow.tg_arn
+  mape_alarm_threshold = var.mape_alarm_threshold
+}
+
+module "lambdas" {
+  source                 = "../../modules/lambdas"
+  project                = var.project
+  job_queue_spot_arn     = module.batch.job_queue_spot_arn
+  job_queue_ondemand_arn = module.batch.job_queue_ondemand_arn
+  job_definition_arn     = module.batch.job_definition_arn
+  job_definition_name    = module.batch.job_definition_name
+  default_tuning         = var.default_tuning
+  data_bucket            = module.storage.data_bucket
+  data_bucket_arn        = module.storage.data_bucket_arn
+  varieties_schedule     = var.varieties_schedule
+  sns_topic_arn          = module.monitoring.sns_topic_arn
+  log_retention_days     = var.log_retention_days
+  lambdas_src_dir        = "${path.module}/../../lambdas"
+}
+```
+
+### 3.6 `outputs.tf`
+
+```hcl
+output "mlflow_url"            { value = "http://${module.mlflow.alb_dns_name}" }
+output "data_bucket"           { value = module.storage.data_bucket }
+output "artifacts_bucket"      { value = module.storage.artifacts_bucket }
+output "ecr_trainer_repo_url"  { value = module.storage.ecr_trainer_url }
+output "batch_job_queue_spot"  { value = module.batch.job_queue_spot }
+output "batch_job_queue_od"    { value = module.batch.job_queue_ondemand }
+output "sns_alerts_topic"      { value = module.monitoring.sns_topic_arn }
 ```
 
 ---
 
-## 9. Lambda dispatcher
+## 4. Modulos
 
-Recibe eventos de EventBridge (cron + S3 PutObject) y resuelve qué
-varieties entrenar; submite el job a Batch.
+### 4.1 `modules/network/` — VPC + subnets + NAT + SGs
 
-### 9.1 Codigo
+**Interface (variables)**: `project`, `vpc_cidr`, `azs` (opcional).
+**Interface (outputs)**: `vpc_id`, `public_subnet_ids`, `private_subnet_ids`, `sg_{alb,mlflow,batch,rds}_id`.
 
-Crear `aws/lambda/dispatcher.py` localmente:
+`modules/network/main.tf`:
+
+```hcl
+data "aws_availability_zones" "available" { state = "available" }
+
+locals {
+  azs           = length(var.azs) > 0 ? var.azs : slice(data.aws_availability_zones.available.names, 0, 2)
+  public_cidrs  = [cidrsubnet(var.vpc_cidr, 8, 0),  cidrsubnet(var.vpc_cidr, 8, 1)]
+  private_cidrs = [cidrsubnet(var.vpc_cidr, 8, 10), cidrsubnet(var.vpc_cidr, 8, 11)]
+}
+
+resource "aws_vpc" "this" {
+  cidr_block           = var.vpc_cidr
+  enable_dns_support   = true
+  enable_dns_hostnames = true
+  tags                 = { Name = "${var.project}-vpc" }
+}
+
+resource "aws_internet_gateway" "this" {
+  vpc_id = aws_vpc.this.id
+  tags   = { Name = "${var.project}-igw" }
+}
+
+resource "aws_subnet" "public" {
+  count                   = 2
+  vpc_id                  = aws_vpc.this.id
+  cidr_block              = local.public_cidrs[count.index]
+  availability_zone       = local.azs[count.index]
+  map_public_ip_on_launch = true
+  tags = { Name = "${var.project}-public-${count.index}", Tier = "public" }
+}
+
+resource "aws_subnet" "private" {
+  count             = 2
+  vpc_id            = aws_vpc.this.id
+  cidr_block        = local.private_cidrs[count.index]
+  availability_zone = local.azs[count.index]
+  tags              = { Name = "${var.project}-private-${count.index}", Tier = "private" }
+}
+
+resource "aws_eip" "nat" {
+  domain = "vpc"
+  tags   = { Name = "${var.project}-nat-eip" }
+}
+
+# Single-AZ NAT GW para abaratar. Si hace falta HA, duplicar NAT GW + RT.
+resource "aws_nat_gateway" "this" {
+  allocation_id = aws_eip.nat.id
+  subnet_id     = aws_subnet.public[0].id
+  tags          = { Name = "${var.project}-nat" }
+  depends_on    = [aws_internet_gateway.this]
+}
+
+resource "aws_route_table" "public" {
+  vpc_id = aws_vpc.this.id
+  route { cidr_block = "0.0.0.0/0"  gateway_id = aws_internet_gateway.this.id }
+  tags  = { Name = "${var.project}-rt-public" }
+}
+
+resource "aws_route_table" "private" {
+  vpc_id = aws_vpc.this.id
+  route { cidr_block = "0.0.0.0/0"  nat_gateway_id = aws_nat_gateway.this.id }
+  tags  = { Name = "${var.project}-rt-private" }
+}
+
+resource "aws_route_table_association" "public"  { count = 2  subnet_id = aws_subnet.public[count.index].id   route_table_id = aws_route_table.public.id }
+resource "aws_route_table_association" "private" { count = 2  subnet_id = aws_subnet.private[count.index].id  route_table_id = aws_route_table.private.id }
+
+# ─── Security groups (egress libre; ingress por SG-rules separadas) ──────
+
+resource "aws_security_group" "alb"    { name = "${var.project}-alb"    vpc_id = aws_vpc.this.id  egress { from_port=0  to_port=0  protocol="-1"  cidr_blocks=["0.0.0.0/0"] }  ingress { from_port=80  to_port=80  protocol="tcp"  cidr_blocks=["0.0.0.0/0"] } }
+resource "aws_security_group" "mlflow" { name = "${var.project}-mlflow" vpc_id = aws_vpc.this.id  egress { from_port=0  to_port=0  protocol="-1"  cidr_blocks=["0.0.0.0/0"] } }
+resource "aws_security_group" "batch"  { name = "${var.project}-batch"  vpc_id = aws_vpc.this.id  egress { from_port=0  to_port=0  protocol="-1"  cidr_blocks=["0.0.0.0/0"] } }
+resource "aws_security_group" "rds"    { name = "${var.project}-rds"    vpc_id = aws_vpc.this.id  egress { from_port=0  to_port=0  protocol="-1"  cidr_blocks=["0.0.0.0/0"] } }
+
+resource "aws_security_group_rule" "mlflow_from_alb"   { type="ingress"  from_port=5000 to_port=5000 protocol="tcp" source_security_group_id=aws_security_group.alb.id    security_group_id=aws_security_group.mlflow.id }
+resource "aws_security_group_rule" "mlflow_from_batch" { type="ingress"  from_port=5000 to_port=5000 protocol="tcp" source_security_group_id=aws_security_group.batch.id  security_group_id=aws_security_group.mlflow.id }
+resource "aws_security_group_rule" "rds_from_mlflow"   { type="ingress"  from_port=5432 to_port=5432 protocol="tcp" source_security_group_id=aws_security_group.mlflow.id security_group_id=aws_security_group.rds.id }
+```
+
+### 4.2 `modules/storage/` — S3 + ECR
+
+**Interface**: solo `project`. Outputs: `data_bucket`, `artifacts_bucket`, `ecr_trainer_url`, `ecr_mlflow_url` (+ ARNs).
+
+```hcl
+data "aws_caller_identity" "current" {}
+
+locals {
+  account_short = substr(data.aws_caller_identity.current.account_id, -6, 6)
+  data_bucket   = "${var.project}-data-${local.account_short}"
+  mlflow_bucket = "${var.project}-mlflow-${local.account_short}"
+}
+
+resource "aws_s3_bucket"          "data"   { bucket = local.data_bucket }
+resource "aws_s3_bucket"          "mlflow" { bucket = local.mlflow_bucket }
+
+# Versioning + SSE + block-public en los DOS buckets
+resource "aws_s3_bucket_versioning"                       "data"   { bucket = aws_s3_bucket.data.id    versioning_configuration { status = "Enabled" } }
+resource "aws_s3_bucket_versioning"                       "mlflow" { bucket = aws_s3_bucket.mlflow.id  versioning_configuration { status = "Enabled" } }
+resource "aws_s3_bucket_server_side_encryption_configuration" "data"   { bucket = aws_s3_bucket.data.id    rule { apply_server_side_encryption_by_default { sse_algorithm = "AES256" } } }
+resource "aws_s3_bucket_server_side_encryption_configuration" "mlflow" { bucket = aws_s3_bucket.mlflow.id  rule { apply_server_side_encryption_by_default { sse_algorithm = "AES256" } } }
+resource "aws_s3_bucket_public_access_block" "data"   { bucket = aws_s3_bucket.data.id    block_public_acls=true block_public_policy=true ignore_public_acls=true restrict_public_buckets=true }
+resource "aws_s3_bucket_public_access_block" "mlflow" { bucket = aws_s3_bucket.mlflow.id  block_public_acls=true block_public_policy=true ignore_public_acls=true restrict_public_buckets=true }
+
+# data-raw emite eventos a EventBridge (consume el dispatcher Lambda)
+resource "aws_s3_bucket_notification" "data_eventbridge" {
+  bucket      = aws_s3_bucket.data.id
+  eventbridge = true
+}
+
+# Lifecycle: borrar versiones antiguas (90d data, 180d mlflow)
+resource "aws_s3_bucket_lifecycle_configuration" "data" {
+  bucket = aws_s3_bucket.data.id
+  rule { id="expire-old"  status="Enabled"  filter {}  noncurrent_version_expiration { noncurrent_days = 90 } }
+}
+resource "aws_s3_bucket_lifecycle_configuration" "mlflow" {
+  bucket = aws_s3_bucket.mlflow.id
+  rule { id="expire-old"  status="Enabled"  filter {}  noncurrent_version_expiration { noncurrent_days = 180 } }
+}
+
+# ECR repos: trainer + mlflow custom (con scan-on-push)
+resource "aws_ecr_repository" "trainer" { name = var.project              image_scanning_configuration { scan_on_push = true } }
+resource "aws_ecr_repository" "mlflow"  { name = "${var.project}-mlflow"  image_scanning_configuration { scan_on_push = true } }
+
+resource "aws_ecr_lifecycle_policy" "trainer" {
+  repository = aws_ecr_repository.trainer.name
+  policy = jsonencode({
+    rules = [{
+      rulePriority = 1
+      description  = "Expire untagged after 7 days"
+      selection    = { tagStatus = "untagged"  countType = "sinceImagePushed"  countUnit = "days"  countNumber = 7 }
+      action       = { type = "expire" }
+    }]
+  })
+}
+```
+
+### 4.3 `modules/mlflow/` — RDS + ECS Fargate + ALB
+
+**Interface**: subnets + SGs (de network), `mlflow_image`, `artifacts_bucket`. Outputs: `alb_dns_name`, `tracking_uri`, `cluster_name`, `service_name`.
+
+```hcl
+# RDS Postgres + Secret
+resource "random_password" "db" {
+  length           = 24
+  special          = true
+  override_special = "!#$%&*-_=+"      # evitar @ y espacios para la URI de MLflow
+}
+
+resource "aws_secretsmanager_secret"        "db" { name = "${var.project}/mlflow/db"  recovery_window_in_days = 0 }
+resource "aws_secretsmanager_secret_version" "db" { secret_id = aws_secretsmanager_secret.db.id  secret_string = jsonencode({ username = "mlflow", password = random_password.db.result }) }
+
+resource "aws_db_subnet_group" "mlflow" { name = "${var.project}-mlflow"  subnet_ids = var.private_subnet_ids }
+
+resource "aws_db_instance" "mlflow" {
+  identifier             = "${var.project}-mlflow"
+  engine                 = "postgres"
+  engine_version         = "15.7"
+  instance_class         = var.rds_instance_class
+  allocated_storage      = var.rds_allocated_storage_gb
+  storage_type           = "gp3"
+  storage_encrypted      = true
+  db_name                = "mlflow"
+  username               = "mlflow"
+  password               = random_password.db.result
+  vpc_security_group_ids = [var.sg_rds_id]
+  db_subnet_group_name   = aws_db_subnet_group.mlflow.name
+  multi_az               = false
+  publicly_accessible    = false
+  backup_retention_period = 7
+  skip_final_snapshot    = true
+  apply_immediately      = true
+}
+
+# ALB (publico) + TG + listener
+resource "aws_lb"               "mlflow" { name = "${var.project}-mlflow"  internal=false  load_balancer_type="application"  security_groups=[var.sg_alb_id]  subnets=var.public_subnet_ids }
+resource "aws_lb_target_group"  "mlflow" { name = "${var.project}-mlflow"  port=5000  protocol="HTTP"  target_type="ip"  vpc_id=var.vpc_id  health_check { path="/health"  matcher="200"  interval=30 } }
+resource "aws_lb_listener"      "mlflow" { load_balancer_arn = aws_lb.mlflow.arn  port=80  protocol="HTTP"  default_action { type="forward"  target_group_arn=aws_lb_target_group.mlflow.arn } }
+
+# ECS cluster + task-def + service
+resource "aws_ecs_cluster"            "this"   { name = "${var.project}-cluster" }
+resource "aws_cloudwatch_log_group"   "mlflow" { name = "/aws/ecs/${var.project}-mlflow"  retention_in_days = var.log_retention_days }
+
+resource "aws_iam_role" "ecs_exec" {
+  name = "${var.project}-ecs-exec"
+  assume_role_policy = jsonencode({ Version="2012-10-17" Statement=[{ Effect="Allow" Principal={ Service="ecs-tasks.amazonaws.com" } Action="sts:AssumeRole" }] })
+}
+resource "aws_iam_role_policy_attachment" "ecs_exec" { role = aws_iam_role.ecs_exec.name  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy" }
+
+resource "aws_iam_role" "mlflow_task" {
+  name = "${var.project}-mlflow-task"
+  assume_role_policy = jsonencode({ Version="2012-10-17" Statement=[{ Effect="Allow" Principal={ Service="ecs-tasks.amazonaws.com" } Action="sts:AssumeRole" }] })
+}
+resource "aws_iam_role_policy" "mlflow_task_s3" {
+  name = "s3-artifacts"  role = aws_iam_role.mlflow_task.id
+  policy = jsonencode({ Version="2012-10-17" Statement=[{ Effect="Allow" Action=["s3:ListBucket","s3:GetObject","s3:PutObject","s3:DeleteObject"]
+                        Resource = ["arn:aws:s3:::${var.artifacts_bucket}", "arn:aws:s3:::${var.artifacts_bucket}/*"] }] })
+}
+
+locals {
+  alb_dns        = aws_lb.mlflow.dns_name
+  allowed_hosts  = "${local.alb_dns},${local.alb_dns}:*,localhost,localhost:*,127.0.0.1,127.0.0.1:*"
+  backend_db_uri = "postgresql://mlflow:${random_password.db.result}@${aws_db_instance.mlflow.endpoint}/mlflow"
+  artifact_root  = "s3://${var.artifacts_bucket}/artifacts"
+}
+
+resource "aws_ecs_task_definition" "mlflow" {
+  family                   = "${var.project}-mlflow"
+  network_mode             = "awsvpc"
+  requires_compatibilities = ["FARGATE"]
+  cpu = "512"  memory = "1024"
+  execution_role_arn = aws_iam_role.ecs_exec.arn
+  task_role_arn      = aws_iam_role.mlflow_task.arn
+
+  container_definitions = jsonencode([{
+    name      = "mlflow"
+    image     = var.mlflow_image
+    essential = true
+    portMappings = [{ containerPort = 5000, protocol = "tcp" }]
+    command = [
+      "mlflow", "server",
+      "--host", "0.0.0.0", "--port", "5000",
+      "--allowed-hosts", local.allowed_hosts,
+      "--backend-store-uri", local.backend_db_uri,
+      "--default-artifact-root", local.artifact_root,
+    ]
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        awslogs-group         = aws_cloudwatch_log_group.mlflow.name
+        awslogs-region        = data.aws_region.current.name
+        awslogs-stream-prefix = "mlflow"
+      }
+    }
+  }])
+}
+
+resource "aws_ecs_service" "mlflow" {
+  name            = "${var.project}-mlflow"
+  cluster         = aws_ecs_cluster.this.id
+  task_definition = aws_ecs_task_definition.mlflow.arn
+  desired_count   = 1
+  launch_type     = "FARGATE"
+
+  network_configuration {
+    subnets          = var.private_subnet_ids
+    security_groups  = [var.sg_mlflow_id]
+    assign_public_ip = false
+  }
+
+  load_balancer {
+    target_group_arn = aws_lb_target_group.mlflow.arn
+    container_name   = "mlflow"
+    container_port   = 5000
+  }
+
+  depends_on = [aws_lb_listener.mlflow]
+}
+```
+
+### 4.4 `modules/batch/` — compute envs + queues + job-def + IAM
+
+**Interface**: `private_subnet_ids`, `sg_batch_id`, `ecr_trainer_url`, `tracking_uri`, los buckets de S3, `job_attempt_seconds`. Outputs: `job_queue_spot`, `job_queue_ondemand`, `job_definition_name` (+ ARNs).
+
+`modules/batch/iam.tf`:
+
+```hcl
+data "aws_region"          "current" {}
+data "aws_caller_identity" "current" {}
+
+# Instance profile (host EC2 de Batch)
+resource "aws_iam_role" "instance" {
+  name = "${var.project}-batch-instance"
+  assume_role_policy = jsonencode({ Version="2012-10-17" Statement=[{ Effect="Allow" Principal={ Service="ec2.amazonaws.com" } Action="sts:AssumeRole" }] })
+}
+resource "aws_iam_role_policy_attachment" "instance" { role = aws_iam_role.instance.name  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonEC2ContainerServiceforEC2Role" }
+resource "aws_iam_instance_profile"       "instance" { name = "${var.project}-batch-instance"  role = aws_iam_role.instance.name }
+
+# Execution role (lo asume el container al arrancar)
+resource "aws_iam_role" "exec" {
+  name = "${var.project}-batch-exec"
+  assume_role_policy = jsonencode({ Version="2012-10-17" Statement=[{ Effect="Allow" Principal={ Service="ecs-tasks.amazonaws.com" } Action="sts:AssumeRole" }] })
+}
+resource "aws_iam_role_policy_attachment" "exec" { role = aws_iam_role.exec.name  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy" }
+
+# Job role (lo que hace el codigo del trainer)
+resource "aws_iam_role" "job" {
+  name = "${var.project}-batch-job"
+  assume_role_policy = jsonencode({ Version="2012-10-17" Statement=[{ Effect="Allow" Principal={ Service="ecs-tasks.amazonaws.com" } Action="sts:AssumeRole" }] })
+}
+resource "aws_iam_role_policy" "job_s3" {
+  name = "s3-data-and-artifacts"  role = aws_iam_role.job.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      { Effect = "Allow", Action = ["s3:ListBucket"], Resource = [var.data_bucket_arn, var.artifacts_bucket_arn] },
+      { Effect = "Allow", Action = ["s3:GetObject","s3:PutObject","s3:DeleteObject"],
+        Resource = ["${var.data_bucket_arn}/*", "${var.artifacts_bucket_arn}/*"] }
+    ]
+  })
+}
+resource "aws_iam_role_policy" "job_cw_metrics" {
+  name = "cw-metrics-emit"  role = aws_iam_role.job.id
+  policy = jsonencode({ Version="2012-10-17" Statement=[{ Effect="Allow" Action=["cloudwatch:PutMetricData"] Resource="*" Condition={ StringEquals={ "cloudwatch:namespace" = "MLTraining" } } }] })
+}
+```
+
+`modules/batch/main.tf`:
+
+```hcl
+resource "aws_cloudwatch_log_group" "batch" {
+  name              = "/aws/batch/${var.project}"
+  retention_in_days = var.log_retention_days
+}
+
+resource "aws_batch_compute_environment" "spot" {
+  compute_environment_name = "${var.project}-ce-spot"
+  type   = "MANAGED"  state = "ENABLED"
+  compute_resources {
+    type                = "EC2"
+    allocation_strategy = "BEST_FIT_PROGRESSIVE"
+    bid_percentage      = var.spot_bid_percentage
+    min_vcpus           = 0  max_vcpus = var.spot_max_vcpus  desired_vcpus = 0
+    instance_type       = [var.instance_type]
+    subnets             = var.private_subnet_ids
+    security_group_ids  = [var.sg_batch_id]
+    instance_role       = aws_iam_instance_profile.instance.arn
+    spot_iam_fleet_role = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:role/aws-service-role/spotfleet.amazonaws.com/AWSServiceRoleForEC2SpotFleet"
+  }
+}
+
+resource "aws_batch_compute_environment" "ondemand" {
+  compute_environment_name = "${var.project}-ce-ondemand"
+  type   = "MANAGED"  state = "ENABLED"
+  compute_resources {
+    type                = "EC2"
+    allocation_strategy = "BEST_FIT_PROGRESSIVE"
+    min_vcpus           = 0  max_vcpus = var.ondemand_max_vcpus  desired_vcpus = 0
+    instance_type       = [var.instance_type]
+    subnets             = var.private_subnet_ids
+    security_group_ids  = [var.sg_batch_id]
+    instance_role       = aws_iam_instance_profile.instance.arn
+  }
+}
+
+resource "aws_batch_job_queue" "spot"     { name = "${var.project}-queue"           state = "ENABLED" priority = 100  compute_environment_order { order=1  compute_environment = aws_batch_compute_environment.spot.arn } }
+resource "aws_batch_job_queue" "ondemand" { name = "${var.project}-queue-ondemand"  state = "ENABLED" priority = 100  compute_environment_order { order=1  compute_environment = aws_batch_compute_environment.ondemand.arn } }
+
+resource "aws_batch_job_definition" "trainer" {
+  name = var.project
+  type = "container"
+  platform_capabilities = ["EC2"]
+
+  retry_strategy { attempts = 2 }
+  timeout        { attempt_duration_seconds = var.job_attempt_seconds }   # 8h cubre prod_xl
+
+  container_properties = jsonencode({
+    image            = "${var.ecr_trainer_url}:${var.trainer_image_tag}"
+    command          = ["--varieties", "POP", "--tuning", "prod"]         # default; el dispatcher lo override-a
+    executionRoleArn = aws_iam_role.exec.arn
+    jobRoleArn       = aws_iam_role.job.arn
+    resourceRequirements = [
+      { type = "VCPU",   value = "8" },
+      { type = "MEMORY", value = "15000" },
+    ]
+    environment = [
+      { name = "MLFLOW_TRACKING_URI", value = var.tracking_uri },
+      { name = "S3_ARTIFACTS_BUCKET", value = var.artifacts_bucket },
+      { name = "S3_ARTIFACTS_PREFIX", value = "artifacts" },
+      { name = "S3_REPORTS_PREFIX",   value = "reports" },
+      { name = "AWS_DEFAULT_REGION",  value = data.aws_region.current.name },
+      { name = "EMIT_CW_METRICS",     value = "1" },                      # activa metric custom para alarma de MAPE
+    ]
+    logConfiguration = {
+      logDriver = "awslogs"
+      options = {
+        awslogs-group         = aws_cloudwatch_log_group.batch.name
+        awslogs-region        = data.aws_region.current.name
+        awslogs-stream-prefix = "job"
+      }
+    }
+  })
+}
+```
+
+### 4.5 `modules/lambdas/` — dispatcher + notifier + EventBridge
+
+**Interface**: `job_queue_*_arn`, `job_definition_*`, `varieties_schedule`, `data_bucket`, `sns_topic_arn`, `lambdas_src_dir`. Sin outputs criticos para otros modulos.
+
+`modules/lambdas/dispatcher.tf`:
+
+```hcl
+data "aws_region"          "current" {}
+data "aws_caller_identity" "current" {}
+
+data "archive_file" "dispatcher" {
+  type        = "zip"
+  source_dir  = "${var.lambdas_src_dir}/dispatcher"
+  output_path = "${path.module}/.build/dispatcher.zip"
+}
+
+resource "aws_iam_role" "dispatcher" {
+  name = "${var.project}-dispatcher"
+  assume_role_policy = jsonencode({ Version="2012-10-17" Statement=[{ Effect="Allow" Principal={ Service="lambda.amazonaws.com" } Action="sts:AssumeRole" }] })
+}
+resource "aws_iam_role_policy_attachment" "dispatcher_basic" { role = aws_iam_role.dispatcher.name  policy_arn = "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole" }
+resource "aws_iam_role_policy" "dispatcher_submit" {
+  name = "batch-submit"  role = aws_iam_role.dispatcher.id
+  policy = jsonencode({ Version="2012-10-17" Statement=[{
+    Effect = "Allow"  Action = ["batch:SubmitJob"]
+    Resource = [
+      var.job_queue_spot_arn, var.job_queue_ondemand_arn,
+      "arn:aws:batch:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:job-definition/${var.job_definition_name}*",
+    ]
+  }] })
+}
+
+resource "aws_cloudwatch_log_group" "dispatcher" { name = "/aws/lambda/${var.project}-dispatcher"  retention_in_days = var.log_retention_days }
+
+resource "aws_lambda_function" "dispatcher" {
+  function_name    = "${var.project}-dispatcher"
+  role             = aws_iam_role.dispatcher.arn
+  filename         = data.archive_file.dispatcher.output_path
+  source_code_hash = data.archive_file.dispatcher.output_base64sha256
+  runtime          = "python3.13"
+  handler          = "dispatcher.lambda_handler"
+  timeout          = 30
+  memory_size      = 256
+
+  environment {
+    variables = {
+      JOB_QUEUE           = element(reverse(split("/", var.job_queue_spot_arn)), 0)
+      JOB_DEFINITION      = var.job_definition_name
+      DEFAULT_TUNING      = var.default_tuning
+      DEFAULT_VARIETIES   = "POP"
+      DEFAULT_DATA_BUCKET = var.data_bucket
+      DEFAULT_DATA_KEY    = "latest/BD_HISTORICO_ACUMULADO.xlsx"
+    }
+  }
+  depends_on = [aws_cloudwatch_log_group.dispatcher]
+}
+
+# 1 cron por variedad (1 variedad/dia, dias 5..N del mes a las 06:00 UTC)
+resource "aws_cloudwatch_event_rule" "schedule" {
+  for_each            = { for i, v in var.varieties_schedule : v => i }
+  name                = "${var.project}-train-${lower(each.key)}"
+  schedule_expression = "cron(0 6 ${5 + each.value} * ? *)"
+  state               = "ENABLED"
+}
+resource "aws_cloudwatch_event_target" "schedule" {
+  for_each = aws_cloudwatch_event_rule.schedule
+  rule     = each.value.name
+  arn      = aws_lambda_function.dispatcher.arn
+  input    = jsonencode({ detail = { varieties = each.key, tuning = var.default_tuning } })
+}
+resource "aws_lambda_permission" "schedule" {
+  for_each      = aws_cloudwatch_event_rule.schedule
+  statement_id  = "eb-schedule-${lower(each.key)}"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.dispatcher.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = each.value.arn
+}
+
+# Trigger por upload a S3 data-raw
+resource "aws_cloudwatch_event_rule" "s3_upload" {
+  name        = "${var.project}-data-uploaded"
+  state       = "ENABLED"
+  event_pattern = jsonencode({
+    source      = ["aws.s3"]
+    detail-type = ["Object Created"]
+    detail = {
+      bucket = { name = [var.data_bucket] }
+      object = { key = [{ prefix = "incoming/", suffix = "BD_HISTORICO_ACUMULADO.xlsx" }] }
+    }
+  })
+}
+resource "aws_cloudwatch_event_target" "s3_upload" { rule = aws_cloudwatch_event_rule.s3_upload.name  arn = aws_lambda_function.dispatcher.arn }
+resource "aws_lambda_permission"      "s3_upload" { statement_id="eb-s3-upload" action="lambda:InvokeFunction" function_name=aws_lambda_function.dispatcher.function_name principal="events.amazonaws.com" source_arn=aws_cloudwatch_event_rule.s3_upload.arn }
+```
+
+`modules/lambdas/notifier.tf` — analogo al dispatcher pero con event-pattern de Batch state-change (`SUCCEEDED`/`FAILED`).
+
+### 4.6 Codigo Python de las Lambdas (`lambdas/`)
+
+`lambdas/dispatcher/dispatcher.py`:
 
 ```python
-"""Lambda dispatcher: EventBridge -> AWS Batch SubmitJob.
-
-El usuario de negocio sube SOLO BD_HISTORICO_ACUMULADO.xlsx al bucket
-data-raw. El Lambda extrae bucket+key del evento y los pasa al job de Batch
-como env vars; main.py los usa en `_hydrate_data_from_s3()` para descargar
-el acumulado y correr scripts.prepare_data.split_workbook -> DB-HISTORICA.
-
-Eventos soportados:
-1. Schedule cron (EventBridge Schedule):
-   detail = {"varieties":"all","tuning":"prod",
-             "s3_data_bucket":"...", "s3_data_key":"latest/BD_HISTORICO_ACUMULADO.xlsx"}
-2. S3 PutObject (data-raw):
-   detail.bucket.name = "ml-training-data-raw-..."
-   detail.object.key  = "incoming/2026-05/BD_HISTORICO_ACUMULADO.xlsx"
-   -> entrena 'all' variedades sobre ese acumulado.
-"""
-import os
-import re
-
+"""Lambda dispatcher: EventBridge -> AWS Batch SubmitJob."""
+import os, re
 import boto3
 
 batch = boto3.client("batch")
-JOB_QUEUE = os.environ["JOB_QUEUE"]
-JOB_DEFINITION = os.environ["JOB_DEFINITION"]
-DEFAULT_TUNING = os.environ.get("DEFAULT_TUNING", "prod")
-DEFAULT_BUCKET = os.environ.get("DEFAULT_DATA_BUCKET", "")
-DEFAULT_KEY = os.environ.get("DEFAULT_DATA_KEY", "")
-
+JOB_QUEUE         = os.environ["JOB_QUEUE"]
+JOB_DEFINITION    = os.environ["JOB_DEFINITION"]
+DEFAULT_TUNING    = os.environ.get("DEFAULT_TUNING", "prod")
+DEFAULT_VARIETIES = os.environ.get("DEFAULT_VARIETIES", "POP")
+DEFAULT_BUCKET    = os.environ.get("DEFAULT_DATA_BUCKET", "")
+DEFAULT_KEY       = os.environ.get("DEFAULT_DATA_KEY", "")
 
 def _from_schedule(detail):
-    return (
-        detail.get("varieties", "all"),
-        detail.get("tuning", DEFAULT_TUNING),
-        detail.get("s3_data_bucket", DEFAULT_BUCKET),
-        detail.get("s3_data_key", DEFAULT_KEY),
-    )
-
+    return (detail.get("varieties", DEFAULT_VARIETIES),
+            detail.get("tuning", DEFAULT_TUNING),
+            detail.get("s3_data_bucket", DEFAULT_BUCKET),
+            detail.get("s3_data_key", DEFAULT_KEY))
 
 def _from_s3(detail):
-    bucket = detail["bucket"]["name"]
-    key = detail["object"]["key"]
-    return "all", DEFAULT_TUNING, bucket, key
-
+    # NO hardcodeamos "all": un upload de Excel dispara DEFAULT_VARIETIES.
+    return DEFAULT_VARIETIES, DEFAULT_TUNING, detail["bucket"]["name"], detail["object"]["key"]
 
 def lambda_handler(event, context):
-    source = event.get("source", "")
     detail = event.get("detail", {})
-
-    if source == "aws.s3":
+    if event.get("source") == "aws.s3":
         varieties, tuning, s3_bucket, s3_key = _from_s3(detail)
     else:
         varieties, tuning, s3_bucket, s3_key = _from_schedule(detail)
 
     if not (s3_bucket and s3_key):
-        raise ValueError(
-            "No se pudo determinar S3_DATA_BUCKET/S3_DATA_KEY. "
-            "Pasalos en detail o seteá DEFAULT_DATA_BUCKET/DEFAULT_DATA_KEY."
-        )
+        raise ValueError("Falta S3_DATA_BUCKET/S3_DATA_KEY")
 
-    job_name = re.sub(r"[^a-zA-Z0-9_-]", "-",
-                      f"train-{varieties}-{tuning}")[:128]
-
+    job_name = re.sub(r"[^a-zA-Z0-9_-]", "-", f"train-{varieties}-{tuning}")[:128]
     resp = batch.submit_job(
-        jobName=job_name,
-        jobQueue=JOB_QUEUE,
-        jobDefinition=JOB_DEFINITION,
+        jobName=job_name, jobQueue=JOB_QUEUE, jobDefinition=JOB_DEFINITION,
         containerOverrides={
             "command": ["--varieties", varieties, "--tuning", tuning],
-            "environment": [
-                {"name": "S3_DATA_BUCKET", "value": s3_bucket},
-                {"name": "S3_DATA_KEY",    "value": s3_key},
-            ],
-        },
-    )
-    return {
-        "jobId": resp["jobId"],
-        "varieties": varieties,
-        "tuning": tuning,
-        "s3_data": f"s3://{s3_bucket}/{s3_key}",
-    }
+            "environment": [{"name":"S3_DATA_BUCKET","value":s3_bucket},
+                            {"name":"S3_DATA_KEY","value":s3_key}],
+        })
+    return {"jobId": resp["jobId"], "varieties": varieties, "tuning": tuning,
+            "s3_data": f"s3://{s3_bucket}/{s3_key}"}
 ```
 
-### 9.2 Crear funcion
-
-```bash
-mkdir -p aws/lambda && cd aws/lambda
-# (pega el codigo en dispatcher.py)
-zip dispatcher.zip dispatcher.py
-cd ../..
-
-# Trust policy
-cat > /tmp/lambda-trust.json <<'JSON'
-{"Version":"2012-10-17","Statement":[{"Effect":"Allow",
-  "Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}
-JSON
-
-aws iam create-role --role-name ${PROJECT}-dispatcher \
-  --assume-role-policy-document file:///tmp/lambda-trust.json
-aws iam attach-role-policy --role-name ${PROJECT}-dispatcher \
-  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-aws iam put-role-policy --role-name ${PROJECT}-dispatcher \
-  --policy-name batch-submit --policy-document '{
-    "Version":"2012-10-17","Statement":[{"Effect":"Allow",
-    "Action":["batch:SubmitJob"],
-    "Resource":["arn:aws:batch:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':job-queue/'${PROJECT}'-queue",
-                "arn:aws:batch:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':job-definition/'${PROJECT}'*"]}]}'
-
-sleep 10  # propagacion IAM
-
-aws lambda create-function \
-  --function-name ${PROJECT}-dispatcher \
-  --runtime python3.13 \
-  --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT}-dispatcher \
-  --handler dispatcher.lambda_handler \
-  --zip-file fileb://aws/lambda/dispatcher.zip \
-  --environment "Variables={JOB_QUEUE=${PROJECT}-queue,JOB_DEFINITION=${PROJECT},DEFAULT_TUNING=prod,DEFAULT_DATA_BUCKET=${S3_DATA_BUCKET},DEFAULT_DATA_KEY=latest/BD_HISTORICO_ACUMULADO.xlsx}"
-```
-
----
-
-## 10. EventBridge — schedule cron + trigger S3
-
-### 10.1 Schedule mensual
-
-```bash
-DISPATCHER_ARN=arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${PROJECT}-dispatcher
-
-# Permiso para que EventBridge invoque al Lambda
-aws lambda add-permission \
-  --function-name ${PROJECT}-dispatcher \
-  --statement-id eb-schedule \
-  --action lambda:InvokeFunction \
-  --principal events.amazonaws.com
-
-# Regla: dia 5 de cada mes a las 06:00 UTC
-aws events put-rule \
-  --name ${PROJECT}-monthly-train \
-  --schedule-expression "cron(0 6 5 * ? *)" \
-  --state ENABLED
-
-aws events put-targets --rule ${PROJECT}-monthly-train --targets '[{
-  "Id":"1",
-  "Arn":"'${DISPATCHER_ARN}'",
-  "Input":"{\"detail\":{\"varieties\":\"all\",\"tuning\":\"prod\"}}"
-}]'
-```
-
-### 10.2 Trigger por upload de Excel a S3
-
-```bash
-# Permiso EventBridge -> Lambda (otro statement-id)
-aws lambda add-permission \
-  --function-name ${PROJECT}-dispatcher \
-  --statement-id eb-s3 \
-  --action lambda:InvokeFunction \
-  --principal events.amazonaws.com
-
-# Regla que matchea PutObject en data-raw
-aws events put-rule \
-  --name ${PROJECT}-data-uploaded \
-  --event-pattern '{
-    "source":["aws.s3"],
-    "detail-type":["Object Created"],
-    "detail":{"bucket":{"name":["'${S3_DATA_BUCKET}'"]},
-              "object":{"key":[{"prefix":"incoming/","suffix":"BD_HISTORICO_ACUMULADO.xlsx"}]}}
-  }' \
-  --state ENABLED
-
-aws events put-targets --rule ${PROJECT}-data-uploaded --targets '[{
-  "Id":"1","Arn":"'${DISPATCHER_ARN}'"
-}]'
-```
-
----
-
-## 11. Lambda notifier — job state changes -> SNS / Slack
-
-### 11.1 SNS topic
-
-```bash
-SNS_ARN=$(aws sns create-topic --name ${PROJECT}-alerts \
-  --query TopicArn --output text)
-
-# Suscribir email (revisa tu inbox para confirmar)
-aws sns subscribe --topic-arn ${SNS_ARN} \
-  --protocol email --notification-endpoint "tu-email@ejemplo.com"
-```
-
-### 11.2 Lambda notifier
-
-`aws/lambda/notifier.py`:
+`lambdas/notifier/notifier.py`:
 
 ```python
-"""Notifica via SNS cuando un job de Batch cambia a SUCCEEDED o FAILED."""
-import json
+"""Lambda notifier: Batch state-change -> SNS."""
 import os
-
 import boto3
 
 sns = boto3.client("sns")
 TOPIC_ARN = os.environ["TOPIC_ARN"]
-
 
 def lambda_handler(event, context):
     detail = event["detail"]
     status = detail["status"]
     if status not in ("SUCCEEDED", "FAILED"):
         return {"skipped": status}
-
-    job_name = detail.get("jobName", "?")
-    job_id = detail.get("jobId", "?")
-    overrides = detail.get("container", {}).get("command", [])
-
-    msg = (
-        f"[ml-training] {status}\n"
-        f"jobName={job_name}\njobId={job_id}\n"
-        f"command={' '.join(overrides)}\n"
-    )
+    msg = (f"[ml-training] {status}\n"
+           f"jobName={detail.get('jobName','?')}\n"
+           f"jobId={detail.get('jobId','?')}\n"
+           f"command={' '.join(detail.get('container',{}).get('command',[]))}\n")
     if status == "FAILED":
-        reason = detail.get("statusReason", "(sin razon)")
-        msg += f"reason={reason}\n"
-
+        msg += f"reason={detail.get('statusReason','(sin razon)')}\n"
     sns.publish(TopicArn=TOPIC_ARN, Subject=f"ml-training {status}", Message=msg)
     return {"published": True}
 ```
 
-```bash
-cd aws/lambda
-zip notifier.zip notifier.py
-cd ../..
+### 4.7 `modules/monitoring/` — SNS + alarmas
 
-aws iam create-role --role-name ${PROJECT}-notifier \
-  --assume-role-policy-document file:///tmp/lambda-trust.json
-aws iam attach-role-policy --role-name ${PROJECT}-notifier \
-  --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-aws iam put-role-policy --role-name ${PROJECT}-notifier \
-  --policy-name sns-publish --policy-document '{
-    "Version":"2012-10-17","Statement":[{"Effect":"Allow",
-    "Action":["sns:Publish"],"Resource":"'${SNS_ARN}'"}]}'
+**Interface**: `alert_email`, `batch_job_queue_name`, `alb_arn`, `tg_arn`, `mape_alarm_threshold`. Output: `sns_topic_arn`.
 
-sleep 10
-aws lambda create-function \
-  --function-name ${PROJECT}-notifier \
-  --runtime python3.13 \
-  --role arn:aws:iam::${AWS_ACCOUNT_ID}:role/${PROJECT}-notifier \
-  --handler notifier.lambda_handler \
-  --zip-file fileb://aws/lambda/notifier.zip \
-  --environment "Variables={TOPIC_ARN=${SNS_ARN}}"
+```hcl
+resource "aws_sns_topic"              "alerts" { name = "${var.project}-alerts" }
+resource "aws_sns_topic_subscription" "email"  { topic_arn = aws_sns_topic.alerts.arn  protocol = "email"  endpoint = var.alert_email }
+# (la suscripcion email requiere confirmacion manual desde el inbox)
 
-NOTIFIER_ARN=arn:aws:lambda:${AWS_REGION}:${AWS_ACCOUNT_ID}:function:${PROJECT}-notifier
+# Alarma 1: cualquier job FAILED en la ultima hora
+resource "aws_cloudwatch_metric_alarm" "job_failures" {
+  alarm_name = "${var.project}-job-failures"
+  namespace  = "AWS/Batch"  metric_name = "FailedJobCount"  statistic = "Sum"
+  period     = 3600  evaluation_periods = 1
+  threshold  = 0  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data = "notBreaching"
+  dimensions = { JobQueue = var.batch_job_queue_name }
+  alarm_actions = [aws_sns_topic.alerts.arn]
+}
 
-aws lambda add-permission \
-  --function-name ${PROJECT}-notifier \
-  --statement-id eb-batch \
-  --action lambda:InvokeFunction \
-  --principal events.amazonaws.com
+# Alarma 2: degradacion del modelo (MAPE > umbral) — se alimenta del custom metric
+# que el trainer emite con EMIT_CW_METRICS=1 (ver §6).
+resource "aws_cloudwatch_metric_alarm" "mape_pop" {
+  alarm_name = "${var.project}-mape-pop-too-high"
+  namespace  = "MLTraining"  metric_name = "BusinessMAPE"  statistic = "Average"
+  period     = 86400  evaluation_periods = 1
+  threshold  = var.mape_alarm_threshold  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data = "notBreaching"
+  dimensions = { Variety = "POP" }
+  alarm_actions = [aws_sns_topic.alerts.arn]
+}
 
-# Regla EventBridge: jobs de nuestra queue que cambian de estado
-aws events put-rule \
-  --name ${PROJECT}-job-state \
-  --event-pattern '{
-    "source":["aws.batch"],
-    "detail-type":["Batch Job State Change"],
-    "detail":{"status":["SUCCEEDED","FAILED"],
-              "jobQueue":[{"prefix":"arn:aws:batch:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':job-queue/'${PROJECT}'"}]}
-  }' \
-  --state ENABLED
-
-aws events put-targets --rule ${PROJECT}-job-state --targets '[{
-  "Id":"1","Arn":"'${NOTIFIER_ARN}'"
-}]'
+# Alarma 3: MLflow Fargate unhealthy 5+ minutos
+locals {
+  alb_name      = element(split("/", var.alb_arn), length(split("/", var.alb_arn)) - 2)
+  alb_id        = element(split("/", var.alb_arn), length(split("/", var.alb_arn)) - 1)
+  tg_name       = element(split("/", var.tg_arn),  length(split("/", var.tg_arn))  - 2)
+  tg_id         = element(split("/", var.tg_arn),  length(split("/", var.tg_arn))  - 1)
+}
+resource "aws_cloudwatch_metric_alarm" "mlflow_unhealthy" {
+  alarm_name = "${var.project}-mlflow-unhealthy"
+  namespace  = "AWS/ApplicationELB"  metric_name = "UnHealthyHostCount"  statistic = "Maximum"
+  period     = 60  evaluation_periods = 5
+  threshold  = 0  comparison_operator = "GreaterThanThreshold"
+  treat_missing_data = "notBreaching"
+  dimensions = {
+    TargetGroup  = "targetgroup/${local.tg_name}/${local.tg_id}"
+    LoadBalancer = "app/${local.alb_name}/${local.alb_id}"
+  }
+  alarm_actions = [aws_sns_topic.alerts.arn]
+}
 ```
-
-### 11.3 (Opcional) Slack webhook
-
-Reemplaza el `sns.publish` con un POST al webhook de Slack:
-
-```python
-import urllib.request, json
-WEBHOOK = os.environ["SLACK_WEBHOOK"]
-req = urllib.request.Request(
-    WEBHOOK,
-    data=json.dumps({"text": msg}).encode(),
-    headers={"Content-Type": "application/json"},
-)
-urllib.request.urlopen(req, timeout=5)
-```
-
-Y agregale al Lambda `SLACK_WEBHOOK` como env var.
 
 ---
 
-## 12. CloudWatch Alarms — calidad y operacion
-
-### 12.1 Alarma: job failure
+## 5. Workflow
 
 ```bash
-aws cloudwatch put-metric-alarm \
-  --alarm-name ${PROJECT}-job-failures \
-  --alarm-description "Cualquier fallo de training en ultima hora" \
-  --namespace AWS/Batch \
-  --metric-name FailedJobCount \
-  --dimensions Name=JobQueue,Value=${PROJECT}-queue \
-  --statistic Sum --period 3600 --evaluation-periods 1 \
-  --threshold 0 --comparison-operator GreaterThanThreshold \
-  --alarm-actions ${SNS_ARN}
+cd ml-training-infra/envs/prod
+
+# Una sola vez (descarga providers + inicializa state remoto)
+terraform init
+
+# Preview de cambios
+terraform plan -var-file=terraform.tfvars
+
+# Apply
+terraform apply -var-file=terraform.tfvars
+
+# Outputs (URLs y nombres importantes)
+terraform output
 ```
 
-### 12.2 Alarma de calidad — MAPE de produccion
+Despues de cada cambio en `*.tf` o `lambdas/*.py`:
 
-El pipeline ya loguea `business_oof_mape` como tag de MLflow. Esto NO está
-disponible directamente en CW Metrics, así que extendemos el código del
-trainer para emitir una metrica custom al final del run. Patch a aplicar
-en `main.py` (o nuevo modulo `src/tracking/cloudwatch.py`):
+```bash
+terraform plan
+terraform apply
+```
+
+`apply` es idempotente: re-correrlo sin cambios da "0 to change". Cambios
+en lambdas (.py) se detectan por `source_code_hash` y disparan re-deploy
+automatico.
+
+---
+
+## 6. Codigo del trainer — patches necesarios
+
+El repo del trainer (`ml_training/`) ya respeta `MLFLOW_TRACKING_URI`,
+`S3_ARTIFACTS_BUCKET`, etc. **Cambio unico necesario** para activar la
+alarma de MAPE: emitir custom metric a CloudWatch al final del run.
+
+Patch en `main.py` (despues de `_write_aggregate_summary`):
 
 ```python
-import boto3, os, json
 def _emit_mape_metric(aggregate_path):
     """Emite business_oof_mape de cada variedad como custom metric en CW."""
     if not os.environ.get("EMIT_CW_METRICS"):
         return
+    import json
+    import boto3
     cw = boto3.client("cloudwatch")
     data = json.loads(open(aggregate_path).read())
     metric_data = []
@@ -1272,65 +966,31 @@ def _emit_mape_metric(aggregate_path):
         mape = ch.get("champion_mape_oof_business")
         if mape is not None:
             metric_data.append({
-                "MetricName":"BusinessMAPE",
-                "Dimensions":[{"Name":"Variety","Value":variety}],
+                "MetricName": "BusinessMAPE",
+                "Dimensions": [{"Name": "Variety", "Value": variety}],
                 "Value": float(mape),
-                "Unit":"Percent",
+                "Unit": "Percent",
             })
     if metric_data:
         cw.put_metric_data(Namespace="MLTraining", MetricData=metric_data)
 ```
 
-Llamarlo despues de `_write_aggregate_summary(...)` en `main.py:152`. La
-job definition ya pasa la env var apropiada — si querés activarlo, agregá
-`EMIT_CW_METRICS=1` a las env vars del job-def.
-
-Alarma:
-```bash
-aws cloudwatch put-metric-alarm \
-  --alarm-name ${PROJECT}-mape-pop-too-high \
-  --alarm-description "POP business MAPE > 25%" \
-  --namespace MLTraining --metric-name BusinessMAPE \
-  --dimensions Name=Variety,Value=POP \
-  --statistic Average --period 86400 --evaluation-periods 1 \
-  --threshold 25 --comparison-operator GreaterThanThreshold \
-  --alarm-actions ${SNS_ARN}
-```
-
-### 12.3 Alarma: MLflow service down
-
-```bash
-TG_NAME=$(aws elbv2 describe-target-groups --target-group-arns ${TG_ARN} \
-  --query 'TargetGroups[0].TargetGroupName' --output text)
-LB_NAME=$(aws elbv2 describe-load-balancers --load-balancer-arns ${ALB_ARN} \
-  --query 'LoadBalancers[0].LoadBalancerName' --output text)
-
-aws cloudwatch put-metric-alarm \
-  --alarm-name ${PROJECT}-mlflow-unhealthy \
-  --namespace AWS/ApplicationELB \
-  --metric-name UnHealthyHostCount \
-  --dimensions Name=TargetGroup,Value=${TG_NAME} Name=LoadBalancer,Value=${LB_NAME} \
-  --statistic Maximum --period 60 --evaluation-periods 5 \
-  --threshold 0 --comparison-operator GreaterThanThreshold \
-  --alarm-actions ${SNS_ARN}
-```
+`EMIT_CW_METRICS=1` ya queda inyectado por la job-def (modulo `batch`).
 
 ---
 
-## 13. GitHub Actions — CI/CD a ECR
+## 7. CI/CD del trainer (GitHub Actions)
 
-`.github/workflows/build-and-push.yml`:
+El IaC NO maneja la imagen del trainer — la construye GH Actions y la
+pushea a ECR. Tag = `git sha` corto.
+
+`.github/workflows/build.yml`:
 
 ```yaml
 name: build-and-push
 on:
   push:
     branches: [main]
-    paths:
-      - "src/**"
-      - "main.py"
-      - "requirements.txt"
-      - "Dockerfile"
 permissions:
   id-token: write
   contents: read
@@ -1341,259 +1001,159 @@ jobs:
       - uses: actions/checkout@v4
       - uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: arn:aws:iam::TU_ACCOUNT:role/ml-training-gh-actions
+          role-to-assume: arn:aws:iam::ACCOUNT:role/gha-ecr-push
           aws-region: us-east-1
-      - uses: aws-actions/amazon-ecr-login@v2
-        id: ecr
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
       - name: Build & push
-        env:
-          ECR: ${{ steps.ecr.outputs.registry }}/ml-training
         run: |
-          GIT_SHA=${GITHUB_SHA::7}
-          docker buildx build --platform linux/amd64 \
-            --build-arg GIT_SHA=${GIT_SHA} \
-            --build-arg BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ) \
-            --build-arg VERSION=${GITHUB_REF_NAME} \
-            -t $ECR:${GIT_SHA} -t $ECR:latest --push .
-      - name: Update Batch job-definition
+          IMG=${{ steps.ecr.outputs.registry }}/ml-training:${GITHUB_SHA::7}
+          docker buildx build --platform linux/amd64 -t $IMG --push .
+      - name: Update job-def via terraform
         run: |
-          DEF=$(aws batch describe-job-definitions \
-            --job-definition-name ml-training --status ACTIVE \
-            --query 'jobDefinitions[0]' --output json)
-          NEW=$(echo "$DEF" | jq --arg img "${{ steps.ecr.outputs.registry }}/ml-training:latest" \
-            '.containerProperties.image = $img |
-             {jobDefinitionName, type, platformCapabilities, containerProperties,
-              retryStrategy, timeout}')
-          echo "$NEW" > /tmp/job-def.json
-          aws batch register-job-definition --cli-input-json file:///tmp/job-def.json
+          cd infra/envs/prod
+          terraform apply -auto-approve \
+            -var="trainer_image_tag=${GITHUB_SHA::7}"
 ```
 
-OIDC role para GitHub (ejecutar UNA vez):
-
-```bash
-cat > /tmp/gh-trust.json <<JSON
-{"Version":"2012-10-17","Statement":[{
-  "Effect":"Allow",
-  "Principal":{"Federated":"arn:aws:iam::${AWS_ACCOUNT_ID}:oidc-provider/token.actions.githubusercontent.com"},
-  "Action":"sts:AssumeRoleWithWebIdentity",
-  "Condition":{"StringEquals":{
-    "token.actions.githubusercontent.com:aud":"sts.amazonaws.com"},
-    "StringLike":{"token.actions.githubusercontent.com:sub":"repo:TU_ORG/ml_training:ref:refs/heads/main"}}}]}
-JSON
-
-aws iam create-role --role-name ${PROJECT}-gh-actions \
-  --assume-role-policy-document file:///tmp/gh-trust.json
-
-aws iam put-role-policy --role-name ${PROJECT}-gh-actions \
-  --policy-name ecr-batch --policy-document '{
-    "Version":"2012-10-17","Statement":[
-      {"Effect":"Allow","Action":["ecr:GetAuthorizationToken"],"Resource":"*"},
-      {"Effect":"Allow","Action":["ecr:BatchCheckLayerAvailability","ecr:CompleteLayerUpload",
-        "ecr:InitiateLayerUpload","ecr:PutImage","ecr:UploadLayerPart"],
-        "Resource":"arn:aws:ecr:'${AWS_REGION}':'${AWS_ACCOUNT_ID}':repository/'${ECR_REPO}'"},
-      {"Effect":"Allow","Action":["batch:DescribeJobDefinitions","batch:RegisterJobDefinition"],
-        "Resource":"*"},
-      {"Effect":"Allow","Action":"iam:PassRole",
-        "Resource":["arn:aws:iam::'${AWS_ACCOUNT_ID}':role/'${PROJECT}'-batch-exec",
-                    "arn:aws:iam::'${AWS_ACCOUNT_ID}':role/'${PROJECT}'-batch-job"]}]}'
-```
+`gha-ecr-push` es un IAM role con OIDC trust de GitHub + permisos minimos
+(ECR push + Terraform state RW). Lo crea **otro** modulo `cicd/` que
+podes agregar mas adelante; no es bloqueante para operar.
 
 ---
 
-## 14. Smoke test end-to-end
+## 8. Runbook
+
+### 8.1 Re-entrenar manualmente una variedad
 
 ```bash
-source .aws_ids.env
+QUEUE=$(terraform -chdir=envs/prod output -raw batch_job_queue_spot)
+DEF=$(terraform -chdir=envs/prod   output -raw batch_job_definition)
 
-# 1) Verifica que MLflow responde
-curl -sf http://${ALB_DNS}/health && echo "MLflow OK"
-
-# 2) Sube un Excel de prueba (debe disparar Lambda dispatcher por la
-#    regla S3 ObjectCreated)
-aws s3 cp data/training/DB-HISTORICA.xlsx \
-  s3://${S3_DATA_BUCKET}/incoming/$(date +%Y-%m)/POP.xlsx
-
-# 3) Verifica que Lambda fue invocado y submitio job
-sleep 10
-aws logs tail /aws/lambda/${PROJECT}-dispatcher --since 1m
-
-# 4) Sigue logs del job en Batch
-aws logs tail /aws/batch/${PROJECT} --follow
-
-# 5) Cuando termine, deberias recibir email del SNS y ver run en MLflow:
-echo "MLflow UI: http://${ALB_DNS}"
-```
-
----
-
-## 15. Operacion / runbook
-
-### Re-entrenar manualmente una variedad
-
-```bash
 aws batch submit-job \
   --job-name "manual-$(date +%s)" \
-  --job-queue ml-training-queue \
-  --job-definition ml-training \
+  --job-queue ${QUEUE} \
+  --job-definition ${DEF} \
   --container-overrides '{"command":["--varieties","JUPITER","--tuning","prod"]}'
 ```
 
-### Ver runs de MLflow
+### 8.2 Recovery: re-entrenar TODAS en un dia (loop manual)
 
 ```bash
-echo "http://${ALB_DNS}"   # abrir en navegador
+QUEUE=$(terraform -chdir=envs/prod output -raw batch_job_queue_spot)
+DEF=$(terraform -chdir=envs/prod   output -raw batch_job_definition)
+
+for VARIETY in POP JUPITER VENTURA SEKOYA ALLISON STELLA; do
+  aws batch submit-job --job-queue ${QUEUE} --job-definition ${DEF} \
+    --job-name "recovery-${VARIETY,,}-$(date +%s)" \
+    --container-overrides '{"command":["--varieties","'${VARIETY}'","--tuning","prod"]}'
+done
 ```
 
-### Cancelar un job en cola
+### 8.3 Spot vs on-demand por preset
+
+| Preset | Wallclock | P(interrupt) | Recomendacion |
+|---|---|---|---|
+| `smoke`    | ~1 min | ~0% | Spot |
+| `dev`      | ~20 min | ~1-2% | Spot |
+| `prod`     | ~1.5-2 h | ~5-10% | Spot + retry=2 |
+| `prod_xl`  | ~5-6 h | ~20-30% | **on-demand** (queue `-queue-ondemand`) |
 
 ```bash
-aws batch terminate-job --job-id <id> --reason "manual cancel"
+# Para forzar on-demand (prod_xl):
+QUEUE_OD=$(terraform -chdir=envs/prod output -raw batch_job_queue_od)
+aws batch submit-job --job-queue ${QUEUE_OD} --job-definition ${DEF} \
+  --job-name "xl-pop-$(date +%s)" \
+  --container-overrides '{"command":["--varieties","POP","--tuning","prod_xl"]}'
 ```
 
-### Rollback de imagen
+### 8.4 Rollback de imagen
 
 ```bash
-# Listar tags disponibles
-aws ecr describe-images --repository-name ${ECR_REPO} \
-  --query 'reverse(sort_by(imageDetails,& imagePushedAt))[*].[imageTags[0],imagePushedAt]' --output table
+# Listar tags
+aws ecr describe-images --repository-name ml-training \
+  --query 'reverse(sort_by(imageDetails,& imagePushedAt))[*].[imageTags[0],imagePushedAt]' \
+  --output table
 
-# Apuntar la job-def a un tag anterior
-DEF=$(aws batch describe-job-definitions --job-definition-name ${PROJECT} \
-  --status ACTIVE --query 'jobDefinitions[0]' --output json)
-echo "$DEF" | jq --arg img "${ECR_URI}:abc1234" \
-  '.containerProperties.image = $img |
-   {jobDefinitionName,type,platformCapabilities,containerProperties,retryStrategy,timeout}' \
-  > /tmp/rollback.json
-aws batch register-job-definition --cli-input-json file:///tmp/rollback.json
+# Apuntar la job-def a un tag anterior via Terraform
+cd envs/prod
+terraform apply -var="trainer_image_tag=abc1234"
 ```
 
-### Bajar todo cuando no se usa (ahorrar costos)
+### 8.5 Bajar todo (ahorrar costos)
 
 ```bash
-# MLflow Fargate -> 0
-aws ecs update-service --cluster ${PROJECT}-cluster \
-  --service ${PROJECT}-mlflow --desired-count 0
+# Opcion A: scale-to-0 sin destruir (manual)
+aws ecs update-service --cluster ml-training-cluster --service ml-training-mlflow --desired-count 0
+aws rds stop-db-instance --db-instance-identifier ml-training-mlflow
 
-# RDS -> stop (max 7 dias, despues vuelve a arrancar solo)
-aws rds stop-db-instance --db-instance-identifier ${PROJECT}-mlflow
+# Opcion B: destruir todo (idempotente)
+cd envs/prod
+terraform destroy
+# (los buckets S3 con data quedan; force_destroy_buckets=false por default)
+```
 
-# Para volver:
-aws rds start-db-instance --db-instance-identifier ${PROJECT}-mlflow
-aws ecs update-service --cluster ${PROJECT}-cluster \
-  --service ${PROJECT}-mlflow --desired-count 1
+### 8.6 Distinguir interrupcion de Spot vs fallo del codigo
+
+```bash
+aws batch list-jobs --job-queue ml-training-queue --job-status FAILED \
+  --max-results 10 --query 'jobSummaryList[*].[jobName,jobId,statusReason]' \
+  --output table
+# statusReason "Host EC2 (instance ...) terminated" -> Spot interrupt
+# statusReason con exit code != 0 -> fallo del codigo
 ```
 
 ---
 
-## 16. Adaptacion del codigo actual
+## 9. Costos estimados (mensual, region us-east-1, 1 variedad/dia)
 
-Los unicos cambios obligatorios al repo son:
+| Servicio | Recurso | Costo aprox |
+|---|---|---|
+| AWS Batch (Spot) | c6i.2xlarge × 6 jobs/mes × 1.5h | ~$1.20 |
+| AWS Batch (Spot) | overhead (provision, idle) | ~$2 |
+| ECS Fargate (MLflow) | 0.5 vCPU / 1 GB, 24/7 | ~$15 |
+| RDS Postgres | db.t4g.micro, 20 GB gp3 | ~$15 |
+| ALB | 1 ALB compartido | ~$18 |
+| NAT Gateway | 1 NAT, single-AZ | ~$32 |
+| S3 + ECR | data + artifacts + 2 repos | ~$2 |
+| CloudWatch | Logs + alarms + metrics | ~$3 |
+| Route 53 (opcional) | dominio MLflow | ~$0.50 |
+| **Total** | | **~$88/mes** |
 
-### 16.1 Nuevas env vars que el código ya respeta
-
-`src/config.py` ya lee `MLFLOW_TRACKING_URI`, `S3_ARTIFACTS_BUCKET`,
-`S3_ARTIFACTS_PREFIX`, `S3_REPORTS_PREFIX`. La job-def ya las pasa. Sin
-cambios.
-
-### 16.2 Data en S3 (acumulado -> split por variedad dentro del container)
-
-**Flujo de datos:**
-- Negocio sube SOLO `BD_HISTORICO_ACUMULADO.xlsx` al bucket data-raw.
-- El container descarga ese acumulado y corre `scripts.prepare_data.split_workbook`
-  para generar `data/training/DB-HISTORICA.xlsx` (una hoja por variedad).
-- `main.py` continúa con su lógica habitual.
-
-Esta logica YA esta aplicada en `main.py` (función `_hydrate_data_from_s3`).
-Se activa cuando las env vars `S3_DATA_BUCKET` y `S3_DATA_KEY` estan presentes
-(las inyecta el Lambda dispatcher en cada SubmitJob — ver §9). En local sin
-esas env vars el flujo es no-op y asume que ya corriste `task data:split`.
-
-Resumen del bloque clave (ya en `main.py`):
-
-```python
-from src.config import ACCUMULATED_FILE, MIN_ROWS_PER_VARIETY, TRAINING_FILE
-
-def _hydrate_data_from_s3(logger) -> bool:
-    bucket = os.environ.get("S3_DATA_BUCKET")
-    key = os.environ.get("S3_DATA_KEY")
-    if not (bucket and key):
-        return True  # local: asume que prepare_data corrio offline
-    import boto3
-    from scripts.prepare_data import split_workbook
-    ACCUMULATED_FILE.parent.mkdir(parents=True, exist_ok=True)
-    boto3.client("s3").download_file(bucket, key, str(ACCUMULATED_FILE))
-    split_workbook(
-        input_path=ACCUMULATED_FILE,
-        output_path=TRAINING_FILE,
-        min_rows=MIN_ROWS_PER_VARIETY,
-    )
-    return True
-```
-
-El Lambda dispatcher (§9) pasa esas env vars como `containerOverrides.environment`
-en cada `batch:SubmitJob`.
-
-### 16.3 (Opcional) Emitir custom metric a CloudWatch
-
-Ver §12.2.
+Optimizaciones disponibles:
+- **NAT GW** es el item mas caro. Si no necesitas que el trainer hable con
+  Internet (ya que pulla via VPC endpoints), podes eliminarlo y usar
+  endpoints de S3, ECR, Logs, Secrets — ahorras ~$32/mes.
+- **Bajar MLflow + RDS cuando no se usa** (§8.5): ahorras ~$30/mes los
+  dias sin training.
 
 ---
 
-## 17. Limpieza (al desarmar todo)
-
-```bash
-# Orden inverso al de creacion
-aws ecs update-service --cluster ${PROJECT}-cluster --service ${PROJECT}-mlflow --desired-count 0
-aws ecs delete-service --cluster ${PROJECT}-cluster --service ${PROJECT}-mlflow --force
-aws ecs delete-cluster --cluster ${PROJECT}-cluster
-aws elbv2 delete-load-balancer --load-balancer-arn ${ALB_ARN}
-aws elbv2 delete-target-group --target-group-arn ${TG_ARN}
-aws batch update-job-queue --job-queue ${PROJECT}-queue --state DISABLED
-aws batch delete-job-queue --job-queue ${PROJECT}-queue
-aws batch update-compute-environment --compute-environment ${PROJECT}-ce --state DISABLED
-aws batch delete-compute-environment --compute-environment ${PROJECT}-ce
-aws rds delete-db-instance --db-instance-identifier ${PROJECT}-mlflow --skip-final-snapshot
-aws lambda delete-function --function-name ${PROJECT}-dispatcher
-aws lambda delete-function --function-name ${PROJECT}-notifier
-aws sns delete-topic --topic-arn ${SNS_ARN}
-aws ecr delete-repository --repository-name ${ECR_REPO} --force
-aws s3 rb s3://${S3_DATA_BUCKET} --force
-aws s3 rb s3://${S3_MLFLOW_BUCKET} --force
-aws ec2 delete-nat-gateway --nat-gateway-id ${NAT_ID}
-# ... continuar con SGs, subnets, IGW, VPC
-```
-
----
-
-## 18. Checklist de implementacion
-
-- [ ] §1 Variables base + AWS CLI configurada
-- [ ] §2 VPC, subnets, NAT, security groups
-- [ ] §3 Buckets S3
-- [ ] §4 ECR + primera imagen pushed
-- [ ] §5 Secret de DB
-- [ ] §6 RDS Postgres up
-- [ ] §7 MLflow Fargate behind ALB, /health responde
-- [ ] §8 Batch compute env + queue + job-def
-- [ ] §8.4 Smoke job manual en Batch corre OK
-- [ ] §9 Lambda dispatcher
-- [ ] §10 EventBridge schedule + S3 trigger
-- [ ] §11 Lambda notifier + SNS suscrito + email confirmado
-- [ ] §12 CloudWatch alarms
-- [ ] §13 GitHub Actions OIDC + workflow
-- [ ] §14 Smoke E2E: subir Excel a S3 dispara job, llega notificacion, run aparece en MLflow
-- [ ] §16 Patches al codigo (`_hydrate_data_from_s3` + dispatcher con env vars)
-
----
-
-## 19. Decisiones por revisar en el futuro
+## 10. Decisiones a revisar en el futuro
 
 | Item | Hoy | Cuando reconsiderar |
 |---|---|---|
-| ALB publico para MLflow UI | SG restringido a tu IP | si el equipo crece > 3 personas, usar SSO via Cognito o cerrar el ALB y acceder via SSM port-forward |
-| RDS db.t4g.micro | 20 GB, 1 AZ | si tracking pasa de ~10k runs/mes |
-| Spot c6i.2xlarge | training 30-40 min/variety | si hay timeouts por interrupcion de Spot, subir `bidPercentage` o cambiar a on-demand |
-| Single-region | us-east-1 | si hay requisito de DR |
-| MLflow self-hosted | mantener compat con tu codigo | considerar SageMaker MLflow managed cuando GA en tu region |
-| CloudWatch metrics manuales | EMIT_CW_METRICS opcional | adoptar `aws-embedded-metrics` library para emitir desde logs |
-| Drift detection | no incluido | agregar Evidently/Whylogs scheduled job leyendo el aggregate.json |
+| ALB publico (HTTP) | SG abierto a 0.0.0.0/0 + sin TLS | mover a HTTPS con ACM cuando tengas dominio (Route 53) |
+| RDS db.t4g.micro single-AZ | 20 GB, sin replica | si tracking pasa de ~10k runs/mes o necesitas HA |
+| NAT Gateway single-AZ | costo: ~$32/mes | reemplazar por VPC endpoints (S3 + ECR + CW) si querés ahorrar |
+| Spot c6i.2xlarge | `prod` ~1.5-2 h, `prod_xl` ~5-6 h | escalar a `c6i.4xlarge` si necesitas `prod_xl` mas rapido |
+| EMIT_CW_METRICS=1 | activado en job-def (alarma 12.2 operativa) | adoptar `aws-embedded-metrics` library |
+| Single-region us-east-1 | sin DR | si requisito de DR, replicar state + buckets a otra region |
+| Drift detection | no incluido | agregar Evidently/Whylogs scheduled job |
+| MLflow self-hosted | mantener compat | considerar SageMaker MLflow managed cuando GA en tu region |
+
+---
+
+## 11. Apendice — checklist de implementacion
+
+- [ ] **Bootstrap** §2: bucket de state, DynamoDB lock, SLRs de Spot/Batch
+- [ ] **Build & push imagen MLflow custom** (psycopg2 + boto3) a ECR — necesaria antes del primer apply
+- [ ] **Crear repo `ml-training-infra`** con la estructura §1
+- [ ] **Llenar `terraform.tfvars`** (alert_email, mlflow_image)
+- [ ] **`terraform init`** apuntando al backend del paso 1
+- [ ] **`terraform apply`** — toma ~10-15 min la primera vez (RDS y ALB son lentos)
+- [ ] **Confirmar suscripcion email** del SNS desde el inbox
+- [ ] **Push primera imagen del trainer** a ECR (via GH Actions §7 o manual)
+- [ ] **Smoke test** §8.1 con `--tuning smoke`
+- [ ] **Subir Excel de prueba** al bucket `data/incoming/` y verificar que el dispatcher dispara un job
+- [ ] **Verificar alarmas** disparando un job que falle a proposito (`docker run` con exit 1)
