@@ -1,16 +1,29 @@
+# Logging con rotacion. Sin esto, json-file crece sin bound y puede
+# llenar disco en runs largos (Postgres + MLflow son los peores ofensores).
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
 services:
   postgres:
     image: postgres:15-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_DB: mlflow
       POSTGRES_USER: mlflow
-      POSTGRES_PASSWORD: mlflow
+      # Password via .env (no hardcoded). Default sano para local; en cualquier
+      # entorno compartido, override en .env con un secret real.
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mlflow}
     volumes:
       - pg-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U mlflow"]
+      # `-d mlflow` valida que la DB tambien este lista (no solo el server).
+      test: ["CMD-SHELL", "pg_isready -U mlflow -d mlflow"]
       interval: 5s
       retries: 10
+    logging: *default-logging
 
   mlflow:
     # Imagen custom: ghcr.io/mlflow/mlflow:v3.12.0 + psycopg2-binary (driver
@@ -21,6 +34,7 @@ services:
     build:
       context: .
       dockerfile: docker/mlflow/Dockerfile
+    restart: unless-stopped
     depends_on:
       postgres: { condition: service_healthy }
     environment:
@@ -31,6 +45,7 @@ services:
       AWS_CONFIG_FILE: /aws/config
       AWS_PROFILE: ${AWS_PROFILE:-default}
       AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mlflow}
     volumes:
       # Montar ~/.aws del host como :ro adentro del container.
       # En Windows docker compose expande ~ a %USERPROFILE%.
@@ -44,30 +59,46 @@ services:
     # envia el header con puerto (`mlflow:5000`), asi que hay que listar
     # `mlflow:*` (igual que el default interno hace con `localhost:*`).
     command: >
-      mlflow server
+      sh -c "mlflow server
       --host 0.0.0.0 --port 5000
       --allowed-hosts mlflow,mlflow:*,localhost,localhost:*,127.0.0.1,127.0.0.1:*
-      --backend-store-uri postgresql://mlflow:mlflow@postgres:5432/mlflow
-      --default-artifact-root s3://${S3_MLFLOW_BUCKET:?Set S3_MLFLOW_BUCKET in .env}/artifacts
+      --backend-store-uri postgresql://mlflow:$${POSTGRES_PASSWORD}@postgres:5432/mlflow
+      --default-artifact-root s3://${S3_MLFLOW_BUCKET:?Set S3_MLFLOW_BUCKET in .env}/artifacts"
+    healthcheck:
+      # MLflow 3.x expone /health (200 OK cuando el server esta listo para
+      # aceptar requests). Sin esto, el trainer puede arrancar antes y los
+      # primeros runs fallan con Connection refused.
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:5000/health',timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
     ports:
-      - "5000:5000"
+      # Bind a loopback: evita exponer MLflow a la red local del host
+      # (relevante en VMs corporativas / WSL con bridge).
+      - "127.0.0.1:5000:5000"
+    logging: *default-logging
 
   reports:
     # Sirve reports/ y artifacts/ del host como HTTP estatico (autoindex on).
     # Local: http://localhost:8080/reports/  http://localhost:8080/artifacts/
     # Produccion: mismo patron pero con Caddy/ALB+CloudFront sobre S3.
-    image: nginx:alpine
+    image: nginx:1.27-alpine
+    restart: unless-stopped
     volumes:
       - ./reports:/usr/share/nginx/html/reports:ro
       - ./artifacts:/usr/share/nginx/html/artifacts:ro
       - ./docker/nginx-reports.conf:/etc/nginx/conf.d/default.conf:ro
     ports:
-      - "8080:80"
+      - "127.0.0.1:8080:80"
+    logging: *default-logging
 
   trainer:
     build: .
     depends_on:
-      mlflow: { condition: service_started }
+      # service_healthy (no service_started): el trainer NO arranca hasta que
+      # /health de mlflow responda 200. Evita race condition en primer run.
+      mlflow: { condition: service_healthy }
     environment:
       MLFLOW_TRACKING_URI: http://mlflow:5000
       # Mismas creds que mlflow: leemos del ~/.aws del host (montado abajo).
@@ -87,7 +118,12 @@ services:
       - ./logs:/app/logs             # pipeline_run.log + business_audit.jsonl + variety_*.log
       - ./artifacts:/app/artifacts   # joblib + run_summary + best_params por (variety, model)
       - ./reports:/app/reports       # dashboards HTML / Excel exports
+    # Limites para que un OOM en sklearn/lightgbm no tire el host (laptop o VM).
+    # Override con TRAINER_MEM/TRAINER_CPUS en .env si tu maquina tiene otro perfil.
+    mem_limit: ${TRAINER_MEM:-8g}
+    cpus: ${TRAINER_CPUS:-4}
     command: ["--varieties", "${VARIETIES:-POP}", "--tuning", "${TUNING:-smoke}"]
+    logging: *default-logging
 
 volumes:
   pg-data:

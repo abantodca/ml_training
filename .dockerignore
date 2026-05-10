@@ -22,6 +22,14 @@ __pycache__/
 *.py[cod]
 *.pyo
 
+# Tests y caches de tooling (no van a la imagen de runtime)
+tests/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
 # Entornos virtuales
 .venv/
 venv/

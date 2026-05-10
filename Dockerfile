@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1.7
-ARG PYTHON_VERSION=3.13-slim
+# Pin a minor + variant para reproducibilidad. Para builds 100% deterministicos
+# en CI, sustituir por digest: `python:3.13.1-slim-bookworm@sha256:<digest>`.
+ARG PYTHON_VERSION=3.13.1-slim-bookworm
 
 # ============================================================
 # Stage 1: builder — compila wheels con build deps
@@ -32,7 +34,7 @@ ARG BUILD_DATE=unknown
 ARG VERSION=dev
 LABEL org.opencontainers.image.title="ml-training" \
     org.opencontainers.image.description="Random Forest training pipeline" \
-    org.opencontainers.image.source="https://github.com/<tu-org>/ml_training" \
+    org.opencontainers.image.source="https://github.com/abantodca/ml_training" \
     org.opencontainers.image.revision="${GIT_SHA}" \
     org.opencontainers.image.created="${BUILD_DATE}" \
     org.opencontainers.image.version="${VERSION}"
@@ -74,6 +76,9 @@ RUN mkdir -p data/training logs artifacts reports \
     && chown -R mluser:mluser ${APP_HOME}
 
 USER mluser
+
+# Explicito para auditores: tini reenvia SIGTERM al python child.
+STOPSIGNAL SIGTERM
 
 # tini propaga SIGTERM correctamente cuando Batch mata el job
 ENTRYPOINT ["/usr/bin/tini", "--", "python", "main.py"]
