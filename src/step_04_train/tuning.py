@@ -213,27 +213,50 @@ def _build_cv_splitters(
     inner_folds: int,
     random_state: int,
 ):
-    """Construye outer/inner CV con stratification adaptativa.
+    """Construye outer/inner CV. Outer puede ser stratified o temporal.
 
-    Devuelve `(outer_cv, inner_cv, strat_label, strat_strategy)`. Si la
-    variedad no soporta stratification (1 FUNDO + 1 FORMATO o columnas
-    ausentes), `strat_label` es None y el caller cae a `KFold` normal.
+    Devuelve `(outer_cv, inner_cv, strat_label, strat_strategy)`.
 
-    `min_count`: tras el outer split, el train fold contiene ~N*(outer-1)/outer
-    miembros de cada clase. El inner StratifiedKFold necesita >= inner_folds
-    en cada clase, asi que el minimo seguro a nivel de dataset completo es
-    `ceil(inner * outer / (outer-1))`. Se toma el max con `outer_folds` para
-    no quedar por debajo del requisito del propio outer.
+    Outer strategy controlada por `CV_OUTER_STRATEGY` (env / config):
+        - "stratified" (default): StratifiedKFold por FUNDO_FORMATO con
+          fallback adaptativo a FUNDO -> FORMATO -> KFold.
+        - "temporal_year": TemporalYearSplit (expanding window por ANIO).
+          Resuelve drift severo: el modelo NO ve futuro en train. Necesita
+          columna ANIO o DATE_COLUMN en X.
+
+    Inner siempre stratified (dentro del outer fold el riesgo temporal ya
+    se mitigo; el inner Optuna se beneficia del balance por estrato).
     """
     import math
+    from src.config import CV_OUTER_STRATEGY, TEMPORAL_CV_MIN_TRAIN_YEARS
+
     strat_min_count = max(
         outer_folds,
         math.ceil(inner_folds * outer_folds / max(outer_folds - 1, 1)),
     )
     strat_label, strat_strategy = _build_strat_label(X, min_count=strat_min_count)
-    splitter_cls = StratifiedKFold if strat_label is not None else KFold
-    outer_cv = splitter_cls(n_splits=outer_folds, shuffle=True, random_state=random_state)
-    inner_cv = splitter_cls(n_splits=inner_folds, shuffle=True, random_state=random_state)
+
+    # Outer
+    if CV_OUTER_STRATEGY == "temporal_year":
+        from src.step_04_train.temporal_cv import TemporalYearSplit
+        outer_cv = TemporalYearSplit(
+            year_col="ANIO",
+            n_splits=outer_folds,
+            min_train_years=TEMPORAL_CV_MIN_TRAIN_YEARS,
+        )
+    else:
+        outer_splitter_cls = StratifiedKFold if strat_label is not None else KFold
+        outer_cv = outer_splitter_cls(
+            n_splits=outer_folds, shuffle=True, random_state=random_state,
+        )
+
+    # Inner: siempre stratified (cuando hay strat_label) — el outer fold
+    # contiene multiples anios mezclados, el balance por FUNDO_FORMATO
+    # estabiliza la inner CV de Optuna.
+    inner_splitter_cls = StratifiedKFold if strat_label is not None else KFold
+    inner_cv = inner_splitter_cls(
+        n_splits=inner_folds, shuffle=True, random_state=random_state,
+    )
     return outer_cv, inner_cv, strat_label, strat_strategy
 
 

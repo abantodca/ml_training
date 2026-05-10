@@ -20,6 +20,7 @@ from __future__ import annotations
 from datetime import datetime
 from html import escape
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -30,7 +31,7 @@ from src.diagnostics.html_renderer import (
     fig_to_html_div,
     format_pvalue,
     render_badge,
-    renderrender_test_row,
+    render_test_row,
 )
 from src.diagnostics.plots import _style
 from src.diagnostics.statistical_tests import (
@@ -124,8 +125,13 @@ def render_residual_report(
     model_type: str,
     y_true: np.ndarray,
     y_pred: np.ndarray,
+    run_id: Optional[str] = None,
 ) -> str:
-    """Construye el HTML del residual diagnostic report."""
+    """Construye el HTML del residual diagnostic report.
+
+    `run_id`: si se provee, agrega un link al run de MLflow en el header.
+    Trazabilidad cuando el HTML se comparte fuera del filesystem (S3, mail).
+    """
     y_true = np.asarray(y_true, dtype=float)
     y_pred = np.asarray(y_pred, dtype=float)
     residuals = y_true - y_pred
@@ -200,15 +206,25 @@ def render_residual_report(
     mae = float(np.mean(np.abs(residuals)))
     bias = float(np.mean(residuals))
 
-    plotly_cdn = (
-        '<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>'
-    )
+    # Reusa el tag canonico del proyecto (offline vs CDN segun config).
+    from src.step_05_evaluate.html.styles import _PLOTLY_JS_TAG as plotly_cdn
+
+    # Run identification para trazabilidad MLflow.
+    run_meta = ""
+    if run_id:
+        run_id_short = run_id[:12]
+        run_meta = (
+            f' &middot; <a href="http://localhost:5000/#/experiments/0/runs/{escape(run_id)}" '
+            f'target="_blank" style="color:#dbeafe;text-decoration:underline;'
+            f'font-family:monospace;font-size:11px;" '
+            f'title="Abrir en MLflow UI">run {escape(run_id_short)} &#x2197;</a>'
+        )
 
     body = f"""
     <div class="container">
       <header class="hero">
         <h1>Residual diagnostics — {escape(variety)} / {escape(model_type)}</h1>
-        <div class="meta">{n:,} OOF predictions · MAE={mae:.4f} · RMSE={rmse:.4f} · bias={bias:+.4f}</div>
+        <div class="meta">{n:,} OOF predictions · MAE={mae:.4f} · RMSE={rmse:.4f} · bias={bias:+.4f}{run_meta}</div>
       </header>
 
       <section class="card">
@@ -258,11 +274,12 @@ def write_residual_report(
     y_true: np.ndarray,
     y_pred: np.ndarray,
     out_path: Path,
+    run_id: Optional[str] = None,
 ) -> Path:
     """Renderiza y persiste el HTML. Devuelve out_path."""
     html = render_residual_report(
         variety=variety, model_type=model_type,
-        y_true=y_true, y_pred=y_pred,
+        y_true=y_true, y_pred=y_pred, run_id=run_id,
     )
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(html, encoding="utf-8")

@@ -52,6 +52,14 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
         Si la columna no existe, no se generan derivadas temporales.
     add_year : bool
         Agrega columna `ANIO` (entero) para capturar deriva temporal.
+    add_fundo_formato_interaction : bool
+        Si FUNDO y FORMATO estan ambos en categorical_cols, agrega dummies
+        para la combinacion FUNDO__FORMATO. Default False (legacy LGB v3
+        baseline). Activar via flag ENABLE_FUNDO_FORMATO_INTERACTION para
+        ablation. Justificacion: EDA POP mostro Cramer's V vs target = 0.29
+        (FUNDO) y 0.23 (FORMATO), V(FUNDO,FORMATO)=0.26 (no redundancia).
+        Riesgo: el arbol PUEDE aprender la interaccion solo via 2 splits
+        sucesivos -> agregar dummies puede solo diluir importancia.
     """
 
     def __init__(
@@ -59,10 +67,12 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
         categorical_cols: Optional[List[str]] = None,
         date_col: Optional[str] = None,
         add_year: bool = True,
+        add_fundo_formato_interaction: bool = False,
     ):
         self.categorical_cols = categorical_cols
         self.date_col = date_col
         self.add_year = add_year
+        self.add_fundo_formato_interaction = add_fundo_formato_interaction
 
     # ------------------------------------------------------------------
     # Helpers
@@ -171,6 +181,12 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
         return out
 
     @staticmethod
+    def _safe_ratio(num: np.ndarray, den: np.ndarray) -> np.ndarray:
+        """num/den con den<=0 -> NaN. Suprime warnings de divide-by-zero."""
+        with np.errstate(divide="ignore", invalid="ignore"):
+            return np.where(den > 0, num / den, np.nan)
+
+    @staticmethod
     def _structural_ratios(X: pd.DataFrame, names: List[str]) -> pd.DataFrame:
         out = pd.DataFrame(index=X.index)
         if "KG_TOTAL" in names:
@@ -178,13 +194,13 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
         if "INDUS_KG_HA" in names:
             out["INDUS_KG_HA"] = (X["%INDUS"].astype(float) * X["KG/HA"].astype(float))
         if "KG_PER_BAYA" in names:
+            num = X["KG/HA"].astype(float).to_numpy()
             den = X["P/BAYA"].astype(float).to_numpy()
-            num = X["KG/HA"].astype(float).to_numpy()
-            out["KG_PER_BAYA"] = np.where(den > 0, num / np.where(den > 0, den, 1.0), np.nan)
+            out["KG_PER_BAYA"] = FeatureGenerator._safe_ratio(num, den)
         if "KG_HA_PER_DPC" in names:
-            den = X["DPC"].astype(float).to_numpy()
             num = X["KG/HA"].astype(float).to_numpy()
-            out["KG_HA_PER_DPC"] = np.where(den > 0, num / np.where(den > 0, den, 1.0), np.nan)
+            den = X["DPC"].astype(float).to_numpy()
+            out["KG_HA_PER_DPC"] = FeatureGenerator._safe_ratio(num, den)
         return out
 
     @staticmethod
@@ -261,6 +277,20 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
             c: sorted(map(str, X[c].dropna().unique().tolist())) for c in cat_cols
         }
 
+        # Interaccion FUNDO_FORMATO: solo si ambos estan presentes y la flag
+        # esta activa. Memorizamos las combinaciones VISTAS en train (no el
+        # producto cartesiano) para evitar dummies constantes. Combinaciones
+        # nuevas en transform caen a la dummy "OTROS" (todas en 0).
+        self.ff_categories_: List[str] = []
+        if (
+            self.add_fundo_formato_interaction
+            and "FUNDO" in cat_cols and "FORMATO" in cat_cols
+        ):
+            ff = (
+                X["FUNDO"].astype(str) + "__" + X["FORMATO"].astype(str)
+            ).dropna()
+            self.ff_categories_ = sorted(ff.unique().tolist())
+
         # Columnas que pasan tal cual: numericas (todo lo demas)
         passthrough = [
             c for c in X.columns if c not in cat_cols and c != date_col
@@ -316,12 +346,16 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
         dummy_cols = [
             f"{c}__{cat}" for c in cat_cols for cat in self.categories_[c]
         ]
+        ff_dummy_cols = [
+            f"FUNDO_FORMATO__{cat}" for cat in self.ff_categories_
+        ]
         self.feature_names_out_ = (
             passthrough
             + self.structural_feature_names_
             + self.skew_feature_names_
             + self.date_feature_names_
             + dummy_cols
+            + ff_dummy_cols
         )
         return self
 
@@ -354,6 +388,22 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
                     dummies[col_name] = 0
             keep = [f"{c}__{cat}" for cat in self.categories_[c]]
             dummy_frames.append(dummies[keep].astype(int))
+
+        # Interaccion FUNDO_FORMATO: dummies solo de combinaciones vistas en
+        # fit. Combinaciones nuevas en inference caen al sentinel implicito
+        # (todas las dummies en 0).
+        ff_categories = getattr(self, "ff_categories_", [])
+        if ff_categories and "FUNDO" in X.columns and "FORMATO" in X.columns:
+            ff_series = X["FUNDO"].astype(str) + "__" + X["FORMATO"].astype(str)
+            ff_dummies = pd.get_dummies(
+                ff_series, prefix="FUNDO_FORMATO", prefix_sep="__",
+            )
+            for cat in ff_categories:
+                col_name = f"FUNDO_FORMATO__{cat}"
+                if col_name not in ff_dummies.columns:
+                    ff_dummies[col_name] = 0
+            keep_ff = [f"FUNDO_FORMATO__{cat}" for cat in ff_categories]
+            dummy_frames.append(ff_dummies[keep_ff].astype(int))
 
         out = pd.concat(
             [passthrough_part, structural_part, skew_part, date_part, *dummy_frames],

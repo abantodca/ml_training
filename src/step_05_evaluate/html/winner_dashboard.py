@@ -53,11 +53,23 @@ def render_winner_dashboard(
     output_dir: Optional[Path] = None,
     excel_path: Optional[str] = None,
     X_raw: Optional[pd.DataFrame] = None,
+    run_label: Optional[str] = None,
 ) -> Path:
-    """Genera `reports/Winner_{variety}.html` y devuelve la ruta."""
+    """Genera `reports/Winner_{variety}_{run_label}.html` y devuelve la ruta.
+
+    `run_label` es un identificador estable del run usado en el filename
+    (recomendado: timestamp `YYYY-MM-DD_HH-MM-SS`, con segundos para evitar
+    colisiones cuando dos runs corren en el mismo minuto, ej. smoke tests).
+    Acumular un Winner por run permite revisar el historico desde el
+    dashboard global. Si `run_label` es None, cae al patron viejo
+    `Winner_{variety}.html` (sobrescribe).
+    """
     out_dir = Path(output_dir) if output_dir else REPORTS_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / f"Winner_{variety}.html"
+    if run_label:
+        out_path = out_dir / f"Winner_{variety}_{run_label}.html"
+    else:
+        out_path = out_dir / f"Winner_{variety}.html"
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
 
     kit = build_winner_kit(variety=variety, champion=champion, X_raw=X_raw)
@@ -112,6 +124,31 @@ def render_winner_dashboard(
         X_aligned=kit.X_aligned, abs_errors=kit.abs_err, real=kit.real,
     )
 
+    # Run identification para trazabilidad: run_id MLflow truncado + link al
+    # tracking server. Permite ir del HTML al run de MLflow sin buscar manual.
+    run_id = champion.mlflow_run_id or ""
+    run_id_short = run_id[:12] if run_id else ""
+    mlflow_link = (
+        f'<a href="http://localhost:5000/#/experiments/0/runs/{escape(run_id)}" '
+        f'style="color:#93c5fd;text-decoration:none;font-family:monospace;" '
+        f'target="_blank" title="Abrir en MLflow UI">'
+        f'run {escape(run_id_short)} &#x2197;</a>'
+    ) if run_id else '<span style="opacity:.4;">run sin id</span>'
+
+    nav_back = f"""
+        <nav style="background:#0f172a;color:#e2e8f0;padding:8px 16px;
+                    font:13px/1 'Inter',system-ui,sans-serif;
+                    display:flex;justify-content:space-between;align-items:center;
+                    gap:16px;">
+          <a href="./index.html" style="color:#93c5fd;text-decoration:none;">
+            &#x21A9; Reports Dashboard
+          </a>
+          <div style="display:flex;gap:16px;align-items:center;font-size:11px;">
+            <span style="opacity:.6;">{escape(variety)} &middot; {escape(champion.model_type.upper())}</span>
+            {mlflow_link}
+          </div>
+        </nav>
+    """
     html = f"""<!doctype html>
         <html lang="es"><head><meta charset="utf-8">
         <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -119,6 +156,7 @@ def render_winner_dashboard(
         {_PLOTLY_JS_TAG}
         <style>{DASHBOARD_CSS}</style></head>
         <body>
+        {nav_back}
         <div class="wrap">
         {hero}
         {context_html}

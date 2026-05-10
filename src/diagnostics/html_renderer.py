@@ -17,7 +17,7 @@ from __future__ import annotations
 from datetime import datetime
 from html import escape
 from pathlib import Path
-from typing import Iterable, List
+from typing import Iterable, List, Optional
 
 import plotly.graph_objects as go
 
@@ -161,21 +161,52 @@ def render_test_row(test) -> str:
     )
 
 
-# Backward-compat aliases (deprecadas, usar las publicas).
-# Removerlas cuando todos los callers migren.
-_CSS = BASE_CSS
-_badge = render_badge
-_fig_to_html = fig_to_html_div
-_format_p = format_pvalue
-_test_row = render_test_row
+def _eda_history_links(variety: str, current_path: Path | None = None,
+                        max_links: int = 5) -> str:
+    """Lista los EDAs anteriores de la misma variedad (excluye el actual).
+
+    Util para comparar drift entre EDAs sin abrir el directorio. Devuelve
+    HTML inline con timestamps clicables al pie del header. Si no hay
+    historicos (o solo el actual), devuelve cadena vacia.
+    """
+    from src.config import REPORTS_DIR
+    if not REPORTS_DIR.exists():
+        return ""
+    candidates = sorted(
+        REPORTS_DIR.glob(f"EDA_{variety}_*.html"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if current_path is not None:
+        candidates = [c for c in candidates if c.name != Path(current_path).name]
+    if not candidates:
+        return ""
+    items = []
+    for p in candidates[:max_links]:
+        # Extrae timestamp del filename si tiene patron EDA_<v>_<ts>.html
+        ts_part = p.stem.replace(f"EDA_{variety}_", "")
+        items.append(
+            f'<a href="{escape(p.name)}" '
+            f'style="color:#dbeafe;text-decoration:underline;font-size:11px;'
+            f'margin-right:10px;font-family:monospace;">{escape(ts_part)}</a>'
+        )
+    return (
+        '<div style="margin-top:10px;font-size:11px;opacity:.85;">'
+        '<span style="opacity:.7;">EDAs anteriores:</span> '
+        + "".join(items) +
+        '</div>'
+    )
 
 
-def _hero(variety: str, n_rows: int, n_cols: int) -> str:
+def _hero(variety: str, n_rows: int, n_cols: int,
+          current_path: Path | None = None) -> str:
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    history_html = _eda_history_links(variety, current_path)
     return f"""
     <header class="hero">
       <h1>EDA Diagnostico — {escape(variety)}</h1>
       <div class="meta">{n_rows:,} filas × {n_cols} columnas raw · generado {ts}</div>
+      {history_html}
     </header>
     """
 
@@ -265,6 +296,110 @@ def _temporal_card(profile, fig_acf: go.Figure, idx: int) -> str:
     """
 
 
+def _categorical_section(report) -> str:
+    """Seccion de variables categoricas: cardinality, top, target stats, V."""
+    if not report or not report.profiles:
+        return ""
+
+    cards = []
+    for p in report.profiles:
+        # Top categorias table
+        rows = []
+        for tc in p.top_categories:
+            tmean = (
+                f"{tc.target_mean:.2f}" if tc.target_mean is not None else "—"
+            )
+            tstd = (
+                f"{tc.target_std:.2f}" if tc.target_std is not None else "—"
+            )
+            rows.append(
+                f"<tr><td>{escape(tc.value)}</td>"
+                f"<td class='num'>{tc.count:,}</td>"
+                f"<td class='num'>{tc.pct:.1%}</td>"
+                f"<td class='num'>{tc.cum_pct:.1%}</td>"
+                f"<td class='num'>{tmean}</td>"
+                f"<td class='num'>{tstd}</td></tr>"
+            )
+        top_table = (
+            f"<table class='summary'>"
+            f"<thead><tr>"
+            f"<th>Categoria</th><th class='num'>n</th>"
+            f"<th class='num'>%</th><th class='num'>cum%</th>"
+            f"<th class='num'>target μ</th><th class='num'>target σ</th>"
+            f"</tr></thead>"
+            f"<tbody>{''.join(rows)}</tbody></table>"
+        )
+
+        # Stats line
+        v_str = (
+            f"V={p.cramers_v_target:.2f}" if p.cramers_v_target is not None
+            else "V=—"
+        )
+        chi2_str = (
+            f"χ²={p.chi2_statistic:.1f}, p={format_pvalue(p.chi2_p_value)}"
+            if p.chi2_statistic is not None else "χ²=—"
+        )
+        stats_line = (
+            f"<span><b>n</b>={p.n:,}</span>"
+            f"<span><b>miss</b>={p.miss_ratio:.1%}</span>"
+            f"<span><b>cardinality</b>={p.cardinality:,}</span>"
+            f"<span><b>singletons</b>={p.n_singletons}</span>"
+            f"<span><b>cobertura top10</b>={p.coverage_top10_pct:.1%}</span>"
+            f"<span><b>{v_str}</b></span>"
+            f"<span>{chi2_str}</span>"
+        )
+
+        # Recomendacion badge
+        rec_kind = "warn" if (
+            "agrupar" in p.target_encoding_recommendation
+            or "drop" in p.target_encoding_recommendation
+        ) else "info"
+        rec_badge = render_badge(
+            "FE: " + p.target_encoding_recommendation, rec_kind,
+        )
+
+        cards.append(
+            f'<div class="var-card">'
+            f'<div class="var-name">{escape(p.name)}</div>'
+            f'<div class="var-stats">{stats_line}</div>'
+            f'<div>{rec_badge}</div>'
+            f'<h3>Top {len(p.top_categories)} categorias (vs target)</h3>'
+            f'{top_table}'
+            f'</div>'
+        )
+
+    # Asociaciones entre categoricas
+    assoc_html = ""
+    if report.associations:
+        rows = "".join(
+            f"<tr><td>{escape(a.feature_a)}</td><td>{escape(a.feature_b)}</td>"
+            f"<td class='num'>{a.cramers_v:.3f}</td>"
+            f"<td class='num'>{format_pvalue(a.chi2_p_value)}</td>"
+            f"<td>{render_badge(a.severity, 'danger' if a.severity=='high' else 'warn' if a.severity=='watch' else 'ok')}</td></tr>"
+            for a in report.associations
+        )
+        assoc_html = f"""
+        <h3>Asociaciones entre categoricas (Cramer's V)</h3>
+        <p style="font-size:11px; color:var(--gray-500); margin:0 0 8px;">
+          V &lt; 0.10 sin asociacion · 0.10-0.30 debil/moderada · &gt; 0.30 fuerte
+          (candidatas a redundancia).
+        </p>
+        <table class="summary">
+          <thead><tr><th>A</th><th>B</th><th class='num'>V</th>
+                 <th class='num'>p</th><th>Severidad</th></tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+        """
+
+    return f"""
+    <section class="card">
+      <h2>3-bis. Variables categoricas (frecuencia + asociacion con target)</h2>
+      {''.join(cards)}
+      {assoc_html}
+    </section>
+    """
+
+
 def _findings_section(findings: List[tuple]) -> str:
     """Lista de hallazgos top. `findings` = [(severity, message), ...]"""
     if not findings:
@@ -295,6 +430,8 @@ def render_eda_html(
     mi_fig: go.Figure,
     psi_fig: go.Figure,
     high_corr_pairs: List[tuple],
+    categorical_report=None,
+    out_path: Optional[Path] = None,
 ) -> str:
     """Construye el HTML completo y lo devuelve como string."""
     # Var cards
@@ -321,13 +458,12 @@ def render_eda_html(
         </table>
         """
 
-    plotly_cdn = (
-        '<script src="https://cdn.plot.ly/plotly-2.35.2.min.js" charset="utf-8"></script>'
-    )
+    # Reusa el tag canonico (offline vs CDN segun config) para tamaño consistente.
+    from src.step_05_evaluate.html.styles import _PLOTLY_JS_TAG as plotly_cdn
 
     body = f"""
     <div class="container">
-      {_hero(variety, n_rows, n_cols)}
+      {_hero(variety, n_rows, n_cols, current_path=out_path)}
       {_findings_section(findings)}
       {_data_quality_section(quality_metrics)}
 
@@ -340,6 +476,8 @@ def render_eda_html(
         <h2>3. Analisis temporal (autocorrelacion + estacionariedad + STL)</h2>
         {''.join(temporal_cards) or '<p>sin perfil temporal disponible</p>'}
       </section>
+
+      {_categorical_section(categorical_report)}
 
       <section class="card">
         <h2>4. Multivariado</h2>

@@ -131,46 +131,34 @@ def validate_dataset(
     df: pd.DataFrame,
     *,
     required_columns: Optional[List[str]] = None,
-    strict: bool = True,
 ) -> List[str]:
     """Corre todos los chequeos de schema. Devuelve lista de issues encontrados.
 
     Args
     ----
     df : DataFrame post-parseo Excel y pre-Pipeline.
-    required_columns : si se da, valida presencia. Si falta alguna, raise.
-    strict : True (default) -> raise SchemaError ante issues criticos.
-             False -> solo logea warnings y devuelve la lista.
+    required_columns : si se da, valida presencia. Si falta alguna, raise
+        SchemaError (este es el unico chequeo blocking).
 
-    Issues criticos = columnas faltantes, dtypes irrecuperables, duplicados.
-    Issues blandos (rangos, varianza cero) = solo warnings, se permiten en
-    strict porque pueden ser legitimos en datasets nuevos.
+    El resto (dtypes, rangos, duplicados, varianza cero) son warnings: se
+    loguean y devuelven en la lista, pero no abortan el pipeline. Los
+    sintomas reales aparecen en el modelo (training fallido, MAPE alto).
     """
     if required_columns:
         missing = _check_required_columns(df, required_columns)
         if missing:
             raise SchemaError(f"Columnas requeridas faltantes: {missing}")
 
-    critical: List[str] = []
-    soft: List[str] = []
-
-    soft.extend(_check_dtypes(df))
-    soft.extend(_check_numeric_ranges(df))
+    issues: List[str] = []
+    issues.extend(_check_dtypes(df))
+    issues.extend(_check_numeric_ranges(df))
     # Filas exactamente duplicadas: warning (sobre-pesan al training pero
     # no lo corrompen). Duplicados en (FUNDO+FORMATO+FECHA) NO se
     # chequean: son cosechas distintas legitimas el mismo dia.
-    soft.extend(_check_full_row_duplicates(df))
-    soft.extend(_check_zero_variance(df))
+    issues.extend(_check_full_row_duplicates(df))
+    issues.extend(_check_zero_variance(df))
 
-    for issue in critical:
-        logger.error(f"[schema/CRITICAL] {issue}")
-    for issue in soft:
-        logger.warning(f"[schema/soft] {issue}")
+    for issue in issues:
+        logger.warning(f"[schema] {issue}")
 
-    if strict and critical:
-        raise SchemaError(
-            f"Validacion fallo con {len(critical)} issue(s) critico(s): "
-            f"{critical[0]}"
-        )
-
-    return critical + soft
+    return issues

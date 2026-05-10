@@ -6,19 +6,26 @@ Soporta dos metodos:
 
 `factor` queda como hiperparametro tuneable desde Optuna.
 
-Granularidad opcional por GRUPO (e.g. FUNDO):
-    Si `group_col` se setea, aprende limites SEPARADOS por grupo. Util cuando
-    fundos / segmentos tienen escalas estructuralmente distintas (un fundo
-    rinde 8-15 KG/HA, otro 2-5 KG/HA): el cap global cortaria reales del
-    fundo bueno o no tocaria outliers reales del fundo bajo.
+Granularidad por GRUPO (cascade):
+    `group_col` acepta str o List[str]. Lista = cascade jerarquica:
 
-    Grupos con n < `min_group_size` caen al cap GLOBAL (insuficiente data
-    para estimar IQR confiable). Grupos no vistos en fit (categoria nueva
-    en transform) tambien caen al global.
+        group_col=["FUNDO", "FORMATO"]
+        -> intenta bounds (FUNDO, FORMATO) [mas especifico]
+        -> fallback a bounds por FUNDO solo
+        -> fallback a bounds globales
+
+    Esto resuelve el sesgo cuando UN grupo domina el dataset: en POP, el 86%
+    es FORMATO=GRANEL y 72% FUNDO=A9; los bounds globales / por-FUNDO solo
+    los reflejan a ellos. Cap por (FUNDO, FORMATO) cierra grupos chicos
+    (CLAMSHELL 11 OZ con target μ=2.54) sin contaminar con la cola de
+    GRANEL+A9 (target μ=5.35).
+
+    Grupos con n < `min_group_size` caen al siguiente nivel del cascade
+    (insuficiente data para IQR confiable).
 """
 from __future__ import annotations
 
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -44,14 +51,15 @@ class OutlierCapper(BaseEstimator, TransformerMixin):
         Percentiles para method='percentile' (default 0.01 / 0.99).
     numeric_cols : list[str] | None
         Columnas a procesar; si None usa `config.NUMERIC_FEATURES`.
-    group_col : str | None
-        Si se provee (e.g. 'FUNDO'), aprende limites por grupo. Grupos con
-        n < min_group_size caen al limite global. Default None = comportamiento
-        legacy (cap unico global).
+    group_col : str | List[str] | None
+        - str (e.g. 'FUNDO'): bounds por valor de esa columna, fallback global.
+        - List[str] (e.g. ['FUNDO', 'FORMATO']): cascade jerarquica (mas
+          especifico primero, luego prefijos cada vez mas cortos, luego global).
+        - None: cap global unico (legacy).
     min_group_size : int
-        Tamano minimo de grupo para usar limites por-grupo. Si n<umbral, ese
-        grupo cae al limite global. 30 es default empirico: bajo de 30 obs
-        el IQR es muy ruidoso.
+        Tamano minimo de grupo para usar bounds de ese nivel. Si n<umbral,
+        ese estrato cae al siguiente nivel del cascade (grupo mas grande
+        o global). 30 default empirico: bajo de 30 obs el IQR es muy ruidoso.
     """
 
     def __init__(
@@ -61,7 +69,7 @@ class OutlierCapper(BaseEstimator, TransformerMixin):
         lower_q: float = 0.01,
         upper_q: float = 0.99,
         numeric_cols: Optional[List[str]] = None,
-        group_col: Optional[str] = None,
+        group_col: Optional[Union[str, List[str]]] = None,
         min_group_size: int = 30,
     ):
         self.factor = factor
@@ -89,6 +97,24 @@ class OutlierCapper(BaseEstimator, TransformerMixin):
             upper = X[cols].quantile(self.upper_q)
         return {"lower": lower.to_dict(), "upper": upper.to_dict()}
 
+    @staticmethod
+    def _composite_keys(X: pd.DataFrame, cols: List[str]) -> pd.Series:
+        """Concatena las cols con '__' como key composite (str)."""
+        if len(cols) == 1:
+            return X[cols[0]].astype(str)
+        return X[cols].astype(str).agg("__".join, axis=1)
+
+    def _normalize_group_col(self, X: pd.DataFrame) -> List[str]:
+        """Devuelve lista de columnas validas (presentes en X). Acepta
+        str / list / None.
+        """
+        if self.group_col is None:
+            return []
+        if isinstance(self.group_col, str):
+            return [self.group_col] if self.group_col in X.columns else []
+        # Lista/tuple: filtra a las que existen, preservando orden
+        return [c for c in self.group_col if c in X.columns]
+
     def fit(self, X: pd.DataFrame, y=None) -> "OutlierCapper":
         if self.method not in _VALID_METHODS:
             raise ValueError(
@@ -98,55 +124,103 @@ class OutlierCapper(BaseEstimator, TransformerMixin):
         cols = self._resolve_cols(X)
         self.numeric_cols_ = cols
 
-        # Limites GLOBALES (siempre se calculan, sirven de fallback aun cuando
-        # group_col esta seteado). Bound legacy.
+        # Bounds GLOBALES (siempre, fallback final del cascade).
         global_bounds = self._compute_bounds(X, cols)
         self.lower_ = global_bounds["lower"]
         self.upper_ = global_bounds["upper"]
 
-        # Limites POR GRUPO si group_col aplica.
-        self.group_col_: Optional[str] = (
-            self.group_col if self.group_col and self.group_col in X.columns else None
-        )
-        self.group_lower_: Dict[str, Dict[str, float]] = {}
-        self.group_upper_: Dict[str, Dict[str, float]] = {}
-        self.small_groups_: List[str] = []  # informativo, para debug
+        # Cascade: lista de niveles ordenados de mas especifico a menos.
+        # Para group_col=['FUNDO','FORMATO']: niveles = [['FUNDO','FORMATO'],
+        # ['FUNDO']]. Cada nivel guarda bounds por su key composite.
+        self.group_cols_ = self._normalize_group_col(X)
+        self.cascade_: List[Tuple[List[str], Dict[str, Dict[str, float]],
+                                  Dict[str, Dict[str, float]]]] = []
+        self.small_groups_: Dict[str, List[str]] = {}  # informativo, debug
 
-        if self.group_col_ is not None:
-            for grp_val, X_grp in X.groupby(self.group_col_, sort=False):
-                if len(X_grp) < self.min_group_size:
-                    # Marca para fallback global; no calculamos bounds.
-                    self.small_groups_.append(str(grp_val))
-                    continue
-                bnd = self._compute_bounds(X_grp, cols)
-                self.group_lower_[str(grp_val)] = bnd["lower"]
-                self.group_upper_[str(grp_val)] = bnd["upper"]
+        if self.group_cols_:
+            # Niveles: [primeros n], [primeros n-1], ..., [primeros 1]
+            for n_level in range(len(self.group_cols_), 0, -1):
+                level_cols = self.group_cols_[:n_level]
+                level_label = "_".join(level_cols)
+                level_lower: Dict[str, Dict[str, float]] = {}
+                level_upper: Dict[str, Dict[str, float]] = {}
+                small: List[str] = []
+                keys = self._composite_keys(X, level_cols)
+                for k, X_grp in X.groupby(keys, sort=False):
+                    if len(X_grp) < self.min_group_size:
+                        small.append(str(k))
+                        continue
+                    bnd = self._compute_bounds(X_grp, cols)
+                    level_lower[str(k)] = bnd["lower"]
+                    level_upper[str(k)] = bnd["upper"]
+                self.cascade_.append((level_cols, level_lower, level_upper))
+                if small:
+                    self.small_groups_[level_label] = small
+
+        # Aliases backward-compat para callers / tests que leen los antiguos.
+        # Reflejan el nivel mas especifico del cascade (si existe).
+        if self.cascade_:
+            self.group_col_: Optional[str] = "_".join(self.group_cols_)
+            self.group_lower_ = self.cascade_[0][1]
+            self.group_upper_ = self.cascade_[0][2]
+        else:
+            self.group_col_ = None
+            self.group_lower_ = {}
+            self.group_upper_ = {}
         return self
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
         X = X.copy()
 
-        if self.group_col_ is None or not self.group_lower_:
-            # Path legacy (sin grupos o todos los grupos eran chicos).
+        # Path legacy: sin cascade -> cap global (fila a fila igual para todos).
+        if not self.cascade_:
             for c in self.numeric_cols_:
                 X[c] = np.clip(X[c].astype(float), self.lower_[c], self.upper_[c])
             return X
 
-        # Path por grupos: itera por grupo (cada uno O(1) lookups en dicts) y
-        # aplica np.clip vectorizado a TODAS las filas de ese grupo en una
-        # sola operacion. O(n_groups * n_cols) operaciones bulk numpy en vez
-        # del lambda map.row-a-row anterior, que era ~100x mas lento.
-        # Grupos no vistos en fit caen al cap GLOBAL.
-        group_keys = X[self.group_col_].astype(str)
-        for grp_val, grp_idx in group_keys.groupby(group_keys, sort=False).groups.items():
-            grp_lower = self.group_lower_.get(str(grp_val), self.lower_)
-            grp_upper = self.group_upper_.get(str(grp_val), self.upper_)
-            for c in self.numeric_cols_:
-                X.loc[grp_idx, c] = np.clip(
-                    X.loc[grp_idx, c].astype(float),
-                    grp_lower[c],
-                    grp_upper[c],
-                )
+        # Path cascade: para cada fila buscar el nivel mas especifico que
+        # tenga bounds; las que no matchean en NINGUN nivel caen al global.
+        # Trabajamos en arrays POSICIONALES (np) para evitar overhead de
+        # .loc / index alignment cuando el dataset es grande.
+        n = len(X)
+        # Inicializar bounds posicionales con los GLOBALES (fallback).
+        pos_lower = {
+            c: np.full(n, self.lower_[c], dtype=float) for c in self.numeric_cols_
+        }
+        pos_upper = {
+            c: np.full(n, self.upper_[c], dtype=float) for c in self.numeric_cols_
+        }
+        matched = np.zeros(n, dtype=bool)
+
+        # Recorre cascade del mas especifico al menos. Filas ya 'matched' en
+        # un nivel anterior NO se sobreescriben por niveles menos especificos.
+        for level_cols, level_lower, level_upper in self.cascade_:
+            if matched.all():
+                break
+            keys = self._composite_keys(X, level_cols).reset_index(drop=True)
+            # `.indices` retorna dict[key, ndarray-posicional] directamente:
+            # mas eficiente que `.groups.items()` (que daria pd.Index requiriendo
+            # conversion a posicional con np.asarray).
+            for k, idx in keys.groupby(keys, sort=False).indices.items():
+                k_str = str(k)
+                if k_str not in level_lower:
+                    continue
+                grp_mask = np.zeros(n, dtype=bool)
+                grp_mask[idx] = True
+                apply_mask = grp_mask & ~matched
+                if not apply_mask.any():
+                    continue
+                lower = level_lower[k_str]
+                upper = level_upper[k_str]
+                for c in self.numeric_cols_:
+                    pos_lower[c][apply_mask] = lower[c]
+                    pos_upper[c][apply_mask] = upper[c]
+                matched |= apply_mask
+
+        # Aplicar el clip vectorizado por columna.
+        for c in self.numeric_cols_:
+            col_vals = X[c].astype(float).to_numpy()
+            X[c] = np.clip(col_vals, pos_lower[c], pos_upper[c])
         return X
 
     def get_feature_names_out(self, input_features=None):

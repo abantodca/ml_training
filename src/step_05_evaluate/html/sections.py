@@ -618,8 +618,9 @@ def build_diagnostic_links_section(
             f'<a class="diag-link" href="{escape(latest_eda)}" target="_blank">'
             f'<div class="diag-icon">📊</div>'
             f'<div class="diag-meta">'
-            f'<div class="diag-title">EDA Diagnostico (data raw)</div>'
-            f'<div class="diag-sub">Distribuciones · ACF/PACF · BP/White · VIF · MI · drift PSI</div>'
+            f'<div class="diag-title">EDA — Analisis del dataset</div>'
+            f'<div class="diag-sub">Forma de las variables · ciclos temporales · '
+            f'colinealidad · informacion vs target · cambios entre años</div>'
             f'</div></a>'
         )
     if residual_candidates:
@@ -630,8 +631,9 @@ def build_diagnostic_links_section(
                 f'<a class="diag-link" href="{escape(r.name)}" target="_blank">'
                 f'<div class="diag-icon">🔬</div>'
                 f'<div class="diag-meta">'
-                f'<div class="diag-title">Residual diagnostics — {escape(label)}</div>'
-                f'<div class="diag-sub">DW · Ljung-Box · BP/White · QQ · resid vs pred</div>'
+                f'<div class="diag-title">Diagnostico de errores — {escape(label)}</div>'
+                f'<div class="diag-sub">¿El error se distribuye uniforme? '
+                f'¿Quedan patrones temporales? ¿Es normal o hay sesgo?</div>'
                 f'</div></a>'
             )
 

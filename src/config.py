@@ -239,6 +239,67 @@ INNER_CV_FOLDS: int = TUNING_PROFILES[DEFAULT_TUNING]["inner_folds"]
 OOF_ENSEMBLE_K: int = 5
 
 # ---------------------------------------------------------------------------
+# Feature flags para ABLATION (env-var driven, default = legacy)
+# ---------------------------------------------------------------------------
+# Cada cambio del plan FE 2026-05-09 se activa selectivamente. Default
+# todos OFF -> comportamiento equivalente al modelo LGB v3 (MAPE_oof
+# 14.86%, gap 0.138) baseline. Activar uno a uno (smoke train ~1min) y
+# comparar MAPE_oof + gap para ver cual aporta.
+#
+# Ejemplo:
+#   docker compose run --rm \
+#     -e ENABLE_OUTLIER_CASCADE_FF=1 \
+#     -e CV_OUTER_STRATEGY=temporal_year \
+#     trainer --varieties POP --tuning smoke
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    """Lee bool de env var: '1', 'true', 'yes' (case-insensitive) -> True."""
+    val = os.environ.get(name, "").strip().lower()
+    if not val:
+        return default
+    return val in ("1", "true", "yes", "on")
+
+
+# A — OutlierCapper: bounds por (FUNDO, FORMATO) con cascade fallback.
+#     Justificacion: 86% del data es FORMATO=GRANEL y 72% FUNDO=A9; bounds
+#     globales o solo-por-FUNDO los reflejan a ellos y cortaban grupos
+#     chicos (CLAMSHELL 11 OZ con target μ=2.54 vs 5.35 GRANEL).
+#     False (default) = group_col="FUNDO" legacy.
+ENABLE_OUTLIER_CASCADE_FF: bool = _env_bool("ENABLE_OUTLIER_CASCADE_FF", False)
+
+# D — Lags simples shift(1)/shift(2) + diff(1) por (FUNDO, FORMATO).
+#     Justificacion: PACF de POP muestra lag 1=0.50, lag 2=0.33 (los mas
+#     fuertes). Las rolling medians 7/14/30/90 ya existentes pueden
+#     suavizar esa senal puntual.
+#     Riesgo: alta correlacion con KG_JR_H_lag_FF_7 -> ruido.
+ENABLE_SIMPLE_LAGS: bool = _env_bool("ENABLE_SIMPLE_LAGS", False)
+
+# F — FUNDO_FORMATO interaction como dummies (15-18 cols).
+#     Validado en prod_xl POP (2026-05-09) vs LGB v3 baseline:
+#       - gap promedio mejora -0.011 (-8%): 0.138 -> 0.127.
+#       - MAE_test marginal +0.004 (dentro del std=0.016, ruido).
+#       - biz_MAPE_oof marginal +0.07pp (ruido vs baseline 14.86%).
+#       - std gap +0.021 (mas inestable, fold 4 outlier con gap=0.225).
+#     Cambio default OFF -> ON: el gap MEJORA real (8%) justifica el cambio
+#     a pesar de la mayor varianza. La interaccion FUNDO_FORMATO es senal
+#     legitima (V=0.26 vs target). Se mantiene como flag por si alguna
+#     variedad futura no se beneficie (V<0.10 -> override con env=0).
+ENABLE_FUNDO_FORMATO_INTERACTION: bool = _env_bool(
+    "ENABLE_FUNDO_FORMATO_INTERACTION", True,
+)
+
+# G — CV outer strategy.
+#   "stratified"     : StratifiedKFold por FUNDO_FORMATO (legacy, default).
+#   "temporal_year"  : TemporalYearSplit expanding-window por ANIO.
+#     Justificacion: drift severo (PSI hasta 2.09) entre anios consecutivos
+#     hace que stratified mezcle train/test del futuro -> MAE_test
+#     artificialmente bajo. Temporal mide error real bajo drift.
+# Inner CV siempre stratified (Optuna trial scope: equilibrio por estrato).
+CV_OUTER_STRATEGY: str = os.environ.get("CV_OUTER_STRATEGY", "stratified")
+TEMPORAL_CV_MIN_TRAIN_YEARS: int = int(os.environ.get("TEMPORAL_CV_MIN_TRAIN_YEARS", "2"))
+
+# ---------------------------------------------------------------------------
 # MLflow
 # ---------------------------------------------------------------------------
 # El proyecto SIEMPRE corre contra un MLflow server (Postgres backend +
@@ -347,7 +408,10 @@ REPORT_R2_AMBER_THRESHOLD: float = 0.70
 REPORT_MAE_AMBER_RATIO: float = 2.0
 
 # Modo de carga de plotly.js en el HTML:
-#   True  = embebido inline (+~4.5 MB al HTML, autocontenido, funciona sin internet)
-#   False = CDN script (HTML ~1MB pero requiere internet para renderizar charts)
-# Override desde env: REPORT_PLOTLY_OFFLINE=0 (CDN) o =1 (embebido).
-REPORT_PLOTLY_OFFLINE: bool = os.environ.get("REPORT_PLOTLY_OFFLINE", "1") != "0"
+#   False = CDN (default) — HTML ~4MB Winner, ~1.5MB EDA. Requiere internet para renderizar charts.
+#   True  = embebido inline (+~4.5MB al HTML, autocontenido, funciona offline).
+# Override desde env: REPORT_PLOTLY_OFFLINE=1 (embebido) o =0 (CDN).
+# Default cambiado a CDN (2026-05-09): los reports se sirven via nginx local
+# o S3 web hosting; ambos casos tienen internet. Para casos offline (email,
+# archivo en avion) setear `REPORT_PLOTLY_OFFLINE=1` en ese run especifico.
+REPORT_PLOTLY_OFFLINE: bool = os.environ.get("REPORT_PLOTLY_OFFLINE", "0") != "0"

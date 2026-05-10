@@ -189,17 +189,23 @@ def train_variety(
             y_full = None
             business_full = None
 
+        # `run_label` con segundos para evitar colision si dos runs corren en
+        # el mismo minuto (smoke tests <60s). Comparte el sufijo entre
+        # Winner_<variety>_<run_label>.html y .xlsx para ligar visualmente
+        # ambos artefactos del mismo training.
+        run_label = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
         # ---- Excel del CAMPEON aplicado a la data real ----
-        # Una sola Excel por variedad, en reports/ junto al HTML.
         winner_excel_path = _export_winner_excel(
             champion=champion,
             variety=variety,
             logger=logger,
             X_raw=X_full,
             business_cols=business_full,
+            run_label=run_label,
         )
 
-        # ---- Dashboard ejecutivo unico (Winner_{variety}.html) ----
+        # ---- Dashboard ejecutivo por-run (Winner_{variety}_{run_label}.html) ----
         if X_full is not None:
             try:
                 winner_path = render_winner_dashboard(
@@ -209,10 +215,12 @@ def train_variety(
                     decision=champion_decision,
                     excel_path=winner_excel_path,
                     X_raw=X_full,
+                    run_label=run_label,
                 )
                 winner_report_path = str(winner_path)
                 logger.info(f"[{variety}] Winner dashboard: {winner_path}")
-                # Limpieza de residuales: deja solo el Winner_{variety}.html (+ xlsx)
+                # Limpia obsoletos (reporte_*, business_export_*) pero mantiene
+                # Winners por-run y residuals: el index global los lista todos.
                 keep = [winner_path]
                 if winner_excel_path:
                     keep.append(winner_excel_path)
@@ -242,6 +250,19 @@ def train_variety(
                 logger,
                 winner_report_path=winner_report_path,
             )
+
+        # Regenera el dashboard global (`reports/index.html`) DESPUES del
+        # register MLflow para que el sidebar liste el Winner recien
+        # generado y la pill 'Latest' apunte a el. En modo paralelo (varias
+        # variedades simultaneas) hay race condition al reescribir el mismo
+        # archivo: aceptable porque ambos procesos escanean reports/ y el
+        # ultimo en escribir ve todos los archivos. Try/except para no
+        # abortar la variedad si write_dashboard falla.
+        try:
+            from src.diagnostics.dashboard_index import write_dashboard
+            write_dashboard(REPORTS_DIR)
+        except Exception:
+            logger.exception(f"[{variety}] no se pudo regenerar reports/index.html")
 
         # Mensaje final UNICO con champion + registry + comando UI. Sale solo
         # aqui (no por cada modelo en single_run) porque hasta ahora el champion
@@ -320,13 +341,15 @@ def _export_winner_excel(
     *,
     X_raw,
     business_cols,
+    run_label: Optional[str] = None,
 ) -> Optional[str]:
     """Genera el Excel multi-hoja del CAMPEON aplicado a la data real.
 
     Recibe (X_raw, business_cols) ya cargados por el caller (train_variety)
     para evitar releer el Excel multiples veces. El archivo se escribe en
-    `reports/` con nombre deterministico (`Winner_{variety}.xlsx`) para que
-    el HTML pueda enlazarlo via path relativo.
+    `reports/` con nombre `Winner_{variety}_{run_label}.xlsx` (acumula uno
+    por run); si `run_label` es None cae al patron viejo
+    `Winner_{variety}.xlsx` (sobrescribe).
 
     Devuelve la ruta como string, o None si los inputs son None / faltan
     columnas KG/JR / H-EF o si la prediccion fallo.
@@ -351,6 +374,10 @@ def _export_winner_excel(
         logger.exception(f"[{variety}] no se pudo cargar pipeline del campeon")
         return None
 
+    excel_filename = (
+        f"Winner_{variety}_{run_label}.xlsx" if run_label
+        else f"Winner_{variety}.xlsx"
+    )
     excel_path = export_business_excel(
         variety=variety,
         model_type=champion.model_type,
@@ -361,7 +388,7 @@ def _export_winner_excel(
         business_validation=bv,
         nested_metrics=champion.metrics,
         output_dir=REPORTS_DIR,
-        filename=f"Winner_{variety}.xlsx",
+        filename=excel_filename,
     )
     if excel_path is None:
         logger.warning(
@@ -417,6 +444,24 @@ def _tag_champion(
             "champion_oof_mape",
             f"{champion.oof_mape:.4f}",
         )
+
+        # Tags de drift/EDA: si existe un EDA sidecar reciente, capturamos el
+        # peor PSI y count de severidad para que MLflow UI muestre cuando el
+        # data drift se vuelve critico run-tras-run sin abrir HTMLs manualmente.
+        try:
+            from src.diagnostics.eda import (
+                extract_drift_summary,
+                find_latest_eda_sidecar,
+            )
+            sidecar = find_latest_eda_sidecar(variety)
+            if sidecar is not None:
+                for k, v in extract_drift_summary(sidecar).items():
+                    if v:  # skip empty strings
+                        client.set_tag(champion.mlflow_run_id, k, v)
+                logger.info(f"[{variety}] Drift tags MLflow desde {sidecar.name}")
+        except Exception:
+            logger.exception(f"[{variety}] no se pudo taggear drift (no critico)")
+
         for r in results:
             # r.mlflow_run_id puede estar vacio si el run fue eliminado por
             # ser loser (cleanup post-quality-gate). En ese caso skip:

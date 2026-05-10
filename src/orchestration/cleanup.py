@@ -38,21 +38,24 @@ def cleanup_state(logger, label: str) -> None:
 def cleanup_residual_reports(
     *, variety: str, keep: Iterable[Path | str], reports_dir: Optional[Path] = None,
 ) -> List[Path]:
-    """Borra HTML/Excel residuales de la variedad que no esten en `keep`.
+    """Borra artefactos OBSOLETOS de la variedad que no esten en `keep`.
 
-    Cada re-corrida genera `Winner_{variety}.html` + `.xlsx`. Esta funcion
-    barre `reports/` y elimina cualquier otro artefacto vinculado a la
-    variedad que no este en la lista `keep`. Asi reports/ queda limpio
-    con un solo par de archivos por variedad.
+    Solo limpia patrones legacy que ya no se generan (`reporte_*`,
+    `business_export_*`). Los `Winner_{variety}_*.html` y `.xlsx` se
+    ACUMULAN intencionalmente (uno por run) para que el dashboard global
+    `reports/index.html` muestre el historial completo de trainings; el
+    sidebar agrupado por variedad mantiene la lista navegable.
+
+    Si en el futuro hace falta retencion por antiguedad, agregar un
+    parametro `max_age_days` o `keep_last_n` aqui en vez de re-incluir
+    Winner en los patterns.
     """
     rdir = Path(reports_dir) if reports_dir else REPORTS_DIR
     keep_set = {Path(p).resolve() for p in keep}
     deleted: List[Path] = []
     patterns = [
         f"reporte_{variety}_*.html",
-        f"Winner_{variety}*.html",
         f"business_export_{variety}_*.xlsx",
-        f"Winner_{variety}*.xlsx",
     ]
     for pat in patterns:
         for f in rdir.glob(pat):

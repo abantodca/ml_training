@@ -331,6 +331,7 @@ def train_model(
                 variety=variety, model_type=model_type,
                 y_true=oof["y_true"], y_pred=oof["y_pred"],
                 out_path=residual_html,
+                run_id=run.info.run_id,
             )
             log_artifact(str(residual_html), artifact_path="residuals")
             log.info(f"Residual diagnostics: {residual_html.name}")

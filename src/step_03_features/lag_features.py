@@ -60,7 +60,7 @@ import numpy as np
 import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 
-from src.config import DATE_COLUMN, TARGET
+from src.config import DATE_COLUMN, ENABLE_SIMPLE_LAGS, TARGET
 
 logger = logging.getLogger(__name__)
 
@@ -273,6 +273,39 @@ def _slope_of_window(arr: np.ndarray) -> float:
     return float((x_centered * (y - y.mean())).sum() / denom)
 
 
+def _compute_simple_lags_and_diff(df_work: pd.DataFrame) -> list[str]:
+    """Lags simples shift(1), shift(2) + diff(1) del target por (FUNDO, FORMATO).
+
+    Complementan los rolling medians (que suavizan): PACF de POP muestra
+    lag 1=0.50, lag 2=0.33 — los rolling 7d aplastan esa senal puntual.
+    Diff(1) = shift(1) - shift(2): captura direccion del cambio entre las
+    dos ultimas obs del FF. CV-safe por construccion (todo via shift, no
+    usa valor actual del target).
+
+    Bajos costos: 3 columnas (vs 24+ del rolling). Cold-start: NaN se
+    rellena al final con sentinel -1.
+    """
+    new_cols: list[str] = []
+    df_sorted = df_work.sort_values(["FUNDO", "FORMATO", DATE_COLUMN])
+    grouped_target = df_sorted.groupby(["FUNDO", "FORMATO"], sort=False)[TARGET]
+
+    # shift(1) y shift(2) del target por FF (ordenado por FECHA).
+    shift_1 = grouped_target.transform(lambda s: s.shift(1))
+    shift_2 = grouped_target.transform(lambda s: s.shift(2))
+
+    for k, series in [(1, shift_1), (2, shift_2)]:
+        name = f"KG_JR_H_lag_FF_simple_{k}"
+        df_work.loc[df_sorted.index, name] = series
+        new_cols.append(name)
+
+    # diff(1) en lo previo (no usa target actual).
+    diff_name = "KG_JR_H_diff_1_FF"
+    df_work.loc[df_sorted.index, diff_name] = (shift_1 - shift_2).values
+    new_cols.append(diff_name)
+
+    return new_cols
+
+
 def _compute_seasonal_lags(df_work: pd.DataFrame) -> list[str]:
     """Lag estacional (mismo periodo del ano anterior, ventana +/-15d).
 
@@ -384,6 +417,8 @@ def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
     df_work = df.copy()
     new_cols: list[str] = []
     new_cols.extend(_compute_rolling_lags(df_work))
+    if ENABLE_SIMPLE_LAGS:
+        new_cols.extend(_compute_simple_lags_and_diff(df_work))
     seasonal_cols = _compute_seasonal_lags(df_work)
     new_cols.extend(seasonal_cols)
     new_cols.extend(_compute_volatility_and_momentum_lags(df_work))
@@ -414,12 +449,21 @@ def add_lag_features(df: pd.DataFrame) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # Sklearn transformer wrapper
 # ---------------------------------------------------------------------------
-LAG_OUTPUT_COLUMNS: List[str] = [
-    f"{vname}_lag_{alias}_{w}"
-    for alias, _ in GROUP_DEFS
-    for vname in ("KG_JR_H", "KG_HA")
-    for w in WINDOWS
-] + [
+LAG_OUTPUT_COLUMNS: List[str] = (
+    [
+        f"{vname}_lag_{alias}_{w}"
+        for alias, _ in GROUP_DEFS
+        for vname in ("KG_JR_H", "KG_HA")
+        for w in WINDOWS
+    ]
+    + (
+        # Solo se exponen los simple lags si el flag esta activo: con OFF
+        # el pipeline reproduce exactamente el output del LGB v3 baseline
+        # (75 cols antes de FUNDO_FORMATO interaction).
+        ["KG_JR_H_lag_FF_simple_1", "KG_JR_H_lag_FF_simple_2", "KG_JR_H_diff_1_FF"]
+        if ENABLE_SIMPLE_LAGS else []
+    )
+    + [
     "KG_JR_H_lag_FF_seasonal",
     "KG_HA_lag_FF_seasonal",
     f"KG_HA_std_FF_{STD_WINDOW}",
@@ -431,7 +475,8 @@ LAG_OUTPUT_COLUMNS: List[str] = [
     "delta_KG_JR_H_30_90",
     "KG_HA_REL_GLOBAL_30",
     "KG_HA_REL_FORMATO_30",
-]
+    ]
+)
 
 # Columnas raw que el transformer necesita para hacer su trabajo. El resto
 # de columnas de X pasan tal cual al output.

@@ -25,7 +25,7 @@ import argparse
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import pandas as pd
 
@@ -36,6 +36,10 @@ from src.config import (
     REPORTS_DIR,
     TARGET,
     init_dirs,
+)
+from src.diagnostics.categorical import (
+    CategoricalReport,
+    build_categorical_report,
 )
 from src.diagnostics.distributions import VariableProfile, profile_all_numeric
 from src.diagnostics.html_renderer import render_eda_html, write_eda_html
@@ -63,6 +67,142 @@ from src.diagnostics.temporal import (
 from src.step_01_load.data_loader import load_data
 
 logger = logging.getLogger(__name__)
+
+
+def _write_eda_sidecar(
+    path: Path,
+    *,
+    variety: str,
+    quality: dict,
+    var_profiles,
+    target_temporal,
+    corr,
+    vif_results,
+    mi_results,
+    drift_reports,
+    cat_report,
+    findings,
+) -> None:
+    """Emite JSON con todos los stats crudos del EDA.
+
+    Pensado para que el feature engineering posterior consuma datos reales
+    (skew, missing %, lags significativos, Cramer's V por categorica, etc)
+    sin parsear el HTML. Convierte dataclasses con `asdict`; numpy arrays /
+    Series se convierten a listas / floats Python primitivos.
+    """
+    import json
+    from dataclasses import asdict
+
+    def _safe(obj):
+        # Recursivo: maneja dataclasses, dicts, lists, np types y pandas
+        try:
+            import numpy as np  # local import
+        except Exception:
+            np = None  # type: ignore[assignment]
+        if obj is None:
+            return None
+        if hasattr(obj, "__dataclass_fields__"):
+            return {k: _safe(v) for k, v in asdict(obj).items()}
+        if isinstance(obj, dict):
+            # JSON solo soporta keys string/int/float/bool/None: tuples (ej.
+            # DriftReport.psi_values con (year_a, year_b)) se serializan como
+            # "year_a-year_b". Aplicamos lo mismo a otros tipos no triviales.
+            def _safe_key(k):
+                if isinstance(k, tuple):
+                    return "-".join(str(_safe(x)) for x in k)
+                if isinstance(k, (str, int, float, bool)) or k is None:
+                    return k
+                return str(k)
+            return {_safe_key(k): _safe(v) for k, v in obj.items()}
+        if isinstance(obj, (list, tuple)):
+            return [_safe(v) for v in obj]
+        if np is not None:
+            if isinstance(obj, (np.floating,)):
+                v = float(obj)
+                return None if (v != v or v in (float("inf"), float("-inf"))) else v
+            if isinstance(obj, (np.integer,)):
+                return int(obj)
+            if isinstance(obj, np.ndarray):
+                return _safe(obj.tolist())
+        if isinstance(obj, float):
+            return None if (obj != obj or obj in (float("inf"), float("-inf"))) else obj
+        return obj
+
+    payload = {
+        "variety": variety,
+        "generated_at": datetime.now().isoformat(timespec="seconds"),
+        "quality": _safe(quality),
+        "numeric_profiles": [_safe(p) for p in var_profiles],
+        "target_temporal": _safe(target_temporal),
+        "categorical": _safe(cat_report) if cat_report is not None else None,
+        "multivariate": {
+            "correlation_method": corr.method,
+            "high_corr_pairs": [
+                {"a": a, "b": b, "r": float(r)} for a, b, r in corr.high_pairs
+            ],
+            "vif": [_safe(v) for v in vif_results],
+            "mutual_info": [_safe(m) for m in mi_results],
+        },
+        "drift": [_safe(d) for d in drift_reports],
+        "findings": [{"severity": s, "message": m} for s, m in findings],
+    }
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False, default=str),
+        encoding="utf-8",
+    )
+
+
+def find_latest_eda_sidecar(variety: str, reports_dir: Optional[Path] = None) -> Optional[Path]:
+    """Devuelve el path del JSON sidecar mas reciente para una variedad.
+
+    Busca en `reports/EDA_<variety>_<ts>.json`. None si no hay ninguno.
+    El sidecar tiene drift PSI, findings, stats que MLflow puede tagear.
+    """
+    rdir = Path(reports_dir) if reports_dir else REPORTS_DIR
+    if not rdir.exists():
+        return None
+    candidates = sorted(
+        rdir.glob(f"EDA_{variety}_*.json"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def extract_drift_summary(sidecar_path: Path) -> dict:
+    """Lee el JSON sidecar y resume drift + findings para tags MLflow.
+
+    Devuelve dict con (todos string para que MLflow lo acepte):
+      drift_psi_max         : float "X.XX" — peor PSI entre anios.
+      drift_severe_count    : int "N" — vars con PSI>0.25.
+      drift_severe_vars     : str "var1,var2" — nombres separados por coma.
+      eda_findings_high     : int — cantidad de findings severity=high.
+      eda_generated_at      : timestamp del EDA.
+      eda_n_rows            : int del dataset al momento del EDA.
+    """
+    import json
+    try:
+        data = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+    drift = data.get("drift", []) or []
+    severe = [d for d in drift if d.get("drift_severity") == "severo"]
+    max_psi = max((d.get("max_psi", 0) or 0) for d in drift) if drift else 0.0
+
+    findings = data.get("findings", []) or []
+    n_high = sum(1 for f in findings if f.get("severity") == "high")
+
+    quality = data.get("quality", {}) or {}
+
+    return {
+        "drift_psi_max": f"{max_psi:.4f}",
+        "drift_severe_count": str(len(severe)),
+        "drift_severe_vars": ",".join(d["variable"] for d in severe),
+        "eda_findings_high": str(n_high),
+        "eda_generated_at": str(data.get("generated_at", "")),
+        "eda_n_rows": str(quality.get("n_rows", "")),
+    }
 
 
 def _quality_metrics(df: pd.DataFrame) -> dict:
@@ -248,6 +388,16 @@ def run_eda(variety: str, out_dir: Path | None = None,
     vif_results = compute_vif(numeric_only)
     mi_results = compute_mutual_information(numeric_only, df[TARGET])
 
+    # ---- 5-bis. Categoricas (FORMATO, FUNDO, ...) ----
+    cat_cols = [c for c in CATEGORICAL_FEATURES if c in df.columns]
+    cat_report: Optional[CategoricalReport] = None
+    if cat_cols:
+        logger.info(
+            f"[EDA/{variety}] categoricas sobre {len(cat_cols)} columnas: "
+            f"{cat_cols}..."
+        )
+        cat_report = build_categorical_report(df, cat_cols, df[TARGET], top_n=15)
+
     # ---- 6. Drift por anio ----
     logger.info(f"[EDA/{variety}] drift entre anios...")
     drift_reports = [
@@ -279,10 +429,28 @@ def run_eda(variety: str, out_dir: Path | None = None,
         mi_fig=mi_bars(mi_results),
         psi_fig=psi_heatmap(drift_reports),
         high_corr_pairs=corr.high_pairs,
+        categorical_report=cat_report,
+        out_path=out_path,
     )
 
     write_eda_html(html, out_path)
     logger.info(f"[EDA/{variety}] HTML generado: {out_path}")
+
+    # ---- 8-bis. JSON sidecar con stats crudos ----
+    # Sirve para que el feature engineering / LLM lea datos reales sin
+    # parsear HTML. Mismo basename que el HTML, extension .json.
+    json_path = out_path.with_suffix(".json")
+    _write_eda_sidecar(
+        json_path,
+        variety=variety,
+        quality=quality,
+        var_profiles=var_profiles,
+        target_temporal=target_temporal,
+        corr=corr, vif_results=vif_results, mi_results=mi_results,
+        drift_reports=drift_reports, cat_report=cat_report,
+        findings=findings,
+    )
+    logger.info(f"[EDA/{variety}] JSON sidecar: {json_path}")
 
     # ---- 9. MLflow artifact si hay run activo ----
     if log_to_mlflow:
