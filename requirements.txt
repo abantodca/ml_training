@@ -21,3 +21,11 @@ boto3>=1.38,<2
 # matrix de splines (bs(x, df=N)). Son C-extensions chicas, instalan rapido.
 statsmodels>=0.14.4,<0.15
 patsy==1.0.1
+
+# Cosechador feature builder (scripts/build_cosechador_features.py).
+# Polars escala mejor que pandas con >1M filas (groupby/rolling vectorizado).
+# fastexcel = backend rapido de pl.read_excel via calamine.
+# xlsxwriter = backend de pl.DataFrame.write_excel (solo --make-sample).
+polars>=1.0,<2
+fastexcel>=0.10
+xlsxwriter>=3.2
