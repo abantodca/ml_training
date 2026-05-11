@@ -173,20 +173,19 @@ def train_variety(
                 logger.info(
                     f"[{variety}] Eliminados {deleted_count}/{len(losers)} run(s) "
                     f"no campeon de MLflow (en .trash, recuperables): "
-                    f"{[l.model_type for l in losers]}"
+                    f"{[lo.model_type for lo in losers]}"
                 )
 
         # Cargar (X, y, business_cols) UNA sola vez. Antes se recargaba 2-3
         # veces (Excel + Dashboard + render). single_run las libera al
         # terminar; el costo aqui es leer 1 hoja del Excel (~10k filas).
         try:
-            X_full, y_full, business_full = _load_variety_inputs(variety)
+            X_full, _, business_full = _load_variety_inputs(variety)
         except Exception:
             logger.exception(
                 f"[{variety}] no se pudo recargar data para outputs ejecutivos"
             )
             X_full = None
-            y_full = None
             business_full = None
 
         # `run_label` con segundos para evitar colision si dos runs corren en
@@ -282,8 +281,8 @@ def train_variety(
         )
         logger.info(f"[{variety}] {registry_line}")
         logger.info(
-            f"[{variety}] Para ver en MLflow UI: task mlflow:ui "
-            "(luego http://localhost:5000)"
+            f"[{variety}] MLflow UI: http://localhost:5000 "
+            "(local: `task up`; AWS: ALB del modulo mlflow)"
         )
         logger.info("=" * 78)
 

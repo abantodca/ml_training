@@ -167,14 +167,16 @@ def build_resumen_df(
     mae_kgh = float(nested_metrics.get("nested_cv_mae_mean", float("nan")))
 
     def _state_r2(v):
-        if v != v: return "—"
+        if v != v:
+            return "—"
         return (
             "VERDE" if v >= REPORT_R2_TARGET
             else ("AMARILLO" if v >= REPORT_R2_AMBER_THRESHOLD else "ROJO")
         )
 
     def _state_mae(v):
-        if v != v: return "—"
+        if v != v:
+            return "—"
         return (
             "VERDE" if v <= REPORT_MAE_TARGET
             else (

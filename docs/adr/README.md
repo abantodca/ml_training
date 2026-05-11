@@ -21,6 +21,9 @@ opciones evaluadas y la decisión tomada. Sigue el formato de
 | ADR-004 | EDA standalone como módulo separado del pipeline | Accepted |
 | ADR-005 | Residual diagnostics en cada training run | Accepted |
 | ADR-006 | Validación A/B del pipeline post-EDA | Proposed |
+| ADR-007 | Mono-repo para trainer + Terraform (no separar a `ml-training-infra/`) | Accepted |
+| ADR-008 | CI/CD sin job de tests hasta que exista `tests/` | Accepted |
+| ADR-009 | Image signing (cosign) omitido por ahora | Accepted |
 
 ## Cómo agregar una ADR nueva
 

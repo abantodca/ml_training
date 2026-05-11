@@ -205,9 +205,6 @@ def _build_grouping_options(
             return
         try:
             if fixed is not None:
-                edges = [-np.inf] + [e for e, _ in fixed] + [np.inf]
-                lbls = [lbl for _, lbl in fixed] + [fixed[-1][1]]
-                # use cut with edges (last bin label is reused for >max)
                 edges_cut = [-np.inf] + [e for e, _ in fixed[:-1]] + [np.inf]
                 lbls_cut = [lbl for _, lbl in fixed]
                 bins = pd.cut(s, bins=edges_cut, labels=lbls_cut, include_lowest=True)

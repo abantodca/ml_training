@@ -6,9 +6,10 @@ Cualquier modulo debe leer constantes desde aqui en vez de hardcodearlas.
 Backend MLflow:
     El proyecto SIEMPRE usa un MLflow server (Postgres + S3 detras).
     En local lo sirve `docker compose up` (servicio mlflow en :5000,
-    backend Postgres + LocalStack S3). En produccion apuntas la misma
-    env var `MLFLOW_TRACKING_URI` a tu server real (Fargate / EC2).
-    No hay backend file://mlruns ni sqlite local.
+    backend Postgres + S3 real parametrizado via S3_MLFLOW_BUCKET).
+    En produccion apuntas la misma env var `MLFLOW_TRACKING_URI` a tu
+    server real (ECS Fargate detras de ALB). No hay backend file://mlruns
+    ni sqlite local ni LocalStack (ADR-001 / ADR-003).
 
 Variables de entorno reconocidas (todas opcionales, con fallback sano):
     MLFLOW_TRACKING_URI       : URI del tracking server. Default:
@@ -58,10 +59,12 @@ REPORTS_DIR: Path = BASE_DIR / "reports"
 # ---------------------------------------------------------------------------
 # S3 — artifacts remotos (activo solo si S3_ARTIFACTS_BUCKET esta definido)
 # ---------------------------------------------------------------------------
-# En docker-compose.yml se inyecta apuntando a LocalStack
-# (S3_ARTIFACTS_BUCKET=ml-artifacts, MLFLOW_S3_ENDPOINT_URL=http://localstack:4566).
-# En produccion (AWS Batch/EC2) se inyecta apuntando a un bucket S3 real.
-# El upload ocurre al final de main.py si el bucket esta configurado.
+# Apunta SIEMPRE a un bucket S3 real (ADR-003: no usamos LocalStack).
+# En local lo configurás vía .env (S3_ARTIFACTS_BUCKET=<tu-bucket>).
+# En AWS Batch lo inyecta la job-def definida en GUIA_MLOPS_AWS.md §4.4.
+# El upload ocurre al final de main.py si el bucket esta configurado;
+# scripts/s3_sync.py es defensivo: si S3 falla, el training termina OK
+# igual y los artefactos quedan en disco local del container.
 S3_ARTIFACTS_BUCKET: str = os.environ.get("S3_ARTIFACTS_BUCKET", "")
 S3_ARTIFACTS_PREFIX: str = os.environ.get("S3_ARTIFACTS_PREFIX", "ml-training")
 S3_REPORTS_PREFIX: str = os.environ.get("S3_REPORTS_PREFIX", "ml-training/reports")
@@ -326,10 +329,9 @@ MLFLOW_EXPERIMENT_PREFIX: str = os.environ.get("MLFLOW_EXPERIMENT_PREFIX", "")
 
 # Prefijo del Model Registry (registered model = `f"{prefix}{variety}"`).
 # Cada training de la misma variedad genera una nueva VERSION del mismo
-# registered model. Con backend file:// el Registry NO esta disponible
-# (mlflow_registry.register_model devuelve None silenciosamente). Para
-# registrar versionado real se requiere un MLflow server con backend SQL
-# (ej. SQLite, Postgres) accesible via MLFLOW_TRACKING_URI.
+# registered model. ADR-001 garantiza que SIEMPRE corremos contra un MLflow
+# server con backend SQL (Postgres en local + AWS), por lo que el Registry
+# esta disponible incondicionalmente.
 MODEL_REGISTRY_PREFIX: str = os.environ.get("MODEL_REGISTRY_PREFIX", "rnd-forest-")
 
 # ---------------------------------------------------------------------------

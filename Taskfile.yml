@@ -4,11 +4,10 @@
 # =============================================================================
 #
 # QUICK START (primera vez tras clonar):
-#   task setup           Instala deps Python en el host (para data:split / IDE)
-#   task data:split      Genera data/training/DB-HISTORICA.xlsx
+#   task data:split      Genera data/training/DB-HISTORICA.xlsx (corre en container)
 #   task build           Build de la imagen + arranca servicios (postgres,
-#                          mlflow, localstack). Imprime URLs al final.
-#   task train           Entrena dentro del container (default POP smoke)
+#                          mlflow, nginx-reports). Imprime URLs al final.
+#   task train           Entrena dentro del container (default POP prod)
 #                          UI MLflow: http://localhost:5000
 #
 # DIA A DIA:
@@ -30,8 +29,8 @@
 #   prod_xl  ~5-6 h       6x3 CV    busqueda exhaustiva (overnight)
 #
 # Cada variedad es un proceso independiente: si una falla, las demas siguen.
-# MODEL=auto entrena XGB y LGB y elige campeon por variedad (lex-order:
-# gap -> MAPE -> tiempo). Los losers quedan soft-deleted en MLflow.
+# El sistema entrena XGB y LGB y elige el campeon por variedad (lex-order:
+# gap -> MAPE -> tiempo).
 # =============================================================================
 
 version: "3"
@@ -40,13 +39,6 @@ version: "3"
 dotenv: [ ".env" ]
 
 vars:
-  PY: "{{.PYTHON | default \"python\"}}"
-
-  # BASH: en Windows forzamos Git Bash (no WSL) para que comparta $HOME / FS
-  # con el resto del proyecto. En Linux/Mac es inofensivo: Task cae al `bash`
-  # del PATH si esta ruta no existe.
-  BASH: "\"C:/Program Files/Git/usr/bin/bash.exe\""
-
   TUNING: "{{.TUNING | default \"prod\"}}"
   VARIETIES: "{{.VARIETIES | default \"POP\"}}"
   PARALLEL: "{{.PARALLEL | default \"1\"}}"
@@ -94,9 +86,9 @@ tasks:
         echo "   http://localhost:8080/artifacts/   joblib + run_summary + best_params"
         echo "   s3://...                           Backend de artifacts MLflow (S3 real)"
         echo ""
-        echo "CLEANUP:   task clean:docker  |  task clean:outputs  |  task clean:artifacts"
+        echo "CLEANUP:   task clean:docker   (DESTRUCTIVO: borra volumen Postgres)"
         echo ""
-        echo "   Tip: task --list    listado plano de TODAS las tasks (audit, cleanup, ...)"
+        echo "   Tip: task --list    listado plano de TODAS las tasks"
         echo "============================================================================="
         echo ""
 
@@ -134,6 +126,7 @@ tasks:
   build:
     desc: "Rebuild de la imagen del trainer + arranca TODOS los servicios. Usar tras cambios de codigo o requirements"
     cmds:
+      - task: _ensure_dirs
       - docker compose build trainer
       - docker compose up -d postgres mlflow reports
       - task: _print_urls
@@ -141,8 +134,18 @@ tasks:
   up:
     desc: "Levanta todos los servicios sin rebuild (postgres + mlflow + reports). Para arranque diario"
     cmds:
+      - task: _ensure_dirs
       - docker compose up -d postgres mlflow reports
       - task: _print_urls
+
+  _ensure_dirs:
+    internal: true
+    silent: true
+    # Crea los bind-mount targets antes de levantar Docker, evitando que el
+    # compose los recree con permisos root (Linux) o falle el primer
+    # write del container con uid 1001 (mluser).
+    cmds:
+      - mkdir -p artifacts reports logs data/training
 
   down:
     desc: "Detiene los servicios. Preserva volumen Postgres (los artifacts viven en S3 real, no se tocan)"
@@ -203,30 +206,3 @@ tasks:
     cmds:
       - docker compose run --rm --no-deps --entrypoint python trainer
         -m src.diagnostics.dashboard_index
-
-  registry:audit:
-    desc: "Lista versions de cada modelo en MLflow Registry con metricas y recomendacion de archivado. Read-only (no transiciona nada)"
-    cmds:
-      - docker compose run --rm --no-deps --entrypoint python trainer
-        -m scripts.registry_audit
-
-  # ═══ Auditoria ══════════════════════════════════════════════════════════
-
-  audit:compare:
-    desc: "Tabla comparativa entre runs (lee logs/business_audit.jsonl). Args: -- --variety POP --last 5"
-    cmds:
-      - "{{.BASH}} scripts/sh/audit_compare.sh {{.CLI_ARGS}}"
-
-  # ═══ Cleanup local ══════════════════════════════════════════════════════
-
-  clean:outputs:
-    desc: "Borra artifacts/, logs/, reports/ y __pycache__/ del host. NO toca data/ ni el volumen Postgres ni S3"
-    cmds:
-      - "{{.BASH}} scripts/sh/clean_outputs.sh"
-
-  clean:artifacts:
-    desc: "Borra artifacts/ viejos conservando los ultimos N por (variety, model). Args: KEEP=10 [--dry-run]"
-    vars:
-      KEEP: "{{.KEEP | default \"10\"}}"
-    cmds:
-      - "{{.BASH}} scripts/sh/clean_artifacts.sh {{.KEEP}} {{.CLI_ARGS}}"

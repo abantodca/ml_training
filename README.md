@@ -12,9 +12,11 @@ servidor remoto) para tracking + Model Registry, y un **dashboard HTML
 ejecutivo** autocontenido por variedad.
 
 **Entorno:** Docker (Windows / Linux / Mac). El stack local levanta MLflow
-server con Postgres + LocalStack S3 + nginx para reports HTML. El mismo
-compose se traslada a producción cambiando endpoints (RDS, S3 real, Caddy).
-`Taskfile.yml` orquesta build, up, data split, training, logs y auditoría.
+server (Postgres + S3 real) + nginx para reports HTML. El mismo compose se
+traslada a producción cambiando endpoints (RDS, ALB). `Taskfile.yml` orquesta
+build, up, data split, training, logs y auditoría. El backend MLflow SIEMPRE
+es Postgres + S3 — no se usa `file://mlruns` ni sqlite ni LocalStack
+(ADR-001 / ADR-003).
 
 > **Nota sobre el nombre del repo:** se llama `ml_random_forest` por razones
 > históricas. El pipeline actual entrena **XGBoost + LightGBM** (no Random
@@ -25,24 +27,32 @@ compose se traslada a producción cambiando endpoints (RDS, S3 real, Caddy).
 ## Quick start (local)
 
 ```bash
-task setup                                                # instala deps
-task data:split                                           # split por VARIEDAD
-task smoke                                                # smoke (~1-2 min, POP, XGB+LGB)
-task train:local VARIETIES=POP,JUPITER                    # multi-variety
-task train:local VARIETIES=all PARALLEL=4 TUNING=prod     # paralelo
-task train:local VARIETIES=POP STACKING=gam               # con meta GAM
-task mlflow:ui                                            # UI MLflow en :5000
-task audit:compare -- --variety POP --last 5              # comparativa runs
+# 0. Una sola vez tras clonar: bajar la data raw desde S3 (no vive en git).
+#    El bucket por default es el mismo que S3_MLFLOW_BUCKET de tu .env.
+aws s3 cp s3://<tu-bucket>/data/BD_HISTORICO_ACUMULADO.xlsx data/
+
+# 1. Día a día
+task data:split                                       # genera DB-HISTORICA.xlsx (corre en container)
+task build                                            # build trainer + arranca postgres/mlflow/nginx
+task train VARIETIES=POP TUNING=smoke                 # smoke (~1-2 min, XGB+LGB, elige campeón)
+task train VARIETIES=POP,JUPITER TUNING=dev           # multi-variety
+task train VARIETIES=all TUNING=prod PARALLEL=4       # todas en paralelo (~2h cada una)
+task logs                                             # tail trainer + mlflow
+task down                                             # detiene servicios (preserva data)
 ```
 
-## CLI directa (sin Taskfile)
+URLs locales (con servicios `up`):
+
+- MLflow UI: <http://localhost:5000>
+- Reports HTML: <http://localhost:8080/reports/>
+- Artifacts: <http://localhost:8080/artifacts/>
+
+## CLI directa (sin Taskfile, sin Docker — requiere venv + MLflow server)
 
 ```bash
-# default: --model auto -> entrena XGB y LGB y elige campeón por variedad
+# Siempre entrena XGB y LGB y `select_champion` elige el ganador
+# (ADR-002: el sistema decide, no hay flag para forzar un modelo).
 python main.py --tuning dev --varieties POP
-
-# fuerza UN solo backend (~50% más rápido, sin comparación)
-python main.py --tuning prod --varieties POP --model xgb
 
 # multi-variety (cache se limpia entre variedades)
 python main.py --tuning prod --varieties POP,JUPITER,VENTURA
@@ -57,12 +67,11 @@ python main.py --tuning prod --varieties all --parallel-varieties 4
 python main.py --tuning prod --n-trials 120 --final-trials 60
 python main.py --tuning prod --skip-final-tuning           # ahorra ~1/(outer+1)
 
-# registra campeón en Model Registry (requiere MLflow remoto con backend DB)
-python main.py --tuning prod --varieties POP --registry-stage Staging
-python main.py --tuning prod --varieties POP --no-register # desactiva el registry
-
-# stacking opt-in: envuelve el campeón en GAM como meta-learner
-python main.py --tuning dev --varieties POP --stacking gam
+# Model Registry — control fino sobre la version registrada
+python main.py --tuning prod --varieties POP --no-register                 # no toca el Registry
+python main.py --tuning prod --varieties POP --registry-stage Staging      # registra y promueve
+# Para Production, se recomienda usar el workflow `promote.yml` con gates
+# de calidad (GUIA_MLOPS_AWS.md §12) en vez del flag.
 ```
 
 ### Tuning profiles (`src/config.py`)
@@ -74,9 +83,9 @@ python main.py --tuning dev --varieties POP --stacking gam
 | `prod`    | 60  | 30 | 5 × 3 | 330  | ~1.5-2.5 h  |
 | `prod_xl` | 100 | 50 | 6 × 3 | 650  | ~5-6 h      |
 
-\* sobre 10 073 filas, **POR BACKEND**. Con `--model auto` (default) se duplica.
-Con `--parallel-varieties N` el wallclock por job se acerca a `total / N`
-si hay cores suficientes.
+\* sobre 10 073 filas, **POR BACKEND**. El pipeline entrena XGB + LGB siempre,
+así que el wallclock real es ~2× los valores arriba. Con `--parallel-varieties N`
+el wallclock por job se acerca a `total / N` si hay cores suficientes.
 
 ### Selección de campeón (`src/step_05_evaluate/champion.py`)
 
@@ -105,7 +114,7 @@ sobrescribir entre re-entrenamientos:
 - `artifacts/run_summary_AGGREGATE.json` — resumen multi-variety: campeones, fallos, tiempo total.
 - `reports/Winner_<variety>.html` — dashboard ejecutivo autocontenido (solo para el campeón).
 - `reports/Winner_<variety>.xlsx` — Excel multi-hoja con métricas y predicciones (solo campeón).
-- MLflow server (Docker, `task up`) — runs versionados, métricas, params, Model Registry. UI en `http://localhost:5000`. Backend Postgres (`pg-data` volume) + S3 LocalStack (`localstack-data` volume).
+- MLflow server (Docker, `task up`) — runs versionados, métricas, params, Model Registry. UI en `http://localhost:5000`. Backend Postgres (`pg-data` volume) + S3 real (bucket `S3_MLFLOW_BUCKET` del `.env`).
 - `logs/pipeline_run.log`, `logs/variety_<variety>.log`, `logs/business_audit.jsonl`.
 
 ---
@@ -115,41 +124,49 @@ sobrescribir entre re-entrenamientos:
 ```
 ml_training/
 ├── main.py                                 # Entrypoint thin (parse + delega en orchestration/)
-├── Taskfile.yml                            # Tareas locales: setup / data / train / mlflow:ui / logs
-├── .env.example                            # Variables de entorno opcionales
+├── Taskfile.yml                            # Tareas locales: build / up / train / logs / audit / clean
+├── docker-compose.yml                       # postgres + mlflow custom + nginx + trainer
+├── Dockerfile                               # imagen trainer (multi-stage + tini + non-root)
+├── docker/mlflow/Dockerfile                 # mlflow v3.12 + psycopg2-binary + boto3
+├── .env.example                             # Variables de entorno (S3 buckets + AWS profile + límites)
 ├── requirements.txt, requirements-dev.txt
-├── scripts/
-│   ├── prepare_data.py                     # split del acumulado por VARIEDAD
-│   ├── audit_compare.py                    # comparativa entre runs (lee logs/business_audit.jsonl)
-│   ├── clean_artifacts.py                  # GC de artifacts/ viejos (KEEP por variety+model)
-│   └── sh/                                  # scripts .sh con la lógica del Taskfile
+├── scripts/                                 # módulos importables desde main.py + tasks Python
+│   ├── prepare_data.py                     # split del acumulado por VARIEDAD (usado por main.py en AWS Batch + task data:split)
+│   └── s3_sync.py                          # sync de artifacts/ + reports/ a S3 al final del run (usado por main.py)
 └── src/
     ├── config.py                            # Esquema, rutas, seeds, MLflow URI, branding del reporte
     ├── utils/logger.py                      # setup_logging() archivo + consola
-    ├── step_01_load/data_loader.py          # load_data() → (X_raw, y) con validación + leakage check
+    ├── utils/sklearn_helpers.py             # helpers transversales para sklearn (dump_json_artifact, …)
+    ├── diagnostics/                          # EDA standalone (eda.py) + dashboards / drift (ADR-004)
+    ├── step_01_load/
+    │   ├── data_loader.py                  # load_data() → (X_raw, y) con validación + leakage check
+    │   └── validation.py                    # checks de schema y leakage
     ├── step_02_clean/
     │   ├── missing_flags.py                 # MissingFlagger (boolean per-feature)
     │   ├── imputers.py                      # CustomKNNImputer (KNN + median fallback)
     │   ├── outliers.py                      # OutlierCapper (iqr / percentile, tuneable)
+    │   ├── outlier_score.py                 # score de outliers por (FUNDO, FORMATO) en cascada
     │   └── _helpers.py
     ├── step_03_features/
     │   ├── feature_engineering.py           # FeatureGenerator (cíclicas + ratios estructurales + one-hot)
-    │   └── lag_features.py                  # add_lag_features (~31 features rolling/seasonal/ratios) — invocado desde data_loader.py
+    │   └── lag_features.py                  # add_lag_features (~35 features rolling/seasonal/ratios) — invocado desde data_loader.py
     ├── pipeline/build_pipeline.py           # missing_flags → imputer → outliers → features → variance_filter
     ├── step_04_train/
+    │   ├── registry.py                      # BACKEND_REGISTRY: lista los backends entrenables (XGB, LGB)
     │   ├── model_xgb.py                     # get_xgb_model() — XGBRegressor envuelto en TTR (objective=reg:absoluteerror, MAE nativo)
     │   ├── model_lgb.py                     # get_lgb_model() — LGBMRegressor envuelto en TTR (objective=regression_l1, MAE nativo)
-    │   ├── model_gam.py                     # get_gam_meta_model() — LinearGAM (pyGAM) para stacking
-    │   ├── search_spaces.py                 # Espacios Optuna por backend + meta (registries extensibles)
+    │   ├── search_spaces.py                 # Espacios Optuna por backend (registry extensible)
     │   ├── target_transform.py              # log1p + cap p99.5 vía TransformedTargetRegressor (CV-safe)
     │   ├── oof_ensemble.py                  # K refits sobre folds; predict promedia las K
-    │   ├── stacking.py                      # StackedRegressor — campeón → GAM (opt-in via --stacking gam)
-    │   └── tuning.py                        # perform_nested_cv() + sample_weights + CV adaptativo + stacking_meta
+    │   ├── sample_weights.py                # weights ∝ 1/freq sobre bins del target (cap=5×, sqrt)
+    │   ├── temporal_cv.py                   # TemporalYearSplit (opt-in vía CV_OUTER_STRATEGY=temporal_year)
+    │   └── tuning.py                        # perform_nested_cv() + sample_weights + CV adaptativo
     ├── step_05_evaluate/
     │   ├── metrics.py                       # MAE, RMSE, R², MAPE
     │   ├── diagnostics.py                   # gráficos matplotlib → base64 PNG
+    │   ├── statistical_tests.py             # tests sobre residuos (BP, DW, ADF, …)
     │   ├── champion.py                      # select_champion (lex-order: gap → MAPE → tiempo)
-    │   ├── explainability.py                # KPIs ejecutivos + glosario + WinnerKit
+    │   ├── explainability/                  # paquete: KPIs ejecutivos, glosario, WinnerKit, sesgos, acciones
     │   └── html/                            # dashboard ejecutivo modular
     │       ├── winner_dashboard.py          # entrypoint: Winner_<variety>.html
     │       ├── sections.py, technical.py    # KPIs, tarjetas, tablas, sección técnica
@@ -158,7 +175,7 @@ ml_training/
     ├── step_06_track/
     │   ├── mlflow_registry.py               # init / log_metrics / log_params / log_pipeline / Model Registry
     │   ├── business_validation.py           # KG/JR (= KG/JR_H × H-EF) OOF + in-sample
-    │   └── business_export.py               # Winner_<variety>.xlsx multi-hoja
+    │   └── business_export/                  # paquete: builders + export + formatting → Winner_<variety>.xlsx
     └── orchestration/
         ├── cli.py                           # argparse + resolve_varieties / resolve_settings
         ├── single_run.py                    # entrena UN modelo para UNA variedad → ModelResult
@@ -203,7 +220,7 @@ main.main()
                 │       └── lex-order: gap → MAPE_total → tiempo
                 ├── 5. business_validation: KG/JR = KG/JR_H × H-EF (OOF + in-sample)
                 ├── 6. mlflow_registry: log metrics + params + pipeline + signature
-                │       └── promueve campeón al Model Registry si --registry-stage
+                │       └── registra nueva version del campeón en `rnd-forest-<variety>`
                 └── 7. winner_dashboard + business_export → Winner_<variety>.html / .xlsx
 ```
 
@@ -280,34 +297,6 @@ Las divisiones usan `np.where(den > 0, num/den, NaN)`; los NaN resultantes son t
 - **Sample weights** (`tuning.compute_sample_weights`): pesos inversos a la densidad del target con bins de IGUAL ANCHO (no qcut), cap=5× + `sqrt` para saturar la cola larga (max post-norm ~2.8 vs ~8 sin sqrt), normalizados a media=1. Compensa el sesgo "regresión a la media" de los árboles dando más peso a deciles raros sin amplificar outliers.
 - **`OOFEnsembleRegressor`** (`oof_ensemble.py`): refit final = K=5 pipelines clonados, cada uno entrenado en `(K−1)/K` del dataset según un `KFold`; `predict()` promedia las K predicciones. Reduce varianza ~5–10% del modelo de producción a costa de 5× el tiempo del refit final (despreciable vs nested CV). `K=1` degenera al modo legacy bit-for-bit.
 
-### Stacking (capa GAM, opt-in)
-
-Activado con `--stacking gam` (default `none` → comportamiento bit-for-bit idéntico al actual). Envuelve el campeón XGB/LGB en `StackedRegressor`, que en cascada hace:
-
-```
-fit(X, y):
-    1. KFold(STACKING_OOF_FOLDS) sobre X → oof_pred (predicciones honestas del base)
-    2. meta_features = [oof_pred, X[STACKING_X_SUBSET] imputado por mediana]
-    3. LinearGAM (pyGAM) fit(meta_features, y, weights=sample_weight)
-    4. base.fit(X, y) sobre TODO X (lo que se usa en inferencia)
-
-predict(X):
-    pred_base = base.predict(X)
-    return gam.predict([pred_base, X[STACKING_X_SUBSET] imputado])
-```
-
-**Por qué GAM y no Ridge / red neuronal**: con 3-4 features de entrada al meta y N≈10k filas, el GAM aporta no-linealidad suave por término (`s(pred_base) + s(KG/HA) + s(%INDUS) + s(DIA_COSECHA)`) que los árboles aproximan con escalones; un ridge sería demasiado rígido y una red neuronal sufriría con N tan chico. La interpretabilidad de los splines es un bonus para el dashboard.
-
-**Por qué SOLO un subset de features al meta**: pasarle al GAM las ~50 columnas que ve el base (raw + lags + ratios + dummies) sería curse-of-dim — el GAM diverge. El subset por default (`config.STACKING_X_SUBSET = ["KG/HA", "%INDUS", "DIA_COSECHA"]`) son las 3 features continuas con MI más alta y efectos típicamente suaves no capturados por splits.
-
-**Por qué los lags `KG_JR_H_lag_*` no van al meta**: ya cumplen función de target encoding temporal multi-window dentro del base. Pasarlos al GAM además duplicaría señal y complicaría el OOF del meta (riesgo de leakage cruzado entre el lag CV y el stacking CV).
-
-**OOF doble + paridad**: el nested CV (outer 5 × inner 3) sigue midiendo el **base puro**. Las métricas `nested_cv_mae_mean`, `nested_cv_gap_mean`, `nested_cv_r2_mean` quedan comparables con runs históricos. La capa GAM solo afecta el `final_pipeline.predict()` y la `business_validation` (KG/JR refit + predict all). Si querés evaluar el stacking de forma honesta, comparalo via `task audit:compare` filtrando por `tag.stacked=true` en MLflow.
-
-**Backend**: cero cambios. `mlflow.pyfunc.load_model("rnd-forest-{variety}").predict(X_raw)` carga el `StackedRegressor` y la cascada base→meta es interna al wrapper. La signature de MLflow es la misma porque las features de entrada son idénticas.
-
-**MLflow tags**: cada run loguea `stacked=true|false` y `meta_model=gam` cuando aplica. Filtrable directo en la UI.
-
 ### Validación en unidad de negocio
 
 `KG/JR_H` (kg/jornal-hora) es la unidad del modelo, pero la unidad
@@ -355,7 +344,7 @@ así por:
 - Cada run de MLflow guarda parámetros del pipeline completo (modelo + preprocesador), métricas Train/Test/Full, y el pipeline serializado con `infer_signature` (modelo autodescribible para `mlflow models serve`).
 - `best_params_<variety>_<run_name>.json` se sube como artifact en `hyperparameters/` para evitar el truncado a 250 chars de `mlflow.log_params`.
 - El log incluye `archivo:línea:función` para localizar fallos en segundos.
-- `logs/business_audit.jsonl` registra cada run con métricas de negocio para auditoría histórica (`task audit:compare`).
+- `logs/business_audit.jsonl` registra cada run con métricas de negocio para auditoría histórica (lectura manual; el comparador automático se removió por desuso).
 
 ---
 
@@ -363,12 +352,11 @@ así por:
 
 - **Un experimento por variedad**: `MLFLOW_EXPERIMENT_PREFIX + variety`. Default prefix vacío → el experimento es el nombre de la variedad (`POP`, `JUPITER`, …).
 - **Run versionado dentro del experimento**: `xgb_v1`, `xgb_v2`, …, `lgb_v1`, … (`next_run_version` autoincrementa por modelo). El campeón histórico vive en el mismo experimento que sus rivales y se distingue por sus tags.
-- **Model Registry**: `MODEL_REGISTRY_PREFIX + variety` (default `rnd-forest-POP`, `rnd-forest-JUPITER`, …). Cada training del campeón crea una nueva versión del registered model. Promoción a `Staging` / `Production` opt-in vía `--registry-stage`.
+- **Model Registry**: `MODEL_REGISTRY_PREFIX + variety` (default `rnd-forest-POP`, `rnd-forest-JUPITER`, …). Cada training del campeón crea una nueva versión del registered model. La promoción a `Staging` / `Production` NO es parte del training run — se hace fuera del pipeline (manual desde la UI, vía `mlflow models transition`, o vía el workflow CI/CD `promote.yml` descripto en `GUIA_MLOPS_AWS.md` §12, que aplica gates de calidad antes de promover).
 
-> El `MODEL_REGISTRY_PREFIX` por default está alineado con el `backend_service`,
-> que busca modelos como `f"{experiment_prefix}-{variety}"` con
-> `experiment_prefix="rnd-forest"`. Cambiarlo aquí requiere cambiarlo también
-> en el backend o no encontrará los modelos.
+> El `MODEL_REGISTRY_PREFIX` por default está alineado con cualquier servicio
+> downstream que cargue modelos como `f"rnd-forest-{variety}"`. Cambiarlo
+> aquí requiere coordinarlo con esos consumers o no encontrarán los modelos.
 
 ---
 
@@ -378,7 +366,6 @@ así por:
 |---|---|
 | Overfitting | Cada outer fold reporta `MAE_train`, `MAE_test`, `gap`. El reporte HTML agrega "Análisis de overfitting" con verdict (verde/amarillo/rojo) según gap. El selector de campeón usa `|gap|` como **primer** criterio. |
 | Selección multi-modelo | `select_champion` con lex-order estricto + tolerancias por bucket. Justificación textual auto-generada. |
-| Stacking opcional | `--stacking gam` envuelve el campeón en `StackedRegressor` con pyGAM como meta. OOF interno via `cross_val_predict` (K=5). Default off → paridad bit-for-bit. Backend sin cambios. |
 | Estabilidad varianza | `TransformedTargetRegressor` (log1p + cap p99.5 CV-safe) + `OOFEnsembleRegressor` (K=5 refits promediados). |
 | Compensación cola | `compute_sample_weights` por bins de igual ancho del target (cap=5×). |
 | MLflow run | Tags clave (`r2_mean`, `mae_test_mean`, `mae_train_mean`, `overfit_gap`, `composite_score`) → filtros directos en la UI. |
@@ -389,6 +376,4 @@ así por:
 | Skip-final-tuning | Cuando se omite la ronda final, usa el `best_params` del **mejor** outer fold (argmin MAE_test), no el último. |
 | Stratified adaptativo | Cascada `FUNDO_FORMATO → FUNDO → FORMATO → KFold` con colapso de clases raras a `RARE`. |
 | Group-rare | `RARE_MIN_COUNT=50` en FORMATO: categorías con `n<50` se colapsan a `OTROS` antes del one-hot. |
-| Auditoría JSONL | `logs/business_audit.jsonl` (1 línea por run); `task audit:compare -- --variety POP --last 5` para comparativas. |
-| Cleanup artifacts | `task clean:artifacts KEEP=10` conserva los últimos N runs por variety+model. |
-| Venv portátil | `.env` (opcional) puede exponer `PYTHON=/path/a/venv/bin/python`; el Taskfile usa `{{.PY}}` → corre con el intérprete correcto sin necesidad de activar el venv. |
+| Auditoría JSONL | `logs/business_audit.jsonl` (1 línea por run) — para inspección manual de métricas de negocio. |

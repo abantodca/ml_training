@@ -445,7 +445,6 @@ def build_errors_detail_section(
     p50 = float(np.percentile(abs_err, 50))
     p90 = float(np.percentile(abs_err, 90))
     p99 = float(np.percentile(abs_err, 99))
-    err_max = float(abs_err.max())
 
     metrics_cards = (
         '<div class="ctx-grid">'

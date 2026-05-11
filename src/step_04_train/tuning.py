@@ -34,19 +34,21 @@ from sklearn.metrics import mean_absolute_error, r2_score
 from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.pipeline import Pipeline
 
+# Silenciar warning experimental de optuna ANTES de importar los modulos
+# del proyecto que a su vez disparan llamadas a optuna en tiempo de import.
 warnings.filterwarnings("ignore", category=ExperimentalWarning)
 
-from src.config import (
+from src.config import (  # noqa: E402  (filterwarnings debe ir antes)
     INNER_CV_FOLDS,
     OOF_ENSEMBLE_K,
     OUTER_CV_FOLDS,
     RANDOM_STATE,
 )
-from src.step_04_train.oof_ensemble import OOFEnsembleRegressor
-from src.step_04_train.registry import get_backend
-from src.step_04_train.sample_weights import compute_sample_weights
-from src.step_04_train.search_spaces import suggest_full_params
-from src.utils.sklearn_helpers import (
+from src.step_04_train.oof_ensemble import OOFEnsembleRegressor  # noqa: E402
+from src.step_04_train.registry import get_backend  # noqa: E402
+from src.step_04_train.sample_weights import compute_sample_weights  # noqa: E402
+from src.step_04_train.search_spaces import suggest_full_params  # noqa: E402
+from src.utils.sklearn_helpers import (  # noqa: E402
     fit_with_optional_sample_weight,
     index_or_none,
 )

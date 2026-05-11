@@ -137,7 +137,8 @@ def build_winner_kit(
             from sklearn.metrics import mean_absolute_error, r2_score
 
             def _mape_safe(yt, yp):
-                yt = np.asarray(yt, dtype=float); yp = np.asarray(yp, dtype=float)
+                yt = np.asarray(yt, dtype=float)
+                yp = np.asarray(yp, dtype=float)
                 nz = yt != 0
                 if nz.sum() == 0:
                     return float("nan")

@@ -222,8 +222,9 @@ def register_model(
 ) -> Optional[str]:
     """Registra el modelo del run en MLflow Model Registry con metadata rica.
 
-    Devuelve el nombre completo + version registrada (None si falla o si
-    el backend no soporta Registry).
+    Devuelve `nombre@version` o None si el backend es file:// (caso de
+    emergencia: ADR-001 lo prohibe en operacion normal pero el guard se
+    mantiene como red de seguridad).
 
     Adicionalmente:
     - Setea description del Model Version con un resumen humano
@@ -232,12 +233,8 @@ def register_model(
     - Si `stage` esta en {Staging, Production}, transiciona y archiva las
       versiones anteriores en Production.
 
-    Backend file:// NO soporta Registry (caso default del proyecto local):
-    devuelve None silenciosamente para que el pipeline no aborte. Para
-    versionado real apuntar MLFLOW_TRACKING_URI a un MLflow server con
-    backend SQL (sqlite:///, postgresql://, etc.) y dejar que `register_model`
-    transicione versiones; cualquier MlflowException en ese caso PROPAGA
-    al caller (auth/red/schema son fallos reales que deben verse).
+    Cualquier MlflowException propaga al caller (auth/red/schema son fallos
+    reales que deben verse, no enmascararse).
     """
     model_name = f"{MODEL_REGISTRY_PREFIX}{variety}".strip("_")
     model_uri = f"runs:/{run_id}/{artifact_name}"

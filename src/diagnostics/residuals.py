@@ -30,7 +30,6 @@ from src.diagnostics.html_renderer import (
     BASE_CSS,
     fig_to_html_div,
     format_pvalue,
-    render_badge,
     render_test_row,
 )
 from src.diagnostics.plots import _style

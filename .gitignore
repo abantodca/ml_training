@@ -1,35 +1,68 @@
-# Secretos / config local
+# =============================================================================
+# .gitignore — qué NO se versiona
+# =============================================================================
+# Filosofia: solo viven en git codigo + docs + config plantilla (no secretos).
+# Todo lo generado en runtime, los datos reales, las credenciales y las
+# caches de herramientas se quedan fuera.
+
+# ── Secretos / config local ──────────────────────────────────────────────
 .env
+.env.*
+!.env.example
 .env.infra
 *.pem
+*.key
 
-# Python
+# ── Python ───────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *.so
 .venv/
 venv/
+env/
 .eggs/
 *.egg-info/
 
-# Datos (los reales viven en S3)
-data/training/*.xlsx
+# ── Caches de tooling ────────────────────────────────────────────────────
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ── Datos (los reales viven en S3) ───────────────────────────────────────
+# Input raw del negocio — pesa varios MB y se baja desde S3 en AWS Batch.
+data/*.xlsx
+data/training/
 data/processed/
 
-# Salidas del pipeline
+# ── Salidas del pipeline ─────────────────────────────────────────────────
+# Bind-mounted al container; los dirs vacios se recrean con Taskfile
+# `_ensure_dirs` o init_dirs() en config.py al arrancar.
 artifacts/
 reports/
 logs/
 
-# Legacy: el backend MLflow ahora es Postgres (Docker), `mlruns/` ya no se usa.
-# La regla queda por si alguien volvio de una rama vieja con la carpeta en disco.
+# ── Legacy MLflow (ADR-001: backend ahora es Postgres + S3) ──────────────
+# Regla queda por si alguien checkout-ea una rama vieja con el dir en disco.
 mlruns/
 
-# Editores
+# ── Editores e IDEs ──────────────────────────────────────────────────────
 .vscode/
 .idea/
 *.swp
-.DS_Store
+*.swo
 
-# Claude Code (config local del agente)
+# ── Sistema operativo ────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# ── Archivos temporales ──────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+*~
+
+# ── Claude Code (config local del agente) ────────────────────────────────
 .claude/
