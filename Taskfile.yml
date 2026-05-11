@@ -3,24 +3,32 @@
 # Pipeline ML (XGB / LGB) con Optuna + MLflow Model Registry, sobre Docker.
 # =============================================================================
 #
-# QUICK START (primera vez tras clonar):
-#   task data:split      Genera data/training/DB-HISTORICA.xlsx (corre en container)
-#   task build           Build de la imagen + arranca servicios (postgres,
-#                          mlflow, nginx-reports). Imprime URLs al final.
-#   task train           Entrena dentro del container (default POP prod)
-#                          UI MLflow: http://localhost:5000
+# PRIMERA VEZ (setup inicial, ejecutar en orden — todo corre en Docker):
+#   task build                                  Build de imagen + arranca servicios + URLs
+#   task data:split                             Genera DB-HISTORICA.xlsx (dentro del container)
+#   task eda VARIETIES=POP                      EDA estadistico (BP/DW/ADF/VIF/MI/PSI)
+#   task train VARIETIES=POP TUNING=smoke       primer sanity check (~1 min)
 #
-# DIA A DIA:
-#   task up                                 levanta servicios (sin rebuild)
-#   task train VARIETIES=POP TUNING=prod    entrena con perfil de produccion
-#   task logs                               tail logs de trainer + mlflow
-#   task down                               detiene servicios (preserva data)
+# DIA A DIA (servicios ya construidos):
+#   task up                                     levanta servicios sin rebuild
+#   task train VARIETIES=POP TUNING=dev         baseline           (~20 min)
+#   task train VARIETIES=POP TUNING=prod        produccion         (~2 h)
+#   task train VARIETIES=all PARALLEL=3         todas en paralelo
+#   task logs                                   tail trainer + mlflow
+#   task reports:dashboard                      regenera reports/index_static.html (snapshot)
+#   task down                                   detiene servicios
+#
+# TRAS CAMBIO DE CODIGO O REQUIREMENTS:
+#   task build                                  rebuild imagen + up
+#
+# El sistema entrena XGB y LGB y elige el campeon por variedad.
+# No se puede forzar un modelo: el contrato del proyecto es
+# que la maquina decida (lex-order: gap -> MAPE -> tiempo).
 #
 # VARIABLES (override por CLI, ej: `task train VARIETIES=POP,VENTURA`):
 #   VARIETIES = "POP" | "POP,VENTURA" | "all"            (default POP)
-#   TUNING    = smoke | dev | prod | prod_xl             (default prod)
-#   MODEL     = auto | xgb | lgb | "xgb,lgb"             (default auto)
-#   PARALLEL  = N variedades en paralelo                 (default 1)
+#   TUNING    = smoke (~1m) | dev (~20m) | prod (~2h) | prod_xl (~6h)
+#   PARALLEL  = N variedades en paralelo                  (default 1)
 #
 # PERFILES DE TUNING (presupuesto Optuna):
 #   smoke    ~1 min       2x2 CV    sanity check
@@ -28,9 +36,15 @@
 #   prod     ~1.5-2.5 h   5x3 CV    produccion (default)
 #   prod_xl  ~5-6 h       6x3 CV    busqueda exhaustiva (overnight)
 #
+# URLS (servicios up):
+#   http://localhost:5000              MLflow UI (tracking + Registry)
+#   http://localhost:8080/reports/     Dashboards HTML por variedad
+#   http://localhost:8080/artifacts/   joblib + run_summary + best_params
+#   s3://...                           Backend de artifacts MLflow (S3 real)
+#
+# CLEANUP:   task clean:docker   (DESTRUCTIVO: borra volumen Postgres)
+#
 # Cada variedad es un proceso independiente: si una falla, las demas siguen.
-# El sistema entrena XGB y LGB y elige el campeon por variedad (lex-order:
-# gap -> MAPE -> tiempo).
 # =============================================================================
 
 version: "3"
@@ -57,19 +71,23 @@ tasks:
         echo " ml_training - pipeline ML (XGB / LGB) sobre Docker"
         echo "============================================================================="
         echo ""
-        echo "PRIMERA VEZ (todo corre en Docker, sin Python en el host):"
-        echo "   task build           Build de imagen + arranca servicios + URLs"
-        echo "   task data:split      Genera DB-HISTORICA.xlsx (dentro del container)"
-        echo ""
-        echo "DIA A DIA:"
-        echo "   task up                                     levanta servicios sin rebuild"
-        echo "   task build                                  rebuild + up (tras cambio de codigo)"
+        echo "PRIMERA VEZ (setup inicial, ejecutar en orden):"
+        echo "   task build                                  imagen + servicios + URLs"
+        echo "   task data:split                             Genera DB-HISTORICA.xlsx"
         echo "   task eda VARIETIES=POP                      EDA estadistico (BP/DW/ADF/VIF/MI/PSI)"
-        echo "   task train VARIETIES=POP TUNING=smoke       sanity check        (~1 min)"
+        echo "   task train VARIETIES=POP TUNING=smoke       primer sanity check (~1 min)"
+        echo ""
+        echo "DIA A DIA (servicios ya construidos):"
+        echo "   task up                                     levanta servicios sin rebuild"
         echo "   task train VARIETIES=POP TUNING=dev         baseline           (~20 min)"
+        echo "   task train VARIETIES=POP TUNING=prod        produccion         (~2 h)"
         echo "   task train VARIETIES=all PARALLEL=3         todas en paralelo"
         echo "   task logs                                   tail trainer + mlflow"
+        echo "   task reports:dashboard                      regenera reports/index_static.html"
         echo "   task down                                   detiene servicios"
+        echo ""
+        echo "TRAS CAMBIO DE CODIGO O REQUIREMENTS:"
+        echo "   task build                                  rebuild imagen + up"
         echo ""
         echo "   El sistema entrena XGB y LGB y elige el campeon por variedad."
         echo "   No se puede forzar un modelo: el contrato del proyecto es"
@@ -77,7 +95,7 @@ tasks:
         echo ""
         echo "VARIABLES (override por CLI):"
         echo "   VARIETIES = \"POP\" | \"POP,VENTURA\" | \"all\"            (default POP)"
-        echo "   TUNING    = smoke (~1m) | dev (~20m) | prod (~2h) | prod_xl (~6h)"
+        echo "   TUNING    = smoke (~1m) | dev (~20m) | prod (~2h, default) | prod_xl (~6h)"
         echo "   PARALLEL  = N variedades en paralelo                  (default 1)"
         echo ""
         echo "URLS (servicios up):"
