@@ -5,3 +5,4 @@
 output "data_bucket"          { value = module.storage.data_bucket }
 output "artifacts_bucket"     { value = module.storage.artifacts_bucket }
 output "ecr_trainer_repo_url" { value = module.storage.ecr_trainer_url }
+output "mlflow_url" { value = "http://${module.mlflow.alb_dns_name}" }
