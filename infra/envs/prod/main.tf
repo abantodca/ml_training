@@ -9,3 +9,8 @@ module "network" {
   project  = var.project
   vpc_cidr = var.vpc_cidr
 }
+
+module "storage" {
+  source  = "../../modules/storage"
+  project = var.project
+}
