@@ -30,3 +30,34 @@ module "mlflow" {
   artifacts_bucket         = module.storage.artifacts_bucket
   log_retention_days       = var.log_retention_days
 }
+
+module "reports" {
+  source               = "../../modules/reports"
+  project              = var.project
+  vpc_id               = module.network.vpc_id
+  private_subnet_ids   = module.network.private_subnet_ids
+  sg_alb_id            = module.network.sg_alb_id
+  ecs_cluster_id       = module.mlflow.cluster_id
+  alb_listener_arn     = module.mlflow.alb_listener_arn
+  artifacts_bucket     = module.storage.artifacts_bucket
+  artifacts_bucket_arn = module.storage.artifacts_bucket_arn
+  ecr_reports_url      = module.storage.ecr_reports_url
+  log_retention_days   = var.log_retention_days
+}
+
+module "batch" {
+  source               = "../../modules/batch"
+  project              = var.project
+  private_subnet_ids   = module.network.private_subnet_ids
+  sg_batch_id          = module.network.sg_batch_id
+  ecr_trainer_url      = module.storage.ecr_trainer_url
+  trainer_image_tag    = var.trainer_image_tag
+  spot_bid_percentage  = var.spot_bid_percentage
+  tracking_uri         = module.mlflow.tracking_uri
+  artifacts_bucket     = module.storage.artifacts_bucket
+  artifacts_bucket_arn = module.storage.artifacts_bucket_arn
+  data_bucket          = module.storage.data_bucket
+  data_bucket_arn      = module.storage.data_bucket_arn
+  job_attempt_seconds  = var.job_attempt_seconds
+  log_retention_days   = var.log_retention_days
+}
