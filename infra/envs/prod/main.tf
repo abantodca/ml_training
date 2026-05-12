@@ -85,3 +85,16 @@ module "lambdas" {
   log_retention_days     = var.log_retention_days
   lambdas_src_dir        = "${path.module}/../../lambdas"
 }
+
+module "scheduler" {
+  source                    = "../../modules/scheduler"
+  project                   = var.project
+  ecs_cluster_name          = module.mlflow.cluster_name
+  ecs_service_name_mlflow   = module.mlflow.service_name
+  ecs_service_name_reports  = module.reports.service_name
+  rds_instance_id           = module.mlflow.rds_instance_id
+  batch_queue_spot_name     = module.batch.job_queue_spot
+  batch_queue_ondemand_name = module.batch.job_queue_ondemand
+  work_end_hour_local       = 12               # 12:00 PM PET (decision 3 de Sec 0.3)
+  lambdas_src_dir           = "${path.module}/../../lambdas"
+}
