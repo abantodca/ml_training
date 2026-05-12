@@ -71,3 +71,17 @@ module "monitoring" {
   tg_arn               = module.mlflow.tg_arn
   mape_alarm_threshold = var.mape_alarm_threshold
 }
+
+module "lambdas" {
+  source                 = "../../modules/lambdas"
+  project                = var.project
+  job_queue_spot_arn     = module.batch.job_queue_spot_arn
+  job_queue_ondemand_arn = module.batch.job_queue_ondemand_arn
+  job_definition_name    = module.batch.job_definition_name
+  default_tuning         = var.default_tuning
+  data_bucket            = module.storage.data_bucket
+  varieties_allowed      = var.varieties_allowed
+  sns_topic_arn          = module.monitoring.sns_topic_arn
+  log_retention_days     = var.log_retention_days
+  lambdas_src_dir        = "${path.module}/../../lambdas"
+}
