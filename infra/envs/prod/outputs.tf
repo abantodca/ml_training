@@ -10,3 +10,4 @@ output "batch_job_queue_spot" { value = module.batch.job_queue_spot }
 output "batch_job_queue_od"   { value = module.batch.job_queue_ondemand }
 # Necesario para los comandos del runbook Sec 8.1/8.2.
 output "batch_job_definition" { value = module.batch.job_definition_name }
+output "sns_alerts_topic" { value = module.monitoring.sns_topic_arn }

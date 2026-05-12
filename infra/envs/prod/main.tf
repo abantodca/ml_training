@@ -61,3 +61,13 @@ module "batch" {
   job_attempt_seconds  = var.job_attempt_seconds
   log_retention_days   = var.log_retention_days
 }
+
+module "monitoring" {
+  source               = "../../modules/monitoring"
+  project              = var.project
+  alert_email          = var.alert_email
+  batch_job_queue_name = module.batch.job_queue_spot
+  alb_arn              = module.mlflow.alb_arn
+  tg_arn               = module.mlflow.tg_arn
+  mape_alarm_threshold = var.mape_alarm_threshold
+}
