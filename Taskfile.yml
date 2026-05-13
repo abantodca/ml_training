@@ -45,6 +45,13 @@
 # CLEANUP:   task clean:docker   (DESTRUCTIVO: borra volumen Postgres)
 #
 # Cada variedad es un proceso independiente: si una falla, las demas siguen.
+#
+# NOTA: Para PRODUCCION AWS (deploy, build a ECR, batch, lifecycle), ver
+# GUIA_MLOPS_AWS_V2.md §4. La guia detalla como anadir un bloque `includes:`
+# a este Taskfile y crear `tasks/*.yml` por dominio (infra/ecr/batch/cluster/
+# mlflow-aws/aws). Despues de seguir la guia, `task --list` mostrara ambos:
+# tasks locales (build, train, ...) y tasks AWS namespaced (infra:apply,
+# ecr:build-all, batch:retrain, ...).
 # =============================================================================
 
 version: "3"
@@ -105,6 +112,8 @@ tasks:
         echo "   s3://...                           Backend de artifacts MLflow (S3 real)"
         echo ""
         echo "CLEANUP:   task clean:docker   (DESTRUCTIVO: borra volumen Postgres)"
+        echo ""
+        echo "PRODUCCION AWS: ver GUIA_MLOPS_AWS_V2.md §4 (anade tasks/*.yml AWS)"
         echo ""
         echo "   Tip: task --list    listado plano de TODAS las tasks"
         echo "============================================================================="
