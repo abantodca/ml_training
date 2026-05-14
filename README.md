@@ -71,7 +71,7 @@ python main.py --tuning prod --skip-final-tuning           # ahorra ~1/(outer+1)
 python main.py --tuning prod --varieties POP --no-register                 # no toca el Registry
 python main.py --tuning prod --varieties POP --registry-stage Staging      # registra y promueve
 # Para Production, se recomienda usar el workflow `promote.yml` con gates
-# de calidad (GUIA_MLOPS_AWS.md §12) en vez del flag.
+# de calidad (GUIA_MLOPS_AWS_V2.md §12) en vez del flag.
 ```
 
 ### Tuning profiles (`src/config.py`)
@@ -352,7 +352,7 @@ así por:
 
 - **Un experimento por variedad**: `MLFLOW_EXPERIMENT_PREFIX + variety`. Default prefix vacío → el experimento es el nombre de la variedad (`POP`, `JUPITER`, …).
 - **Run versionado dentro del experimento**: `xgb_v1`, `xgb_v2`, …, `lgb_v1`, … (`next_run_version` autoincrementa por modelo). El campeón histórico vive en el mismo experimento que sus rivales y se distingue por sus tags.
-- **Model Registry**: `MODEL_REGISTRY_PREFIX + variety` (default `rnd-forest-POP`, `rnd-forest-JUPITER`, …). Cada training del campeón crea una nueva versión del registered model. La promoción a `Staging` / `Production` NO es parte del training run — se hace fuera del pipeline (manual desde la UI, vía `mlflow models transition`, o vía el workflow CI/CD `promote.yml` descripto en `GUIA_MLOPS_AWS.md` §12, que aplica gates de calidad antes de promover).
+- **Model Registry**: `MODEL_REGISTRY_PREFIX + variety` (default `rnd-forest-POP`, `rnd-forest-JUPITER`, …). Cada training del campeón crea una nueva versión del registered model. La promoción a `Staging` / `Production` NO es parte del training run — se hace fuera del pipeline (manual desde la UI, vía `mlflow models transition`, o vía el workflow CI/CD `promote.yml` descripto en `GUIA_MLOPS_AWS_V2.md` §12, que aplica gates de calidad antes de promover).
 
 > El `MODEL_REGISTRY_PREFIX` por default está alineado con cualquier servicio
 > downstream que cargue modelos como `f"rnd-forest-{variety}"`. Cambiarlo
