@@ -26,7 +26,7 @@
 >    **En Windows: WSL Ubuntu de principio a fin** — toda la guia (bash,
 >    Terraform, AWS CLI, Docker via WSL2 integration, Task) corre dentro
 >    de WSL. NO Git Bash, NO PowerShell (memoria `feedback_shell_bash.md`).
->    Esta decision se aplica desde §0.3 hasta el final.
+>    Esta decision se aplica desde 📖 0.3 hasta el final.
 >
 > **Que NO es esta V2**: un tutorial introductorio. Asume que ya conoces
 > Terraform modular, Docker multi-stage, AWS Batch / ECS Fargate / RDS,
@@ -51,7 +51,7 @@
   - 0.4 Convenciones (bash desde la raiz, naming, regions)
 - **Parte 1 — Overview del lifecycle y stand-up** *(oleada 1, ⬇ abajo)*
   - 1.1 STAND-UP — primera vez, de cero a produccion
-  - 1.2 Otros modos (TEAR-DOWN / REBUILD / DESTROY) — pointer a §8.5-§8.7
+  - 1.2 Otros modos (TEAR-DOWN / REBUILD / DESTROY) — pointer a 📖 8.5-📖 8.7
 - **Parte 2 — Bootstrap irreversible** *(oleada 1, ⬇ abajo)*
   - 2.1 Por que el bootstrap es a mano
   - 2.2 Script de bootstrap (bash)
@@ -124,7 +124,7 @@ mezclados con manuales operativos. La V2 los separa porque cada uno:
 - **Tiene una transicion legitima distinta**. Stand-up → tear-down →
   rebuild es seguro y reversible. Stand-up → destroy es definitivo.
 - **Tiene un perfil de costo distinto** que el desarrollador necesita
-  ver (§9.3 — matriz cruzada de costos por modo).
+  ver (📖 9.3 — matriz cruzada de costos por modo).
 
 ### Por que Terraform + Task + GitHub Actions (las 3 a la vez)
 
@@ -151,7 +151,7 @@ juntas se cubren los puntos ciegos mutuamente.
 en lugar de Task. Lo migramos porque el stack es Docker + AWS managed
 services (no hosts EC2), donde Ansible es overkill: requiere Python+pipx,
 no es native Windows, y la sintaxis YAML+Jinja+DSL es mas pesada que
-los `cmds:` POSIX de Task. Ver §4.1 para la comparacion completa.
+los `cmds:` POSIX de Task. Ver 📖 4.1 para la comparacion completa.
 
 ### Por que algunas cosas se hacen a mano y no via Terraform
 
@@ -244,7 +244,7 @@ MLflow Model Registry: version transicionada a "Production"
 Con scheduler L-V 08-12 PET activado desde el dia 1: **~$68 USD/mes**
 (detalle en Parte 9; la diferencia con el ~$64 de la V1 viene de incluir
 Reports Fargate y NAT egress que la V1 no contaba). Sin scheduler
-(24/7): ~$140/mes. Solo storage (hibernado, §8.5): ~$8/mes.
+(24/7): ~$140/mes. Solo storage (hibernado, 📖 8.5): ~$8/mes.
 
 ---
 
@@ -488,10 +488,10 @@ Las 4 referencias que aparecen una y otra vez:
   comandos son bash desde la raiz del repo. `$VAR` para variables, `&&`
   para chains, `\` para line continuation. En Windows: la unica terminal
   soportada es WSL Ubuntu (NO Git Bash, NO PowerShell). Esta eleccion
-  vale de §0.3 hasta el final de la guia.
+  vale de 📖 0.3 hasta el final de la guia.
 - **Task**: las operaciones AWS se invocan como `task <namespace>:<accion>`
   (e.g. `task infra:apply`, `task batch:retrain VARIETIES=POP`). El
-  binario de Task se instala **dentro de WSL** (ver §0.3.3); aunque Task
+  binario de Task se instala **dentro de WSL** (ver 📖 0.3.3); aunque Task
   tambien corre nativo en Windows, mezclar ambos host filesystems con la
   misma carpeta `infra/` da problemas de permisos y line endings.
 - **Comandos de un solo shot**: si ves un bloque con `# UNA SOLA VEZ`,
@@ -533,10 +533,10 @@ Diagrama de transiciones:
                                        (vacio)
 ```
 
-> **Que cubre esta Parte 1**: solo el **STAND-UP** (§1.1, abajo) — el unico
+> **Que cubre esta Parte 1**: solo el **STAND-UP** (📖 1.1, abajo) — el unico
 > modo que necesitas en una primera lectura, porque todavia no tenes nada
 > construido. Los otros 3 modos (TEAR-DOWN / REBUILD / DESTROY) son
-> operaciones del runbook y viven en **§8.5-§8.7**: aplican cuando ya
+> operaciones del runbook y viven en **📖 8.5-📖 8.7**: aplican cuando ya
 > estuviste operando el sistema.
 >
 > **Regla de oro**: solo se DESTRUYE cuando estas seguro. Tear-down +
@@ -601,16 +601,16 @@ Estos modos son operaciones del runbook (ya tenes el sistema construido),
 no del stand-up inicial. En tu primera lectura no los necesitas — saltalos
 y volve cuando ya estes operando. Estan documentados en Parte 8:
 
-- **§8.5 — TEAR-DOWN**: apagar todo preservando state + datos (~$8/mes
+- **📖 8.5 — TEAR-DOWN**: apagar todo preservando state + datos (~$8/mes
   hibernado, reversible con rebuild).
-- **§8.6 — REBUILD**: volver despues de un tear-down (cambia solo el ALB
+- **📖 8.6 — REBUILD**: volver despues de un tear-down (cambia solo el ALB
   DNS).
-- **§8.7 — DESTROY**: eliminar TODO de la cuenta AWS (requiere 3 backups
+- **📖 8.7 — DESTROY**: eliminar TODO de la cuenta AWS (requiere 3 backups
   manuales previos — solo aplica si ya operaste el sistema y tenes
   modelos en el Registry, datos en RDS y Terraform state poblado).
 
 La matriz cruzada de costos entre modos (stand-up vs tear-down vs destroy)
-esta en §9.3.
+esta en 📖 9.3.
 
 ---
 
@@ -672,7 +672,7 @@ set -euo pipefail
 
 PROJECT="${PROJECT:-ml-training}"
 REGION="${AWS_DEFAULT_REGION:-us-east-1}"
-# Mismas convenciones que §0.4 (ACCOUNT_ID / ACCOUNT_SUFFIX) — si el
+# Mismas convenciones que 📖 0.4 (ACCOUNT_ID / ACCOUNT_SUFFIX) — si el
 # usuario ya las exporto en su sesion, las reusamos; sino las calculamos.
 ACCOUNT_ID="${ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text)}"
 ACCOUNT_SUFFIX="${ACCOUNT_SUFFIX:-${ACCOUNT_ID: -6}}"
@@ -731,9 +731,9 @@ cd /mnt/c/Users/CarlosAlexanderAbant/Documents/Proyectos/ml_random_forest/ml_tra
 # Crear el directorio infra/ si no existe
 mkdir -p infra
 
-# Verificar que el script existe (lo creaste en §2.2)
+# Verificar que el script existe (lo creaste en 📖 2.2)
 ls -la infra/bootstrap.sh
-# Si no existe -> volver a §2.2 y pegar el contenido en infra/bootstrap.sh
+# Si no existe -> volver a 📖 2.2 y pegar el contenido en infra/bootstrap.sh
 
 # Dar permiso ejecutable + ejecutar
 chmod +x infra/bootstrap.sh
@@ -879,7 +879,7 @@ git push origin main --tags   # opcional pero recomendado
 
 A partir de este punto, **toda la infra es Terraform**. Los `.sh` del
 bootstrap no se vuelven a tocar salvo que destruyas la cuenta entera
-(§8.7).
+(📖 8.7).
 
 ---
 
@@ -926,7 +926,7 @@ ml_training/
 │   └── lambdas/                            # Codigo Python de las Lambdas
 │       ├── dispatcher.py                   # 3.9.5
 │       ├── notifier.py                     # 3.9.6
-│       └── scheduler.py                    # 3.10.5
+│       └── scheduler.py                    # 3.10.4
 ├── docker/
 │   ├── mlflow/Dockerfile                   # ya existe (custom MLflow)
 │   ├── reports/Dockerfile                  # 3.6.5 (nginx + s3-sync sidecar)
@@ -1160,7 +1160,36 @@ infra/modules/scheduler/*.zip
 EOF
 ```
 
-### 3.2.5 `infra/envs/prod/main.tf`
+### 3.2.5 `infra/envs/prod/main.tf` (esqueleto — crece incrementalmente)
+
+> **Como leer esta seccion**: a diferencia de los `variables.tf` /
+> `outputs.tf` que se pegan completos, este `main.tf` se **construye
+> en partes** a medida que avanzas por la guia. Aca pegas solo el
+> esqueleto (los `data` sources). Cada `module "X" {}` se va
+> apendeando al final del archivo cuando llegues a la seccion del
+> modulo correspondiente:
+>
+> | Bloque                | Se agrega en | Modulo creado en |
+> |---|---|---|
+> | `module "network"`    | 📖 3.3.4       | 📖 3.3             |
+> | `module "storage"`    | 📖 3.4.4       | 📖 3.4             |
+> | `module "mlflow"`     | 📖 3.5.4       | 📖 3.5             |
+> | `module "reports"`    | 📖 3.6.7       | 📖 3.6             |
+> | `module "batch"`      | 📖 3.7.5       | 📖 3.7             |
+> | `module "monitoring"` | 📖 3.8.4       | 📖 3.8             |
+> | `module "lambdas"`    | 📖 3.9.7       | 📖 3.9             |
+> | `module "scheduler"`  | 📖 3.10.5      | 📖 3.10            |
+> | `module "cicd"`       | 📖 3.11.4      | 📖 3.11            |
+>
+> **Por que incremental y no de un saque**: cada `module "X" {}`
+> referencia outputs de modulos anteriores (e.g. `module.network.vpc_id`).
+> Si pegas el `main.tf` completo antes de crear los modulos, `terraform
+> validate` truena con "module not found" en cada uno. Apendear por
+> capas mantiene el archivo siempre **valido** al terminar cada seccion
+> — podes correr `terraform fmt` / `validate` checkpoint por checkpoint.
+> La verificacion final integrada esta en 📖 3.12.
+
+Pegar **solo** este contenido inicial:
 
 ```hcl
 # Datos compartidos
@@ -1168,158 +1197,31 @@ data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
 
 # OIDC provider de GitHub (creado en Parte 2.5, NO creado por Terraform).
-# Si saltaste §2.5, este `data` falla con "no resource found" en plan.
+# Si saltaste 📖 2.5, este `data` falla con "no resource found" en plan.
 # Pre-check antes de `terraform plan`:
 #   aws iam list-open-id-connect-providers --query 'OpenIDConnectProviderList[?contains(Arn,`token.actions.githubusercontent.com`)]'
-# Si devuelve [], correr `bash infra/bootstrap-oidc.sh` (§2.5).
+# Si devuelve [], correr `bash infra/bootstrap-oidc.sh` (📖 2.5).
 data "aws_iam_openid_connect_provider" "github" {
   url = "https://token.actions.githubusercontent.com"
 }
-
-# -------------------------------------------------------------------------
-# Capa 1: Red (VPC + subnets + NAT + SGs)
-# -------------------------------------------------------------------------
-module "network" {
-  source   = "../../modules/network"
-  project  = var.project
-  vpc_cidr = var.vpc_cidr
-}
-
-# -------------------------------------------------------------------------
-# Capa 2: Storage (S3 buckets + ECR repos)
-# -------------------------------------------------------------------------
-module "storage" {
-  source  = "../../modules/storage"
-  project = var.project
-}
-
-# -------------------------------------------------------------------------
-# Capa 3: MLflow (RDS + ECS Fargate + ALB)
-# -------------------------------------------------------------------------
-module "mlflow" {
-  source = "../../modules/mlflow"
-
-  project              = var.project
-  vpc_id               = module.network.vpc_id
-  public_subnet_ids    = module.network.public_subnet_ids
-  private_subnet_ids   = module.network.private_subnet_ids
-  sg_alb_id            = module.network.sg_alb_id
-  sg_mlflow_id         = module.network.sg_mlflow_id
-  sg_rds_id            = module.network.sg_rds_id
-  rds_instance_class   = var.rds_instance_class
-  mlflow_image         = "${module.storage.ecr_mlflow_url}:${var.mlflow_image_tag}"
-  artifacts_bucket     = module.storage.artifacts_bucket
-  artifacts_bucket_arn = module.storage.artifacts_bucket_arn
-  log_retention_days   = var.log_retention_days
-}
-
-# -------------------------------------------------------------------------
-# Capa 4: Reports (Fargate nginx, mismo cluster + ALB que MLflow)
-# -------------------------------------------------------------------------
-module "reports" {
-  source = "../../modules/reports"
-
-  project              = var.project
-  vpc_id               = module.network.vpc_id
-  private_subnet_ids   = module.network.private_subnet_ids
-  sg_mlflow_id         = module.network.sg_mlflow_id
-  ecs_cluster_id       = module.mlflow.cluster_id
-  alb_listener_arn     = module.mlflow.alb_listener_arn
-  artifacts_bucket     = module.storage.artifacts_bucket
-  artifacts_bucket_arn = module.storage.artifacts_bucket_arn
-  reports_image        = "${module.storage.ecr_reports_url}:${var.reports_image_tag}"
-  log_retention_days   = var.log_retention_days
-}
-
-# -------------------------------------------------------------------------
-# Capa 5: Batch (Spot + OD queues, job-def, IAM)
-# -------------------------------------------------------------------------
-module "batch" {
-  source = "../../modules/batch"
-
-  project              = var.project
-  private_subnet_ids   = module.network.private_subnet_ids
-  sg_batch_id          = module.network.sg_batch_id
-  ecr_trainer_url      = module.storage.ecr_trainer_url
-  trainer_image_tag    = var.trainer_image_tag
-  spot_max_vcpus       = var.spot_max_vcpus
-  ondemand_max_vcpus   = var.ondemand_max_vcpus
-  instance_type        = var.batch_instance_type
-  tracking_uri         = module.mlflow.tracking_uri
-  artifacts_bucket     = module.storage.artifacts_bucket
-  artifacts_bucket_arn = module.storage.artifacts_bucket_arn
-  data_bucket          = module.storage.data_bucket
-  data_bucket_arn      = module.storage.data_bucket_arn
-  log_retention_days   = var.log_retention_days
-}
-
-# -------------------------------------------------------------------------
-# Capa 6: Monitoring (SNS + alarmas CloudWatch)
-# -------------------------------------------------------------------------
-module "monitoring" {
-  source = "../../modules/monitoring"
-
-  project              = var.project
-  alert_email          = var.alert_email
-  batch_job_queue_name = module.batch.job_queue_spot
-  alb_arn_suffix       = module.mlflow.alb_arn_suffix
-  varieties            = var.varieties_allowed
-  mape_alarm_threshold = var.mape_alarm_threshold
-  log_retention_days   = var.log_retention_days
-}
-
-# -------------------------------------------------------------------------
-# Capa 7: Lambdas (dispatcher + notifier)
-# -------------------------------------------------------------------------
-module "lambdas" {
-  source = "../../modules/lambdas"
-
-  project                = var.project
-  job_queue_spot_arn     = module.batch.job_queue_spot_arn
-  job_queue_ondemand_arn = module.batch.job_queue_ondemand_arn
-  job_definition_name    = module.batch.job_definition_name
-  data_bucket            = module.storage.data_bucket
-  varieties_allowed      = var.varieties_allowed
-  sns_topic_arn          = module.monitoring.sns_topic_arn
-  log_retention_days     = var.log_retention_days
-  lambdas_src_dir        = "${path.module}/../../lambdas"
-}
-
-# -------------------------------------------------------------------------
-# Capa 8: Scheduler (auto on/off RDS + Fargate)
-# -------------------------------------------------------------------------
-module "scheduler" {
-  source = "../../modules/scheduler"
-
-  project                  = var.project
-  ecs_cluster_name         = module.mlflow.cluster_name
-  ecs_service_name_mlflow  = module.mlflow.service_name
-  ecs_service_name_reports = module.reports.service_name
-  rds_instance_id          = module.mlflow.rds_instance_id
-  work_start_hour_local    = var.work_start_hour_local
-  work_end_hour_local      = var.work_end_hour_local
-  log_retention_days       = var.log_retention_days
-  lambdas_src_dir          = "${path.module}/../../lambdas"
-}
-
-# -------------------------------------------------------------------------
-# Capa 9: CI/CD (GHA IAM roles confiando en OIDC)
-# -------------------------------------------------------------------------
-module "cicd" {
-  source = "../../modules/cicd"
-
-  project                = var.project
-  github_org             = var.github_org
-  github_repo            = var.github_repo
-  oidc_provider_arn      = data.aws_iam_openid_connect_provider.github.arn
-  artifacts_bucket_arn   = module.storage.artifacts_bucket_arn
-  data_bucket_arn        = module.storage.data_bucket_arn
-  ecr_trainer_arn        = module.storage.ecr_trainer_arn
-  job_queue_spot_arn     = module.batch.job_queue_spot_arn
-  job_queue_ondemand_arn = module.batch.job_queue_ondemand_arn
-  job_definition_arn     = module.batch.job_definition_arn
-}
 ```
+
+> **🖱️ Equivalente en AWS Console**:
+>
+> | Recurso Terraform | Servicio | Que harias click-a-click |
+> |---|---|---|
+> | `data "aws_caller_identity"` | **🔐 IAM / STS** | `IAM > Dashboard` muestra arriba a la derecha tu **Account ID** de 12 digitos. Read-only — solo "pregunta a AWS quien soy" via `sts:GetCallerIdentity`. |
+> | `data "aws_region"` | **🌎 Region picker** | El selector de region arriba a la derecha (e.g. `us-east-1`). Tambien read-only. |
+> | `data "aws_iam_openid_connect_provider"` | **🔐 IAM** | `IAM > Identity providers` → veras `token.actions.githubusercontent.com` (creado por `bootstrap-oidc.sh` en 📖 2.5). El `data` lo "lee" para que `module.cicd` (📖 3.11) pueda asignar trust policies a los roles GHA sin hardcodear el ARN. |
+>
+> **🧠 Conceptualmente — `data` vs `resource`**: `data` source = lectura
+> de algo que **ya existe** (creado fuera de Terraform o por otro
+> stack). `resource` = Terraform **gestiona el ciclo de vida**
+> (create/update/destroy). Por eso el OIDC provider esta como `data`:
+> lo creamos a mano en 📖 2.5 con `bootstrap-oidc.sh` para que cualquier
+> `terraform destroy` accidental no te tire la confianza GHA-AWS
+> (recrearlo cuesta rotar `vars.AWS_GHA_DEPLOY_ROLE_ARN` y arreglar
+> branch protection — friccion innecesaria).
 
 ### 3.2.6 `infra/envs/prod/outputs.tf`
 
@@ -1704,6 +1606,30 @@ output "sg_rds_id" { value = aws_security_group.rds.id }
 >   desde sg-alb), `sg-batch` (egress all), `sg-rds` (ingress 5432
 >   desde sg-mlflow + sg-batch).
 
+### 3.3.4 Apendear `module "network"` en `infra/envs/prod/main.tf`
+
+Ahora que el modulo `network` esta definido (📖 3.3.2) y expone sus
+outputs (📖 3.3.3), lo **cableamos desde el env `prod`**. Pegar AL
+FINAL de `infra/envs/prod/main.tf` (a continuacion del bloque
+`data` de 📖 3.2.5):
+
+```hcl
+# -------------------------------------------------------------------------
+# Capa 1: Red (VPC + subnets + NAT + SGs)
+# -------------------------------------------------------------------------
+module "network" {
+  source   = "../../modules/network"
+  project  = var.project
+  vpc_cidr = var.vpc_cidr
+}
+```
+
+> **Checkpoint**: con esto el `main.tf` ya es valido. Podes correr
+> `terraform fmt` y `terraform validate` (no `plan` todavia — falta
+> el resto de los modulos). Si valida → seguir a 📖 3.4.
+
+---
+
 ## 3.4 `modules/storage/` — S3 buckets + ECR repos
 
 ### 3.4.1 `modules/storage/variables.tf`
@@ -1714,39 +1640,62 @@ variable "project" { type = string }
 
 ### 3.4.2 `modules/storage/main.tf`
 
+Pegar los bloques siguientes **uno a continuacion del otro** en el
+mismo archivo `modules/storage/main.tf`. La separacion en sub-bloques
+con `### 3.4.2.X` es solo para que puedas leer el "por que" de cada
+pieza sin perderte; el archivo final es la concatenacion de los 5
+bloques.
+
+#### 3.4.2.a — Header: account suffix discovery
+
+Calcula el sufijo de 6 chars que comparten todos los buckets (data,
+artifacts) y el bucket de tfstate creado a mano por `bootstrap.sh`.
+Equivalente bash: `${ACCOUNT: -6}`. Asi un mismo `account_id` produce
+el mismo sufijo en todos los buckets — operativamente no te confundis
+entre "cual era el bucket de este proyecto".
+
+> **🖱️ Equivalente en AWS Console**:
+>
+> | Recurso Terraform | Servicio | Que harias click-a-click |
+> |---|---|---|
+> | `data "aws_caller_identity"` | **🔐 IAM / STS** | `IAM > Dashboard` muestra arriba a la derecha tu **Account ID** de 12 digitos. El `data` es read-only — no crea nada, solo "pregunta a AWS quien soy" via STS (`sts:GetCallerIdentity`). |
+> | `locals.account_suffix` | — | No tiene UI: es compute puro de Terraform. Toma los ultimos 6 chars del account_id para usarlos de sufijo de bucket. |
+>
+> **🧠 Conceptualmente — por que un sufijo y no el nombre crudo**: los nombres de bucket S3 son **globalmente unicos** (no por cuenta, ni por region — globalmente, en TODO S3). Si dos personas hicieran `terraform apply` con `project=ml-training`, el segundo `terraform apply` fallaria con "bucket already exists". El sufijo de 6 chars del account_id hace que el bucket sea **practicamente unico** sin tener que pensar en nombres creativos, y al mismo tiempo te queda **deterministico** dentro de una misma cuenta (no random).
+
 ```hcl
 data "aws_caller_identity" "current" {}
 
 locals {
-  # Mismo sufijo que calcula bash en bootstrap.sh con `${ACCOUNT: -6}`.
-  # Para un account_id estandar de 12 digitos, substr(...,6,6) toma los
-  # caracteres en posiciones 6-11 (indices 0-based), que son los ULTIMOS
-  # 6 caracteres. Equivalencia con bash: `${ACCOUNT: -6}` → tail 6 chars.
-  # Esto asegura que el bucket de tfstate (creado a mano por bootstrap.sh)
-  # y los buckets data/artifacts (creados por Terraform) compartan el
-  # mismo sufijo, evitando confusion operativa.
+  # ${ACCOUNT: -6} en bash. substr(...,6,6) toma chars 6-11 (indices 0-based)
+  # = los ultimos 6 chars de un account_id estandar de 12 digitos.
   account_suffix = substr(data.aws_caller_identity.current.account_id, 6, 6)
 }
+```
 
-# ----- S3: data (input Excels) -----------------------------------------
-#
-# 🖱️ AWS CONSOLE (S3 bucket data):
-#   S3 > Buckets > Create bucket. Name: ml-training-data-<sufijo>. Region: us-east-1.
-#   ACLs: disabled. Block all public access: ON. Bucket versioning: Enable.
-#   Default encryption: AES-256. Object Ownership: ACLs disabled, Bucket owner enforced.
-# 🧠 Conceptualmente: aca subis el Excel acumulado (BD_HISTORICO_ACUMULADO.xlsx)
-#   antes de cada training. El versioning te guarda copia de cada subida — si
-#   alguien sobrescribe con un Excel roto, podes recuperar la version anterior.
+#### 3.4.2.b — S3 bucket `data` (input Excels) + hardening
+
+El bucket donde subis el Excel acumulado (`BD_HISTORICO_ACUMULADO.xlsx`)
+antes de cada training. Los 3 sub-recursos (versioning, encryption,
+public-block) son **obligatorios** en cualquier bucket post-2023 —
+defaults seguros + auditoria.
+
+> **🖱️ Equivalente en AWS Console**:
+>
+> | Recurso Terraform | Servicio | Que harias click-a-click |
+> |---|---|---|
+> | `aws_s3_bucket.data` | **🪣 S3** | `S3 > Buckets > Create bucket`. **Name**: `ml-training-data-<sufijo>`. **Region**: `us-east-1`. **ACLs**: disabled. **Object Ownership**: ACLs disabled, Bucket owner enforced. |
+> | `aws_s3_bucket_versioning.data` | **🪣 S3** | Mismo bucket → `Properties > Bucket Versioning > Edit > Enable`. Cada PUT escribe una **nueva version** en vez de pisar; podes restaurar versiones anteriores desde la consola. |
+> | `aws_s3_bucket_server_side_encryption_configuration.data` | **🪣 S3** | `Properties > Default encryption > Edit > AES-256 (SSE-S3)`. **Bucket Key**: Enable (reduce costos de KMS si en el futuro migras a SSE-KMS). |
+> | `aws_s3_bucket_public_access_block.data` | **🪣 S3** | `Permissions > Block public access > Edit > Block all public access`. Las 4 sub-opciones ON: bloquea ACLs publicas y bucket policies publicas, tanto las que existen como las que se intenten crear. |
+>
+> **🧠 Conceptualmente — por que 4 recursos Terraform para "un bucket"**: la API REST de S3 expone cada faceta del bucket como un sub-endpoint distinto (`PUT /?versioning`, `PUT /?encryption`, `PUT /?publicAccessBlock`). Terraform refleja la API 1-a-1: 1 recurso por sub-endpoint. La consola te lo presenta como tabs dentro de la "pagina de bucket", pero atras son llamadas API separadas. **Versioning** te salva si alguien sube un Excel roto (rollback en 1 click); **encryption AES-256** cumple la mayoria de policies de seguridad sin costo extra; **public access block** es la red de seguridad #1 contra "bucket S3 publico por error" — el bug clasico que hace headlines.
+
+```hcl
 resource "aws_s3_bucket" "data" {
   bucket = "${var.project}-data-${local.account_suffix}"
 }
 
-# 🖱️ AWS CONSOLE (versioning + encryption + public block):
-#   En S3, los 3 recursos son TABs dentro del bucket: Properties > Bucket
-#   Versioning > Enable; Properties > Default encryption > AES-256;
-#   Permissions > Block public access > Edit > all ON.
-#   En Terraform vienen como recursos SEPARADOS porque la API REST de S3
-#   los expone como sub-endpoints distintos (PUT /?versioning, PUT /?encryption, etc.).
 resource "aws_s3_bucket_versioning" "data" {
   bucket = aws_s3_bucket.data.id
   versioning_configuration { status = "Enabled" }
@@ -1767,18 +1716,35 @@ resource "aws_s3_bucket_public_access_block" "data" {
   ignore_public_acls      = true
   restrict_public_buckets = true
 }
+```
 
-# ----- S3: artifacts (modelos + reportes; MLflow artifact store) ------
-#
-# 🖱️ AWS CONSOLE (S3 bucket artifacts):
-#   S3 > Create bucket. Name: ml-training-artifacts-<sufijo>. Mismas
-#   settings que el bucket data (versioning, encryption, public block).
-# 🧠 Conceptualmente: este bucket es el "almacen central" de outputs:
-#   - artifacts/POP/final_pipeline_POP_v1.joblib  (el modelo entrenado)
-#   - artifacts/POP/run_summary_POP.json          (metricas del run)
-#   - reports/POP/dashboard.html                  (dashboards interactivos)
-#   MLflow tambien lo usa como "artifact store" (al log_artifact() escribe aca).
-#   Lifecycle: borra versiones viejas a los 90 dias para no inflar el bill.
+#### 3.4.2.c — S3 bucket `artifacts` (modelos + reportes + MLflow store) + lifecycle
+
+Almacen central de outputs: modelos `.joblib`, JSONs de metricas,
+dashboards HTML, y el "artifact store" de MLflow (cuando
+`mlflow.log_artifact()` sube algo, va aca). La lifecycle policy borra
+**versiones no-current** a los 90 dias para que el bill S3 no se infle
+indefinidamente.
+
+> **🖱️ Equivalente en AWS Console**:
+>
+> | Recurso Terraform | Servicio | Que harias click-a-click |
+> |---|---|---|
+> | `aws_s3_bucket.artifacts` | **🪣 S3** | `Create bucket` con nombre `ml-training-artifacts-<sufijo>`. Mismas settings que el bucket data. |
+> | `aws_s3_bucket_versioning.artifacts` + `_server_side_encryption_configuration` + `_public_access_block` | **🪣 S3** | Mismos 3 sub-recursos de hardening (versioning, encryption AES-256, public access block) — identico al bloque .b. |
+> | `aws_s3_bucket_lifecycle_configuration.artifacts` | **🪣 S3** | `Management > Lifecycle rules > Create lifecycle rule`. **Name**: `expire-noncurrent`. **Scope**: Apply to all objects. **Permanently delete noncurrent versions**: after **90 days**. **Abort incomplete multipart uploads**: after 7 days. |
+>
+> **🧠 Que guarda este bucket** — estructura tipica:
+> - `artifacts/POP/final_pipeline_POP_v1.joblib` (el modelo entrenado)
+> - `artifacts/POP/run_summary_POP.json` (metricas del run)
+> - `reports/POP/dashboard.html` (dashboards interactivos)
+> - Internamente MLflow tambien apunta sus `artifact_uri` aca.
+>
+> **🧠 Por que 90 dias y no 30 ni 365**: tres meses cubren un ciclo razonable de A/B testing entre modelos (cuanto tiempo querrias mirar atras para comparar un campeon contra su predecesor). **Mas corto** perderia auditoria de incidentes pasados — "el modelo de hace 2 meses que se rompio en prod, donde esta?". **Mas largo** infla el bill S3 sin valor operativo: los artifacts viejos se vuelven data fria sin uso. Nota: la lifecycle solo borra **noncurrent versions** (las versiones viejas que reemplazaste); la version actual del modelo nunca se borra automaticamente.
+>
+> **🧠 Por que `abort_incomplete_multipart_upload`**: cuando subis un archivo grande (~modelo de 100 MB+) y la subida se corta a la mitad, S3 te cobra storage por los chunks parciales aunque no podes ver el archivo. Esta regla los limpia a los 7 dias — barato seguro contra "fantasmas" en el bill.
+
+```hcl
 resource "aws_s3_bucket" "artifacts" {
   bucket = "${var.project}-artifacts-${local.account_suffix}"
 }
@@ -1804,13 +1770,6 @@ resource "aws_s3_bucket_public_access_block" "artifacts" {
   restrict_public_buckets = true
 }
 
-# Lifecycle: borrar versiones no-current despues de 90 dias.
-# Por que 90 (y no 30 ni 365): 3 meses cubre un ciclo razonable de
-# A/B testing entre modelos (cuanto tiempo querrias mirar atras para
-# comparar un campeon contra su predecesor). Mas corto perderia
-# auditoria de incidentes pasados (e.g., "el modelo de hace 2 meses
-# que se rompio en prod"); mas largo infla el bill S3 sin valor
-# operativo (los artifacts viejos se vuelven "data fria" sin uso).
 resource "aws_s3_bucket_lifecycle_configuration" "artifacts" {
   bucket = aws_s3_bucket.artifacts.id
 
@@ -1822,19 +1781,29 @@ resource "aws_s3_bucket_lifecycle_configuration" "artifacts" {
     abort_incomplete_multipart_upload { days_after_initiation = 7 }
   }
 }
+```
 
-# ----- ECR: trainer ----------------------------------------------------
-#
-# 🖱️ AWS CONSOLE (ECR repository trainer):
-#   ECR > Private repositories > Create repository. Name: ml-training.
-#   Tag immutability: Mutable. Scan on push: Enabled. Encryption: AES-256.
-# 🧠 Conceptualmente: ECR es el "Docker Hub privado de AWS". Cada repo
-#   guarda imagenes Docker tagueadas (ml-training:v0.1.0, :sha-abc123, :latest).
-#   Mutable = podes sobreescribir un tag (ej. mover "latest" a una imagen nueva).
-#   El job de Batch hace `docker pull` desde este repo cuando arranca un job.
-#   Scan on push: ECR analiza la imagen recien subida buscando CVEs conocidos
-#   en los paquetes (te muestra "imagen tiene CVE-2024-XXXX en openssl"); util
-#   pero NO bloquea el push — es solo informativo en ECR > images.
+#### 3.4.2.d — ECR `trainer` + lifecycle policy
+
+El "Docker Hub privado" donde vive la imagen del trainer
+(`ml-training:v0.1.0`, `:sha-abc123`, `:latest`). El job de Batch hace
+`docker pull` desde aca cuando arranca. La lifecycle policy evita que
+ECR acumule decenas de GB de imagenes viejas.
+
+> **🖱️ Equivalente en AWS Console**:
+>
+> | Recurso Terraform | Servicio | Que harias click-a-click |
+> |---|---|---|
+> | `aws_ecr_repository.trainer` | **🐳 ECR** | `ECR > Private repositories > Create repository`. **Name**: `ml-training`. **Tag immutability**: `Mutable`. **Scan on push**: Enabled. **Encryption**: AES-256. |
+> | `aws_ecr_lifecycle_policy.trainer` | **🐳 ECR** | `ECR > [repo trainer] > Lifecycle Policy > Edit > Add rule`. Definir 2 reglas: Priority 1 = keep last 10 tagged `v*`/`sha-*`, Priority 2 = expire untagged > 7 days. La consola muestra preview de "que imagenes se borrarian con esta regla". |
+>
+> **🧠 Conceptualmente — MUTABLE vs IMMUTABLE**: `Mutable` permite que la **misma tag** apunte a una imagen distinta en el futuro (ej: `latest` se mueve de la imagen vieja a la nueva en cada push). Util para CI/CD donde reusas tags como `latest`/`main`. **Pero** si alguien hace `docker pull ml-training:latest` hoy y manana, recibe imagenes **distintas**, lo cual es trampa para debugging. Por eso ademas de `latest` siempre tagueamos con el sha del commit (`sha-abc123`) — esa es la tag "real" e inmutable de facto.
+>
+> **🧠 Por que la lifecycle**: cada imagen de trainer pesa ~1-2 GB. Si pusheas 50 versiones sin limpiar son ~75 GB acumulados (~$7.50/mes solo por storage en ECR). La policy garantiza max ~20 GB en cualquier momento (~$2/mes). Las reglas con `rulePriority` se evaluan en orden ascendente: primero "keep last 10 tagged", lo no-matcheado pasa a la regla 2 "expire untagged > 7 days".
+>
+> **🔍 Sobre `scan_on_push`**: ECR analiza la imagen recien subida buscando CVEs conocidos en sus paquetes (te muestra "imagen tiene CVE-2024-XXXX en openssl") en `ECR > [repo] > Images > [imagen] > Vulnerabilities`. Util pero **NO bloquea el push** — es solo informativo. Bloquear pushes con CVEs requiere un step adicional en CI (con `aws ecr describe-image-scan-findings`).
+
+```hcl
 resource "aws_ecr_repository" "trainer" {
   name                 = var.project
   image_tag_mutability = "MUTABLE" # CI/CD reusa tag "latest" + sha
@@ -1842,15 +1811,6 @@ resource "aws_ecr_repository" "trainer" {
   encryption_configuration { encryption_type = "AES256" }
 }
 
-# Lifecycle: mantener ultimas 10 tags + borrar untagged > 7 dias.
-#
-# 🖱️ AWS CONSOLE (lifecycle policy):
-#   ECR > [repo trainer] > Lifecycle Policy > Edit > Add rule. Definir 2 reglas
-#   con Priority 1 (keep last 10 tagged "v*"/"sha-*") y Priority 2 (expire
-#   untagged > 7 days). La consola muestra preview de "que imagenes se borrarian".
-# 🧠 Por que: cada imagen pesa ~1-2 GB. Si pusheas 50 versiones sin limpiar,
-#   son ~75 GB acumulados en ECR (~$7.50/mes solo por storage). Esta policy
-#   garantiza max ~20 GB en cualquier momento ($2/mes).
 resource "aws_ecr_lifecycle_policy" "trainer" {
   repository = aws_ecr_repository.trainer.name
   policy = jsonencode({
@@ -1880,12 +1840,25 @@ resource "aws_ecr_lifecycle_policy" "trainer" {
     ]
   })
 }
+```
 
-# ----- ECR: MLflow custom ----------------------------------------------
-#
-# 🖱️ AWS CONSOLE (ECR repository mlflow): mismo wizard que trainer, pero
-#   Tag immutability: IMMUTABLE (la tag v3.12.0 nunca debe sobrescribirse —
-#   garantiza que el ALB siempre apunta a la misma imagen verificada).
+#### 3.4.2.e — ECR `mlflow` (IMMUTABLE) + ECR `reports` (MUTABLE)
+
+Dos repos mas con politicas **opuestas** de tag immutability — la
+diferencia es deliberada y refleja como evolucionan los binarios.
+
+> **🖱️ Equivalente en AWS Console**:
+>
+> | Recurso Terraform | Servicio | Que harias click-a-click |
+> |---|---|---|
+> | `aws_ecr_repository.mlflow` | **🐳 ECR** | `Create repository`. **Name**: `ml-training-mlflow`. **Tag immutability**: **`IMMUTABLE`** (importante!). Scan on push: Enabled. Encryption: AES-256. |
+> | `aws_ecr_repository.reports` | **🐳 ECR** | `Create repository`. **Name**: `ml-training-reports`. **Tag immutability**: `Mutable`. Scan on push: Enabled. Encryption: AES-256. |
+>
+> **🧠 Por que MLflow va IMMUTABLE**: el binario de MLflow es un release oficial verificado (v3.12.0 baja de PyPI y se pinea con su hash). Si alguien pudiera sobrescribir la tag `v3.12.0` con una imagen distinta (intencional o accidentalmente), el ALB de produccion empezaria a servir una version no-auditada. **IMMUTABLE** = AWS rechaza con error cualquier push que intente reusar una tag existente. El nivel de proteccion es **a nivel API** — ni un humano con permisos de admin puede sobrescribir.
+>
+> **🧠 Por que reports queda MUTABLE**: el nginx + entrypoint.sh del modulo `reports` es codigo nuestro que iteramos seguido (ajustar `nginx.conf`, mejorar el `s3-sync`). Es razonable re-pushear `:latest` muchas veces. Ademas no sirve trafico critico de produccion como MLflow — si una iteracion sale mal, redeploys nuestros sin riesgo de compliance.
+
+```hcl
 resource "aws_ecr_repository" "mlflow" {
   name                 = "${var.project}-mlflow"
   image_tag_mutability = "IMMUTABLE" # v3.12.0 nunca cambia
@@ -1893,17 +1866,19 @@ resource "aws_ecr_repository" "mlflow" {
   encryption_configuration { encryption_type = "AES256" }
 }
 
-# ----- ECR: reports (nginx + s3-sync) ----------------------------------
-#
-# 🖱️ AWS CONSOLE (ECR repository reports): mismo wizard que trainer.
-#   Mutable porque podes iterar nginx.conf y re-pushear `:latest` sin bumpear version.
 resource "aws_ecr_repository" "reports" {
   name                 = "${var.project}-reports"
-  image_tag_mutability = "MUTABLE"
+  image_tag_mutability = "MUTABLE" # iteramos nginx.conf seguido
   image_scanning_configuration { scan_on_push = true }
   encryption_configuration { encryption_type = "AES256" }
 }
 ```
+
+> **Checkpoint despues de pegar los 5 bloques**: ejecuta
+> `terraform fmt infra/modules/storage/main.tf` para confirmar que el
+> archivo es sintacticamente valido. Si reformatea, OK; si imprime
+> error de parse, falta pegar un `}` o uniste dos resources sin
+> separador.
 
 ### 3.4.3 `modules/storage/outputs.tf`
 
@@ -1932,6 +1907,29 @@ output "ecr_reports_arn" { value = aws_ecr_repository.reports.arn }
 >   `ml-training-reports` (vacios hasta Ola B). Cada uno con scan-on-push
 >   y lifecycle policy (keep last 10 tags + borrar untagged >7 dias).
 
+### 3.4.4 Apendear `module "storage"` en `infra/envs/prod/main.tf`
+
+Mismo patron: pegar AL FINAL de `infra/envs/prod/main.tf`
+(despues del bloque `module "network"` de 📖 3.3.4):
+
+```hcl
+# -------------------------------------------------------------------------
+# Capa 2: Storage (S3 buckets + ECR repos)
+# -------------------------------------------------------------------------
+module "storage" {
+  source  = "../../modules/storage"
+  project = var.project
+}
+```
+
+> **Checkpoint**: `terraform fmt && terraform validate` debe pasar.
+> Storage es independiente de network (no comparte inputs) — por eso
+> en Parte 4 hay una "Ola A" que aplica storage **solo**, antes que
+> todo lo demas (📖 4.2). Asi tenes ECR listo para hacer `docker push`
+> antes de levantar ECS.
+
+---
+
 ## 3.5 `modules/mlflow/` — RDS + ECS Fargate + ALB
 
 Este modulo es el mas pesado: arma el backend de tracking (RDS Postgres),
@@ -1943,7 +1941,7 @@ contratos criticos del codigo del trainer:
   el ALB DNS no se conoce en tiempo de `terraform plan`. Refinable
   post-stand-up: una vez que tenes el ALB DNS, podrias pasar a lista
   especifica `--allowed-hosts <alb-dns>,mlflow.local,localhost` (ver
-  §10 hardening).
+  📖 10 hardening).
 - El usuario Postgres se llama `mlflow` y la DB se llama `mlflow`
   (igual que en docker-compose local, para que el trainer no tenga que
   cambiar la connection string entre local y prod).
@@ -1984,7 +1982,7 @@ porque RDS exige 2 AZs aunque sea single-AZ. `skip_final_snapshot=true`
 + `deletion_protection=false` son **inseguros para prod con datos
 reales**: nos los dejamos asi mientras hay solo experimentos
 descartables. Al primer modelo que importe en Production, ambos
-flags **deben cambiarse** (lo trata §10.4).
+flags **deben cambiarse** (lo trata 📖 10.4).
 
 > **🖱️ Equivalente en AWS Console**:
 >
@@ -2051,7 +2049,7 @@ resource "aws_db_instance" "mlflow" {
 #### 3.5.2.b — ALB (load balancer + target group + listener)
 
 Un solo ALB sirve MLflow y reports — el listener default va a MLflow,
-reports agrega una `listener_rule` desde §3.6. `idle_timeout=60` es
+reports agrega una `listener_rule` desde 📖 3.6. `idle_timeout=60` es
 suficiente para ML training UI; subir si subis dashboards pesados.
 
 > **🖱️ Equivalente en AWS Console**:
@@ -2297,7 +2295,7 @@ resource "aws_ecs_task_definition" "mlflow" {
           "--host 0.0.0.0 --port 5000",
           # Allowed-hosts wildcard: MLflow 3.x rechaza con 403 si el
           # Host: header no coincide. ALB DNS no se conoce en plan-time;
-          # wildcard es la opcion mas simple. Hardening en §10.
+          # wildcard es la opcion mas simple. Hardening en 📖 10.
           "--allowed-hosts '*'",
           "--backend-store-uri postgresql://mlflow:$$RDS_PASSWORD@${aws_db_instance.mlflow.address}:5432/mlflow",
           "--default-artifact-root s3://${var.artifacts_bucket}/artifacts",
@@ -2399,6 +2397,42 @@ output "namespace_id" { value = aws_service_discovery_private_dns_namespace.main
 >   (interno, para que reports/batch resuelvan `mlflow.local:5000`).
 > - Secrets Manager → `ml-training-rds-password` (con KMS aws/secretsmanager).
 > - CloudWatch → Log groups → `/ecs/ml-training/mlflow` (logs Fargate).
+
+### 3.5.4 Apendear `module "mlflow"` en `infra/envs/prod/main.tf`
+
+Pegar AL FINAL de `infra/envs/prod/main.tf` (despues de
+`module "storage"` de 📖 3.4.4):
+
+```hcl
+# -------------------------------------------------------------------------
+# Capa 3: MLflow (RDS + ECS Fargate + ALB)
+# -------------------------------------------------------------------------
+module "mlflow" {
+  source = "../../modules/mlflow"
+
+  project              = var.project
+  vpc_id               = module.network.vpc_id
+  public_subnet_ids    = module.network.public_subnet_ids
+  private_subnet_ids   = module.network.private_subnet_ids
+  sg_alb_id            = module.network.sg_alb_id
+  sg_mlflow_id         = module.network.sg_mlflow_id
+  sg_rds_id            = module.network.sg_rds_id
+  rds_instance_class   = var.rds_instance_class
+  mlflow_image         = "${module.storage.ecr_mlflow_url}:${var.mlflow_image_tag}"
+  artifacts_bucket     = module.storage.artifacts_bucket
+  artifacts_bucket_arn = module.storage.artifacts_bucket_arn
+  log_retention_days   = var.log_retention_days
+}
+```
+
+> **Checkpoint**: este es el **primer modulo con dependencias** —
+> consume outputs de `module.network` (VPC, subnets, SGs) y
+> `module.storage` (ECR url, bucket de artifacts). Si `terraform
+> validate` falla con "Unsupported attribute" o "Reference to
+> undeclared module", revisa que pegaste 📖 3.3.4 y 📖 3.4.4 antes que
+> esto.
+
+---
 
 ## 3.6 `modules/reports/` — Fargate nginx sirviendo S3
 
@@ -2677,6 +2711,38 @@ aws s3 sync "s3://${S3_BUCKET}/artifacts/" /usr/share/nginx/html/artifacts/ --no
 exec nginx -g 'daemon off;'
 ```
 
+### 3.6.7 Apendear `module "reports"` en `infra/envs/prod/main.tf`
+
+Pegar AL FINAL de `infra/envs/prod/main.tf` (despues de
+`module "mlflow"` de 📖 3.5.4):
+
+```hcl
+# -------------------------------------------------------------------------
+# Capa 4: Reports (Fargate nginx, mismo cluster + ALB que MLflow)
+# -------------------------------------------------------------------------
+module "reports" {
+  source = "../../modules/reports"
+
+  project              = var.project
+  vpc_id               = module.network.vpc_id
+  private_subnet_ids   = module.network.private_subnet_ids
+  sg_mlflow_id         = module.network.sg_mlflow_id
+  ecs_cluster_id       = module.mlflow.cluster_id
+  alb_listener_arn     = module.mlflow.alb_listener_arn
+  artifacts_bucket     = module.storage.artifacts_bucket
+  artifacts_bucket_arn = module.storage.artifacts_bucket_arn
+  reports_image        = "${module.storage.ecr_reports_url}:${var.reports_image_tag}"
+  log_retention_days   = var.log_retention_days
+}
+```
+
+> **Checkpoint**: `reports` reusa el `cluster_id` y `alb_listener_arn`
+> de `module.mlflow` — por eso 📖 3.5.4 **tiene que estar antes**. Si
+> intentas validar sin haber pegado mlflow, vas a ver "Reference to
+> undeclared module module.mlflow".
+
+---
+
 ## 3.7 `modules/batch/` — Compute envs + queues + job-def + IAM
 
 Pieza critica donde se respeta el contrato del trainer: el container
@@ -2941,7 +3007,7 @@ resource "aws_batch_compute_environment" "ondemand" {
 
 #### 3.7.3.c — Job queues (1 por CE)
 
-Una queue por CE. El Lambda dispatcher (§3.9.5) elige queue por
+Una queue por CE. El Lambda dispatcher (📖 3.9.5) elige queue por
 `tuning`: `prod_xl → ondemand`, resto → spot. Priority=1 en ambas
 (no hay queueing entre ellas, son disjuntas).
 
@@ -2983,7 +3049,7 @@ resource "aws_batch_job_queue" "ondemand" {
 #### 3.7.3.d — Job definition (contrato con el trainer)
 
 El campo `command = ["--varieties","POP","--tuning","smoke"]` es default
-— el dispatcher (§3.9.5) lo sobreescribe por job. `retry_strategy`
+— el dispatcher (📖 3.9.5) lo sobreescribe por job. `retry_strategy`
 solo reintenta cuando AWS Spot mata el host (no en error del trainer).
 `timeout = job_attempt_seconds` (default 28800 = 8h) corta jobs colgados.
 
@@ -3083,7 +3149,7 @@ output "log_group_name" { value = aws_cloudwatch_log_group.batch.name }
 >   conecta a ce-spot) y `-ondemand` (priority=2). Ambas `VALID`.
 > - Batch → Job definitions → `ml-training-trainer` (revision N, type
 >   container, imagen del ECR `ml-training:latest`). Es lo que el Lambda
->   dispatcher (§3.9) invoca con SubmitJob.
+>   dispatcher (📖 3.9) invoca con SubmitJob.
 > - IAM → Roles → `ml-training-batch-instance-role` (EC2 lanzadora),
 >   `ml-training-batch-job-role` (lo asume el container del trainer:
 >   S3 r/w + CloudWatch PutMetricData), `ml-training-batch-exec-role`
@@ -3091,6 +3157,42 @@ output "log_group_name" { value = aws_cloudwatch_log_group.batch.name }
 >   (gestion del CE).
 > - CloudWatch → Log groups → `/aws/batch/ml-training` con
 >   `retention=14 days`.
+
+### 3.7.5 Apendear `module "batch"` en `infra/envs/prod/main.tf`
+
+Pegar AL FINAL de `infra/envs/prod/main.tf` (despues de
+`module "reports"` de 📖 3.6.7):
+
+```hcl
+# -------------------------------------------------------------------------
+# Capa 5: Batch (Spot + OD queues, job-def, IAM)
+# -------------------------------------------------------------------------
+module "batch" {
+  source = "../../modules/batch"
+
+  project              = var.project
+  private_subnet_ids   = module.network.private_subnet_ids
+  sg_batch_id          = module.network.sg_batch_id
+  ecr_trainer_url      = module.storage.ecr_trainer_url
+  trainer_image_tag    = var.trainer_image_tag
+  spot_max_vcpus       = var.spot_max_vcpus
+  ondemand_max_vcpus   = var.ondemand_max_vcpus
+  instance_type        = var.batch_instance_type
+  tracking_uri         = module.mlflow.tracking_uri
+  artifacts_bucket     = module.storage.artifacts_bucket
+  artifacts_bucket_arn = module.storage.artifacts_bucket_arn
+  data_bucket          = module.storage.data_bucket
+  data_bucket_arn      = module.storage.data_bucket_arn
+  log_retention_days   = var.log_retention_days
+}
+```
+
+> **Checkpoint**: batch depende de network (subnets/SG), storage (ECR
+> + buckets) y mlflow (`tracking_uri`). El `tracking_uri` se inyecta
+> como env var al job-def para que los containers de entrenamiento
+> sepan a donde loguear runs sin hardcodearlo.
+
+---
 
 ## 3.8 `modules/monitoring/` — SNS + alarmas
 
@@ -3218,7 +3320,7 @@ output "sns_topic_arn" { value = aws_sns_topic.alerts.arn }
 > **En consola AWS veras**:
 > - SNS → Topics → `ml-training-alerts` con 1 subscription
 >   (`Protocol=email`, `Endpoint=<alert_email>`, `Status=PendingConfirmation`
->   hasta que clickees el mail de §4.6).
+>   hasta que clickees el mail de 📖 4.6).
 > - CloudWatch → Alarms → **N + 2 alarmas** con prefijo `ml-training-`,
 >   donde N = `length(var.varieties)`. El conteo escala automatic si
 >   agregas/quitas variedades — `for_each` se reconcilia en el proximo
@@ -3232,6 +3334,35 @@ output "sns_topic_arn" { value = aws_sns_topic.alerts.arn }
 > - Cada alarma con `AlarmActions=[<topic-arn>]`. La de Batch tambien
 >   tiene `OKActions` para mandar mail al recuperar.
 
+### 3.8.4 Apendear `module "monitoring"` en `infra/envs/prod/main.tf`
+
+Pegar AL FINAL de `infra/envs/prod/main.tf` (despues de
+`module "batch"` de 📖 3.7.5):
+
+```hcl
+# -------------------------------------------------------------------------
+# Capa 6: Monitoring (SNS + alarmas CloudWatch)
+# -------------------------------------------------------------------------
+module "monitoring" {
+  source = "../../modules/monitoring"
+
+  project              = var.project
+  alert_email          = var.alert_email
+  batch_job_queue_name = module.batch.job_queue_spot
+  alb_arn_suffix       = module.mlflow.alb_arn_suffix
+  varieties            = var.varieties_allowed
+  mape_alarm_threshold = var.mape_alarm_threshold
+  log_retention_days   = var.log_retention_days
+}
+```
+
+> **Checkpoint**: monitoring lee el nombre de la queue de `module.batch`
+> (para alarmas de jobs failed) y el `alb_arn_suffix` de `module.mlflow`
+> (para alarma 5XX del ALB). El `sns_topic_arn` que genera lo consumira
+> `module.lambdas` en 📖 3.9.7 (notifier).
+
+---
+
 ## 3.9 `modules/lambdas/` — dispatcher + notifier
 
 Dos Lambdas:
@@ -3243,13 +3374,13 @@ Dos Lambdas:
 - **notifier**: recibe eventos EventBridge "Batch Job State Change FAILED"
   y publica un mensaje a SNS con el log link directo.
 
-> **Orden de pegado importante**: los `.tf` de §3.9.2 y §3.9.3 usan
+> **Orden de pegado importante**: los `.tf` de 📖 3.9.2 y 📖 3.9.3 usan
 > `data "archive_file"` para empaquetar `infra/lambdas/dispatcher.py` y
 > `infra/lambdas/notifier.py`. Si haces `terraform plan` antes de crear
 > esos `.py`, falla con "no such file or directory". Para evitarlo:
 >
-> 1. **Crear primero los `.py`** — saltar a §3.9.5 (dispatcher.py) y
->    §3.9.6 (notifier.py), pegar el codigo en
+> 1. **Crear primero los `.py`** — saltar a 📖 3.9.5 (dispatcher.py) y
+>    📖 3.9.6 (notifier.py), pegar el codigo en
 >    `infra/lambdas/dispatcher.py` y `infra/lambdas/notifier.py`.
 > 2. **Luego volver aca** y pegar los `.tf` (3.9.1 -> 3.9.4).
 >
@@ -3675,17 +3806,48 @@ def handler(event, _context):
     return {"statusCode": 200, "body": "notified"}
 ```
 
+### 3.9.7 Apendear `module "lambdas"` en `infra/envs/prod/main.tf`
+
+Pegar AL FINAL de `infra/envs/prod/main.tf` (despues de
+`module "monitoring"` de 📖 3.8.4):
+
+```hcl
+# -------------------------------------------------------------------------
+# Capa 7: Lambdas (dispatcher + notifier)
+# -------------------------------------------------------------------------
+module "lambdas" {
+  source = "../../modules/lambdas"
+
+  project                = var.project
+  job_queue_spot_arn     = module.batch.job_queue_spot_arn
+  job_queue_ondemand_arn = module.batch.job_queue_ondemand_arn
+  job_definition_name    = module.batch.job_definition_name
+  data_bucket            = module.storage.data_bucket
+  varieties_allowed      = var.varieties_allowed
+  sns_topic_arn          = module.monitoring.sns_topic_arn
+  log_retention_days     = var.log_retention_days
+  lambdas_src_dir        = "${path.module}/../../lambdas"
+}
+```
+
+> **Checkpoint**: el `lambdas_src_dir` apunta a `infra/lambdas/`
+> (donde estan los `.py` de 📖 3.9.5 y 📖 3.9.6). Si todavia no pegaste
+> los `.py`, `terraform plan` truena al hacer `archive_file` del zip.
+> Por eso 📖 3.9 te dice **primero pegar los `.py`, despues los `.tf`**.
+
+---
+
 ## 3.10 `modules/scheduler/` — auto on/off RDS + Fargate
 
 Una Lambda + 2 crons EventBridge. La Lambda hace `start`/`stop` segun
 el payload. Antes de stop, chequea Batch jobs RUNNING — si hay, posterga
 (no apaga). Lockeado a PET (UTC-5).
 
-> **Orden de pegado**: igual que §3.9, `modules/scheduler/main.tf`
+> **Orden de pegado**: igual que 📖 3.9, `modules/scheduler/main.tf`
 > empaca `infra/lambdas/scheduler.py` con `data "archive_file"`. Pegar
-> **primero** §3.10.4 (`scheduler.py`) en `infra/lambdas/scheduler.py`,
-> y **despues** §3.10.1-§3.10.3 (los `.tf`). Asi el `terraform plan`
-> de §3.12 no truena por archivo inexistente.
+> **primero** 📖 3.10.4 (`scheduler.py`) en `infra/lambdas/scheduler.py`,
+> y **despues** 📖 3.10.1-📖 3.10.3 (los `.tf`). Asi el `terraform plan`
+> de 📖 3.12 no truena por archivo inexistente.
 
 ### 3.10.1 `modules/scheduler/variables.tf`
 
@@ -3719,7 +3881,7 @@ Empaqueta `infra/lambdas/scheduler.py` (que ya creaste antes — ver
 callout arriba). IAM con scope a ECS update-service, RDS start/stop,
 y Batch describe — todo `Resource="*"` porque los recursos del proyecto
 son los unicos en la cuenta con esos names; refinable a ARN especifico
-en hardening (§10).
+en hardening (📖 10).
 
 > **🖱️ Equivalente en AWS Console**:
 >
@@ -3948,7 +4110,7 @@ output "function_arn" { value = aws_lambda_function.scheduler.arn }
 > **Variante con dias custom (L/Mi/V o cualquier subset)**: el codigo
 > de abajo asume `weekday < 5` hardcoded — funciona para el default
 > `MON-FRI`. Si necesitas otros workdays (ej. solo lunes/miercoles/
-> viernes), aplicar el patch de **§13.1** *despues* de Parte 4. El patch
+> viernes), aplicar el patch de **📖 13.1** *despues* de Parte 4. El patch
 > reemplaza el hardcode por un parser de la env var `WORKDAYS_CRON`.
 
 ```python
@@ -4074,6 +4236,37 @@ def handler(event, _context):
     return {"statusCode": 200, "body": action}
 ```
 
+### 3.10.5 Apendear `module "scheduler"` en `infra/envs/prod/main.tf`
+
+Pegar AL FINAL de `infra/envs/prod/main.tf` (despues de
+`module "lambdas"` de 📖 3.9.7):
+
+```hcl
+# -------------------------------------------------------------------------
+# Capa 8: Scheduler (auto on/off RDS + Fargate)
+# -------------------------------------------------------------------------
+module "scheduler" {
+  source = "../../modules/scheduler"
+
+  project                  = var.project
+  ecs_cluster_name         = module.mlflow.cluster_name
+  ecs_service_name_mlflow  = module.mlflow.service_name
+  ecs_service_name_reports = module.reports.service_name
+  rds_instance_id          = module.mlflow.rds_instance_id
+  work_start_hour_local    = var.work_start_hour_local
+  work_end_hour_local      = var.work_end_hour_local
+  log_retention_days       = var.log_retention_days
+  lambdas_src_dir          = "${path.module}/../../lambdas"
+}
+```
+
+> **Checkpoint**: scheduler consume `cluster_name` / `service_name` /
+> `rds_instance_id` para escalar Fargate a 0 y parar RDS fuera de
+> horario laboral. Igual que 📖 3.9.7, depende de que `scheduler.py`
+> (📖 3.10.4) ya este pegado.
+
+---
+
 ## 3.11 `modules/cicd/` — OIDC trust + GHA roles
 
 Dos roles: `gha-deploy` (terraform apply, push ECR) y `gha-train`
@@ -4198,9 +4391,9 @@ resource "aws_iam_role_policy" "deploy" {
       #   - leer Secrets Manager (incluido el RDS password).
       # MITIGACIONES en uso:
       #   - trust policy con `sub = "repo:org/repo:*"` (solo este repo).
-      #   - branch protection en main (§6.6) + required reviewers.
-      #   - GitHub Environment "production" con manual approval (§6.5).
-      # Refinable en §10 (hardening): partir en deploy-plan-only + apply
+      #   - branch protection en main (📖 6.6) + required reviewers.
+      #   - GitHub Environment "production" con manual approval (📖 6.5).
+      # Refinable en 📖 10 (hardening): partir en deploy-plan-only + apply
       # con CODEOWNERS, o restringir Resource por modulo via tags.
       {
         Effect = "Allow"
@@ -4259,18 +4452,50 @@ output "gha_train_role_arn" { value = aws_iam_role.train.arn }
 
 > **En consola AWS veras**:
 > - IAM → Roles → `ml-training-gha-deploy` y `ml-training-gha-train`.
->   Ambas con trust policy que confia en el OIDC provider de §2.5 y
+>   Ambas con trust policy que confia en el OIDC provider de 📖 2.5 y
 >   limita el `sub` a `repo:<github_org>/<github_repo>:*`.
 > - IAM → Roles → `gha-deploy` → Permissions tab: inline policy con
 >   ec2/iam/s3/ecr/ecs/batch/lambda/cloudwatch/logs/events/sns
 >   (scope amplio para que `terraform apply` pueda crear/modificar
 >   cualquier modulo). **Blast radius**: si alguien compromete el OIDC
 >   trust (e.g., un fork con write a `main`), puede destruir toda la
->   infra — por eso branch protection (§6.6) es load-bearing.
+>   infra — por eso branch protection (📖 6.6) es load-bearing.
 > - IAM → Roles → `gha-train` → Permissions: solo `lambda:InvokeFunction`
 >   sobre el dispatcher. Scope minimo intencional.
 > - Estos roles son los `vars.AWS_GHA_DEPLOY_ROLE_ARN` /
->   `AWS_GHA_TRAIN_ROLE_ARN` que se setean con `gh variable set` en §6.1.
+>   `AWS_GHA_TRAIN_ROLE_ARN` que se setean con `gh variable set` en 📖 6.1.
+
+---
+
+### 3.11.4 Apendear `module "cicd"` en `infra/envs/prod/main.tf`
+
+Ultimo bloque. Pegar AL FINAL de `infra/envs/prod/main.tf` (despues
+de `module "scheduler"` de 📖 3.10.5):
+
+```hcl
+# -------------------------------------------------------------------------
+# Capa 9: CI/CD (GHA IAM roles confiando en OIDC)
+# -------------------------------------------------------------------------
+module "cicd" {
+  source = "../../modules/cicd"
+
+  project                = var.project
+  github_org             = var.github_org
+  github_repo            = var.github_repo
+  oidc_provider_arn      = data.aws_iam_openid_connect_provider.github.arn
+  artifacts_bucket_arn   = module.storage.artifacts_bucket_arn
+  data_bucket_arn        = module.storage.data_bucket_arn
+  ecr_trainer_arn        = module.storage.ecr_trainer_arn
+  job_queue_spot_arn     = module.batch.job_queue_spot_arn
+  job_queue_ondemand_arn = module.batch.job_queue_ondemand_arn
+  job_definition_arn     = module.batch.job_definition_arn
+}
+```
+
+> **Checkpoint final**: con este bloque pegado, el `main.tf` esta
+> **completo** (los 9 modulos + los 3 `data` sources). En 📖 3.12 viene
+> la validacion sintactica integrada (`terraform fmt -recursive` y
+> `terraform validate`) antes de pasar a Parte 4 (apply real).
 
 ---
 
@@ -4389,7 +4614,7 @@ task --version
 # Esperado: 3.34+ (necesario para `prompt:` en tasks destructivos)
 ```
 
-Si falta (ya cubierto en §0.3.3; recordatorio aqui):
+Si falta (ya cubierto en 📖 0.3.3; recordatorio aqui):
 
 ```bash
 # Windows (WSL Ubuntu) y Linux: mismo instalador
@@ -4402,7 +4627,7 @@ brew install go-task
 
 ### 4.1.2 Estructura final
 
-Despues de seguir §4.1.3 a §4.1.9, tu proyecto va a tener:
+Despues de seguir 📖 4.1.3 a 📖 4.1.9, tu proyecto va a tener:
 
 ```
 Taskfile.yml                    # raiz: tasks LOCALES (Docker) + includes AWS
@@ -4426,8 +4651,8 @@ tasks/
 
 ### 4.1.3 Crear `tasks/` y anadir `PROJECT` al Taskfile raiz
 
-> **Orden importa**: el `includes:` viene en §4.1.10 — DESPUES de crear
-> los 6 archivos referenciados (§4.1.4 a §4.1.9). Si pegas el
+> **Orden importa**: el `includes:` viene en 📖 4.1.10 — DESPUES de crear
+> los 6 archivos referenciados (📖 4.1.4 a 📖 4.1.9). Si pegas el
 > `includes:` ahora, `task --list` falla por "archivo no encontrado"
 > hasta que llegues a 4.1.10.
 
@@ -4437,7 +4662,7 @@ mkdir -p tasks
 
 Editar `Taskfile.yml` raiz para anadir `PROJECT` al bloque `vars:`
 existente (esto SI se hace ahora — los Taskfiles que vas a crear en
-§4.1.4-4.1.9 lo van a leer):
+📖 4.1.4-4.1.9 lo van a leer):
 
 ```yaml
 vars:
@@ -5276,7 +5501,7 @@ peligrosa del runbook, vale la pena un segundo pulse.
 
 ### 4.1.10 Anadir `includes:` al Taskfile raiz + verificacion final
 
-Ahora que los 6 `tasks/*.yml` existen (§4.1.4 a §4.1.9), agregar el
+Ahora que los 6 `tasks/*.yml` existen (📖 4.1.4 a 📖 4.1.9), agregar el
 bloque `includes:` al `Taskfile.yml` raiz, **despues de `dotenv:` y
 antes de `vars:`**:
 
@@ -5315,7 +5540,7 @@ task --list-all > /dev/null && echo "OK"
 ```
 
 Si `task --list` muestra los 6 namespaces, el setup esta completo. A
-partir de aca, las oleadas A/B/C (§4.2 a §4.5) usan estas tasks.
+partir de aca, las oleadas A/B/C (📖 4.2 a 📖 4.5) usan estas tasks.
 
 ## 4.2 Ola A — apply storage solo
 
@@ -5323,7 +5548,7 @@ Crea los 2 buckets S3 + 3 repos ECR. Tiempo: ~1 min.
 
 ```bash
 # Variables de sesion (re-declaradas para que cada oleada sea standalone
-# copy-paste-able; si ya las exportaste en §0.4 estas lineas son no-op).
+# copy-paste-able; si ya las exportaste en 📖 0.4 estas lineas son no-op).
 export AWS_DEFAULT_REGION="us-east-1"
 export PROJECT="ml-training"
 export ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
@@ -5382,7 +5607,7 @@ Las 3 imagenes son:
 
 ### 4.3.1 Como funciona
 
-La task `ecr:build-all` (definida en §4.1.5) encadena 3 invocaciones de
+La task `ecr:build-all` (definida en 📖 4.1.5) encadena 3 invocaciones de
 `ecr:build` con `IMG=trainer/mlflow/reports`. Cada una hace
 `docker build` con build args (`GIT_SHA`, `BUILD_DATE`, `VERSION`) y
 pushea 2 tags: el solicitado (`latest`/`v3.12.0`/`stable`) y
@@ -5605,7 +5830,7 @@ Si los 5 checks dan OK, la infra esta arriba.
 ## 4.5 Smoke test — entrenar 1 variedad end-to-end
 
 Esto verifica (el item 1 sobre Lambda dispatcher se valida indirectamente
-en §4.7.1 cuando uses `task batch:retrain`; el smoke va directo a Batch):
+en 📖 4.7.1 cuando uses `task batch:retrain`; el smoke va directo a Batch):
 
 1. Batch submit funciona (SubmitJob directo, sin pasar por Lambda).
 2. EC2 Spot arranca + corre el container.
@@ -5712,7 +5937,7 @@ aws sns publish \
 
 Esto materializa los comandos que la Parte 1 (Lifecycle) menciono como
 contrato. La implementacion completa de cada task ya se copio inline en
-§4.1.4 a §4.1.9 (`tasks/infra.yml`, `tasks/ecr.yml`, `tasks/batch.yml`,
+📖 4.1.4 a 📖 4.1.9 (`tasks/infra.yml`, `tasks/ecr.yml`, `tasks/batch.yml`,
 `tasks/cluster.yml`, `tasks/mlflow_registry.yml`, `tasks/aws.yml`).
 Esta seccion es el **catalogo de uso** de esas tasks ya creadas.
 
@@ -5824,7 +6049,7 @@ task aws:destroy
 
 **No incluye** vaciado de buckets versionados, OIDC provider, ni DDB
 tflock (esos son bootstrap manual, no Terraform). Para limpieza
-completa hasta "cuenta como antes de Parte 2", seguir §8.7 a mano
+completa hasta "cuenta como antes de Parte 2", seguir 📖 8.7 a mano
 despues de `task aws:destroy`.
 
 ### 4.7.7 Promote a Production (`task mlflow-aws:promote`)
@@ -6261,8 +6486,8 @@ jobs:
 > ```
 >
 > Si el workflow falla en "Assume gha-deploy role", el `gh variable
-> set AWS_GHA_DEPLOY_ROLE_ARN` de §6.1 no se ejecuto o el ARN es
-> incorrecto. Corregir antes de pasar a §6.3.
+> set AWS_GHA_DEPLOY_ROLE_ARN` de 📖 6.1 no se ejecuto o el ARN es
+> incorrecto. Corregir antes de pasar a 📖 6.3.
 
 ## 6.3 `.github/workflows/terraform-plan.yml` — validar PRs de infra
 
@@ -7084,11 +7309,11 @@ task aws:wake
 task batch:retrain VARIETIES=POP
 ```
 
-> **Solucion permanente**: aplicar §13.2 (auto-train on push con
+> **Solucion permanente**: aplicar 📖 13.2 (auto-train on push con
 > wake + cool-down). Ese workflow invoca Lambda scheduler antes del
 > train y apaga 10 min despues si MLflow estaba abajo. La ampliacion
 > de permisos del role `gha-train` para invocar el scheduler vive
-> en §13.2.1.
+> en 📖 13.2.1.
 
 ### 8.3.8 Cold-start de RDS lento el primer request
 
@@ -7370,7 +7595,7 @@ $68 es realista con los modulos del V2.
 
 | Escenario | Cambio vs default | Costo total/mes | Cuando elegirlo |
 |---|---|---|---|
-| **Hibernado** | tear-down completo (§8.5) | ~$3 | Pausa de 1+ semana |
+| **Hibernado** | tear-down completo (📖 8.5) | ~$3 | Pausa de 1+ semana |
 | **Default (lockeado)** | Scheduler L-V 08-12 PET | **~$68** | Operacion normal |
 | **24/7** | Scheduler OFF, MLflow + RDS siempre on | ~$140 | Equipo distribuido multi-timezone |
 | **No-NAT** | VPC endpoints en vez de NAT GW (Parte 10.3) | ~$36 | Trafico NAT < 10 GB/mes |
@@ -7382,7 +7607,7 @@ $68 es realista con los modulos del V2.
 Tabla resumen que cruza los 4 modos (STAND-UP / TEAR-DOWN / DESTROY) con
 los recursos: util para razonar "cuanto bajo apagando X" antes de
 ejecutar `task aws:teardown` o `task aws:destroy` (los modos en si estan
-documentados en §8.5-§8.7).
+documentados en 📖 8.5-📖 8.7).
 
 | Recurso | STAND-UP (operando) | TEAR-DOWN (hibernado) | DESTROY (vacio) |
 |---|---|---|---|
@@ -7402,13 +7627,13 @@ documentados en §8.5-§8.7).
 | **Total mensual** | **~$68** | **~$3** | **$0** |
 
 > La suma directa de esta tabla da ~$65; los ~$68 reales (que matchean
-> §9.1) incluyen items consolidados aca: ALB LCU + CloudWatch Custom
+> 📖 9.1) incluyen items consolidados aca: ALB LCU + CloudWatch Custom
 > Metrics (9 series MAPE+base × $0.30) + DynamoDB + S3 lifecycle de
 > versiones. Tabla pensada como **delta entre modos**, no como suma
-> auditable — para esa ver §9.1.
+> auditable — para esa ver 📖 9.1.
 
 Si queres bajar mas el modo operando, ver Parte 10.3 (VPC endpoints
-elimina NAT GW = $32 menos), §9.4 (S3 lifecycle + Intelligent
+elimina NAT GW = $32 menos), 📖 9.4 (S3 lifecycle + Intelligent
 Tiering, ECR scan policies).
 
 ## 9.4 Optimizaciones adicionales (🔮 FUTURO)
@@ -7669,7 +7894,7 @@ single-binary 10 MB vs Ansible ~200 MB con Python+pipx, sintaxis
 YAML+POSIX shell mas legible que YAML+Jinja+modulos `ansible.builtin.X`,
 y corre con un solo binario en Linux/WSL/macOS sin overhead de runtime
 Python. (En este proyecto Task se instala dentro de WSL Ubuntu — ver
-§0.3.3 — para mantener un unico entorno bash a lo largo de toda la
+📖 0.3.3 — para mantener un unico entorno bash a lo largo de toda la
 guia.) Para un stack Docker + AWS managed services (sin
 hosts EC2), Ansible es overkill.
 
@@ -7764,10 +7989,10 @@ aplicada). Total LOC agregadas: ~3500 (HCL + Python + YAML + Markdown).
 
 **Archivos extra si aplicas Parte 13** (customizaciones):
 - `infra/modules/consumer-iam/` (3 archivos: variables.tf, main.tf,
-  outputs.tf) — §13.5.
-- `.github/workflows/auto-train-on-push.yml` — §13.2.
+  outputs.tf) — 📖 13.5.
+- `.github/workflows/auto-train-on-push.yml` — 📖 13.2.
 - Modificaciones a `infra/envs/prod/{main,variables,outputs}.tf` y
-  `terraform.tfvars` para registrar el modulo `consumer_iam` — §13.5.2.
+  `terraform.tfvars` para registrar el modulo `consumer_iam` — 📖 13.5.2.
 
 ---
 
@@ -7856,7 +8081,7 @@ Agregar `WORKDAYS_CRON` al bloque `environment.variables` del Lambda:
 ### 13.1.3 Patch a `infra/lambdas/scheduler.py::_keepstop`
 
 Reemplazar la heuristica hardcoded por la lista de dias parseada desde
-la env var. **Borrar** la version vieja de §3.10.4 y poner:
+la env var. **Borrar** la version vieja de 📖 3.10.4 y poner:
 
 ```python
 # Mapeo de tokens de EventBridge cron a tm_wday (0=Monday)
@@ -8298,7 +8523,7 @@ fallar, reintentar (~30s retry) hasta que RDS este up. Funciona, pero:
 
 **Patch a `infra/lambdas/scheduler.py` — REEMPLAZAR la funcion `_start`
 completa**. Identifica el bloque `def _start():` ... `def _stop():` en
-la version de §3.10.4 (~lineas 3398-3413 del scheduler.py original) y
+la version de 📖 3.10.4 (~lineas 3398-3413 del scheduler.py original) y
 **borralo entero** antes de pegar la nueva version. Si no borras la
 vieja, Python toma la ultima definicion del archivo (la nueva) pero
 queda codigo muerto que confunde el `git blame`:
@@ -8753,7 +8978,7 @@ jobs:
 | MLFLOW_TRACKING_URI del consumer | Variable de GH del repo consumer | Se setea con el output `alb_dns` de este repo |
 
 **Como sincronizar el URI cuando rebuild cambia el DNS**: el rebuild
-(§8.6) cambia el ALB DNS. Tras rebuild, exportar el nuevo DNS y
+(📖 8.6) cambia el ALB DNS. Tras rebuild, exportar el nuevo DNS y
 actualizar la variable del otro repo:
 
 ```bash
@@ -8791,24 +9016,24 @@ o por evento.
 
 **Paso 1 — Patches a Terraform/Python** (ediciones a mano):
 
-- §13.1.1: editar `infra/modules/scheduler/variables.tf`
+- 📖 13.1.1: editar `infra/modules/scheduler/variables.tf`
   (`workdays_cron = "MON,WED,FRI"`).
-- §13.1.2: editar `infra/modules/scheduler/main.tf` (agregar
+- 📖 13.1.2: editar `infra/modules/scheduler/main.tf` (agregar
   `WORKDAYS_CRON`, `WORK_START_UTC`, `WORK_END_UTC` al
   `environment.variables` del Lambda).
-- §13.1.3: editar `infra/lambdas/scheduler.py` (reemplazar `_keepstop`).
-- §13.2.1: editar `infra/modules/cicd/main.tf` (reemplazar bloque
+- 📖 13.1.3: editar `infra/lambdas/scheduler.py` (reemplazar `_keepstop`).
+- 📖 13.2.1: editar `infra/modules/cicd/main.tf` (reemplazar bloque
   `aws_iam_role_policy.train` completo).
-- §13.3: editar `infra/lambdas/scheduler.py` (reemplazar funcion
+- 📖 13.3: editar `infra/lambdas/scheduler.py` (reemplazar funcion
   `_start`) + `infra/modules/scheduler/main.tf` (timeout 300 → 900).
 
 **Paso 2 — Workflow nuevo**:
 
-- §13.2.2: crear `.github/workflows/auto-train-on-push.yml`.
+- 📖 13.2.2: crear `.github/workflows/auto-train-on-push.yml`.
 
 **Paso 3 — Modulo nuevo**:
 
-- §13.5.2: crear `infra/modules/consumer-iam/` (3 archivos:
+- 📖 13.5.2: crear `infra/modules/consumer-iam/` (3 archivos:
   variables.tf, main.tf, outputs.tf) + editar 4 archivos en
   `infra/envs/prod/` (main.tf, variables.tf, terraform.tfvars,
   outputs.tf).
@@ -8853,7 +9078,7 @@ aws iam get-role --role-name ml-training-consumer --query 'Role.Arn' --output te
 >   `lambda:InvokeFunction` en array de 2 (dispatcher + scheduler).
 
 **Paso 6 — Smoke end-to-end**: probar auto-train via push trivial (ver
-§13.2.4).
+📖 13.2.4).
 
 ---
 
