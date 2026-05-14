@@ -67,3 +67,16 @@ Desktop.ini
 
 # ── Claude Code (config local del agente) ────────────────────────────────
 .claude/
+
+# Terraform
+**/terraform.tfvars
+**/.terraform/
+**/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*
+.terraformrc
+terraform.rc
+
+# Lambdas .zip (Terraform los crea desde Python source)
+infra/modules/lambdas/*.zip
+infra/modules/scheduler/*.zip

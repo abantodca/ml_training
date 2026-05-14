@@ -76,6 +76,8 @@
   - 13.4 URLs locales y produccion (referencia)
   - 13.5 Consumer IAM (FastAPI/Streamlit consumiendo MLflow productivo)
   - 13.6 Recalculo de costos con MON,WED,FRI
+  - 13.7 Orden de aplicacion de los 5 patches
+  - 13.8 Local + S3 + Produccion — reutilizar el setup sin perder runs locales
 
 > **Parte 13 es un addendum**, no parte del runbook lineal. Cada
 > subseccion **modifica infra ya aplicada** (re-apply Terraform,
@@ -9082,13 +9084,244 @@ aws iam get-role --role-name ml-training-consumer --query 'Role.Arn' --output te
 
 ---
 
+## 13.8 Local + S3 + Produccion — reutilizar el setup sin perder runs locales
+
+**Por que se documenta**: el `docker-compose.yml` actual ya usa S3
+(`S3_MLFLOW_BUCKET` para artifacts de MLflow + `S3_ARTIFACTS_BUCKET`
+para el `s3_sync` post-run). Eso quiere decir que **cuando entrenas
+en tu laptop, los modelos y reports ya viajan a S3** — el setup es
+hibrido, no puramente local. Esta seccion documenta:
+
+1. Que pieza del entrenamiento local **si** se persiste en cloud y
+   cual **no**.
+2. Como pasar el mismo compose a produccion (EC2/ECS) cambiando lo
+   minimo.
+3. Como dejar que tu laptop entrene contra el MLflow de prod para
+   que **ningun run local quede huerfano**.
+
+### 13.8.1 Mapeo del setup actual (que persiste y que no)
+
+Lectura cruzada de `docker-compose.yml` + `scripts/s3_sync.py` +
+`.env`:
+
+| Pieza | Donde vive en local | Donde va a S3 |
+|---|---|---|
+| MLflow artifacts (joblib, plots, signatures) | Va directo a S3 (no toca disco local) | `s3://${S3_MLFLOW_BUCKET}/artifacts/` via `--default-artifact-root` en `docker-compose.yml:66` |
+| MLflow tracking metadata (runs, params, metrics, experiments, run_id) | **Postgres en volumen Docker `pg-data`** (`docker-compose.yml:20`, `:129`) | **NO se sube a ningun lado** |
+| `./artifacts/` del trainer (joblib, run_summary, champion JSON) | Bind mount `./artifacts:/app/artifacts` (`docker-compose.yml:119`) | `s3://${S3_ARTIFACTS_BUCKET}/artifacts/` via `scripts/s3_sync.py:81` |
+| `./reports/` (HTML, xlsx) | Bind mount `./reports:/app/reports` | `s3://${S3_ARTIFACTS_BUCKET}/reports/` via `scripts/s3_sync.py:89` |
+| Credenciales AWS | `~/.aws:/aws:ro` montado en mlflow + trainer (`docker-compose.yml:52, :116`) | — |
+
+> **El unico dato que se queda atrapado en local es el Postgres de
+> MLflow**. Los `.joblib` y los reports siempre llegan a S3. Lo que
+> perderias al cambiar de laptop o levantar otro compose en otra
+> maquina es el **contexto** (que run produjo que modelo, con que
+> params, en que fecha).
+
+Verificarlo en cualquier momento:
+
+```bash
+# Tras un run en local, los modelos deberian estar en S3
+aws s3 ls s3://"$(grep ^S3_ARTIFACTS_BUCKET .env | cut -d= -f2)"/artifacts/
+# Esperado: ver final_pipeline_*.joblib + run_summary_*.json del ultimo run
+
+aws s3 ls s3://"$(grep ^S3_MLFLOW_BUCKET .env | cut -d= -f2)"/artifacts/ | head
+# Esperado: directorios numerados de runs MLflow con sus artifacts
+```
+
+### 13.8.2 Diferencias minimas entre compose local y el deploy de prod
+
+> **Aclaracion clave**: en produccion **no se usa `docker-compose`** —
+> se usa ECS Task Definition (modulo `mlflow` de Parte 3) + Batch job
+> definition para el trainer. El compose local y la task def de prod
+> describen lo mismo (que container correr, con que env, que volumenes)
+> pero en formatos distintos. La tabla compara equivalentes:
+
+| Concepto | Local (compose) | Produccion (ECS Task Def / Batch) |
+|---|---|---|
+| **Credenciales AWS** | `~/.aws:/aws:ro` montado (`docker-compose.yml:52, :116`) + `AWS_SHARED_CREDENTIALS_FILE`/`AWS_PROFILE` | **Sin volumen** — IAM Task Role del Task Definition aporta las creds via metadata endpoint. El SDK las resuelve solo |
+| **Backend store de MLflow** | Servicio `postgres` (compose:10-26) con volumen `pg-data` | RDS Postgres (modulo `rds` de Parte 3). El server MLflow recibe `--backend-store-uri postgresql://...@<RDS-DNS>:5432/mlflow` |
+| **Servidor MLflow** | Container `mlflow` expuesto a `127.0.0.1:5000` | ECS Fargate detras de ALB (modulo `mlflow` de Parte 3) — el trainer apunta a `http://<ALB-DNS>` en vez de `http://mlflow:5000` |
+| **Reports estaticos** | Servicio `reports` (nginx, compose:82-94) en `127.0.0.1:8080` | ECS Fargate con la misma imagen nginx detras del mismo ALB en path `/reports/` (modulo `reports` de Parte 3). Los archivos vienen de S3 (montados via `s3fs` o sincronizados en startup) |
+
+> El **codigo del trainer no cambia** entre local y prod. `main.py:236`
+> ya tiene `if S3_ARTIFACTS_BUCKET: sync_to_s3(...)`, asi que el mismo
+> binario corre en ambos: con bucket configurado sube, sin bucket
+> sigue de largo sin romper.
+
+### 13.8.3 Estrategia para que NINGUN run local quede huerfano
+
+La unica forma robusta de no perder el tracking de los runs locales
+es **apuntar el MLflow de tu laptop al MLflow de produccion** (mismo
+RDS, mismo bucket de artifacts). Esquema:
+
+```
+┌──────────────┐         ┌──────────────────────┐
+│  Tu laptop   │────────▶│ MLflow Server (ECS)  │──┐
+│  trainer     │  HTTPS  │ + RDS Postgres       │  │
+│  (compose)   │         └──────────────────────┘  │
+└──────────────┘                                    ▼
+┌──────────────┐                          ┌─────────────────┐
+│  EC2 prod    │────────▶ mismo MLflow ──▶│  S3 artifacts   │
+│  trainer     │                          └─────────────────┘
+└──────────────┘
+```
+
+**Como configurarlo** — crear un `docker-compose.override.yml` (no
+commitear, va en `.gitignore`) con el override de URI:
+
+```yaml
+# docker-compose.override.yml (LOCAL, apuntando a prod)
+# Compose lo merge automaticamente con docker-compose.yml
+services:
+  trainer:
+    environment:
+      MLFLOW_TRACKING_URI: http://${MLFLOW_ALB_DNS}
+      # Bucket de prod — SOBREESCRIBE el S3_ARTIFACTS_BUCKET del .env local.
+      # Antes de correr, verificar que el bucket existe:
+      #   aws s3 ls s3://ml-training-artifacts-${ACCOUNT_SUFFIX}
+      S3_ARTIFACTS_BUCKET: ml-training-artifacts-${ACCOUNT_SUFFIX}
+
+  # Desactivar los servicios que ya no necesitas en local
+  mlflow:
+    profiles: ["disabled"]
+  postgres:
+    profiles: ["disabled"]
+```
+
+Y en tu `.env` local agregar (sacando el ALB DNS de Terraform):
+
+```bash
+echo "MLFLOW_ALB_DNS=$(terraform -chdir=infra/envs/prod output -raw alb_dns)" >> .env
+echo "ACCOUNT_SUFFIX=$(aws sts get-caller-identity --query Account --output text | tail -c 7)" >> .env
+```
+
+Resultado: corres `docker compose up trainer` desde tu laptop, el run
+aparece en la UI de prod (http://<ALB-DNS>), los artifacts se quedan
+en el bucket de prod, y no hay un Postgres local que se pueda perder.
+
+> **Cuidado con permisos** — MLflow **NO usa IAM** (la API es HTTP plano
+> sobre el ALB, no hay acciones IAM `mlflow:*`). Tu cliente local solo
+> necesita:
+> - **Acceso de red** al ALB de prod (mismo SG que el de los consumers
+>   de 📖 13.5.3 — abierto a `0.0.0.0/0:80` o restringido a tu IP/VPN).
+> - **Creds AWS** con `s3:PutObject` + `s3:GetObject` sobre
+>   `s3://ml-training-artifacts-*/artifacts/*` (porque el cliente sube
+>   los `.joblib` directo a S3 cuando el server tiene
+>   `--default-artifact-root s3://...`). El server MLflow es quien
+>   escribe a RDS — tu cliente no toca el RDS.
+>
+> Para crear el IAM user/role de dev escritor, usar como **inspiracion**
+> `infra/modules/consumer-iam/` (📖 13.5.2 — el consumer solo lee, tu
+> dev-writer ademas escribe `s3:PutObject` con prefijo `artifacts/`).
+
+### 13.8.4 Alternativas si el MLflow compartido no es viable
+
+| Caso | Estrategia | Trade-off |
+|---|---|---|
+| **Quiero entrenar offline (avion, casa sin VPN)** | Mantener compose local completo + `MLFLOW_EXPERIMENT_PREFIX=local_` en `.env` local. Al volver online, replicar via `mlflow experiments csv` + `mlflow runs list --to-csv` + re-loguear contra el server de prod | Replicacion manual; los timestamps quedan re-escritos a la fecha de re-import |
+| **Equipo con varios devs queriendo aislamiento** | MLflow compartido + `MLFLOW_EXPERIMENT_PREFIX=dev_<USER>_` por dev | Cada dev pollute el server de prod con sus experimentos — mitigar con lifecycle de S3 que borre `artifacts/dev_*` >30 dias |
+| **No quiero exponer el MLflow productivo a Internet** | Dejar el ALB en SG privado + cliente local via VPN o SSM port-forward (`aws ssm start-session --target i-xxx --document-name AWS-StartPortForwardingSession ...`) | Mas operacion; requiere VPN/SSM configurado para cada dev |
+
+> Si elegis **mantener Postgres local**, asumi que **cada `docker
+> compose down -v` borra el tracking**. Los `.joblib` y los reports
+> sobreviven en S3, pero los experimentos de la UI no. Es un trade-off
+> aceptable solo si trataste a esos runs como ejecuciones throwaway.
+
+### 13.8.5 Cuando un run local se considera "promovible" a prod
+
+> **Estado actual del gate** (📖 Parte 7): el gate de promocion se
+> dispara **manualmente** via `promote.yml` con `-f model=... -f
+> version=...` (linea 6900 aprox). El gate hoy NO escanea runs por
+> tag — solo aplica (1) umbral de MAPE, (2) A/B vs el campeon
+> Production, y (3) approval humano. Asi que el "filtro" de runs
+> locales **lo hace el dev en el approval**, no el gate automatico.
+
+**Si igual queres marcar los runs locales** (recomendado — facilita
+ignorarlos al hacer `mlflow runs list` y deja huella de auditoria),
+hay dos formas:
+
+**Forma A — set_tag dentro del codigo** (el patron que ya usa el repo
+en `src/orchestration/single_run.py` y `src/step_06_track/mlflow_registry.py`):
+
+```python
+# En src/orchestration/single_run.py, donde ya se setean tags
+import os
+mlflow.set_tags({
+    "env": os.environ.get("ML_ENV", "local-dev"),
+    "dev_user": os.environ.get("USER", "unknown"),
+})
+```
+
+Despues, en tu `.env` local o por sesion:
+
+```bash
+# Por defecto, runs locales = local-dev (no promovibles)
+export ML_ENV=local-dev
+
+# Para un run que queres marcar como candidato (revisable a mano)
+ML_ENV=candidate task train -- --varieties POP --tuning full
+```
+
+> **No existe** una env var nativa `MLFLOW_TAGS` que MLflow lea
+> automaticamente. Las unicas que el cliente respeta son
+> `MLFLOW_TRACKING_URI`, `MLFLOW_EXPERIMENT_NAME`, `MLFLOW_RUN_NAME`.
+> Los tags se setean **siempre** via `mlflow.set_tag(s)` en codigo.
+
+**Forma B — tag manual post-run desde CLI** (sin tocar codigo):
+
+```bash
+# Sacar el run_id del ultimo run y taggearlo
+RUN_ID=$(mlflow runs search --experiment-name POP --order-by 'start_time DESC' --max-results 1 --view-type ACTIVE_ONLY -o json | jq -r '.[0].info.run_id')
+mlflow runs set-tag --run-id "$RUN_ID" --key env --value local-dev
+```
+
+**Si en el futuro queres que el gate auto-filtre por tag**, editar
+`.github/workflows/promote.yml` (📖 Parte 7) para que rechace
+`version` cuyo source run tenga `env=local-dev` — hoy no esta
+implementado, es trabajo a futuro.
+
+### 13.8.6 Verificacion (3 checks)
+
+```bash
+# Check 1: el MLFLOW_TRACKING_URI apunta a prod (no localhost)
+docker compose run --rm trainer python -c \
+  "import mlflow; print(mlflow.get_tracking_uri())"
+# Esperado: http://<ALB-DNS> (no http://mlflow:5000)
+
+# Check 2: run end-to-end aparece en la UI de prod
+task train -- --varieties POP --tuning smoke
+open "http://$(terraform -chdir=infra/envs/prod output -raw alb_dns)"
+# Esperado: el run mas reciente en el experiment "POP" (o el prefijo
+# que tengas en MLFLOW_EXPERIMENT_PREFIX). Si aplicaste Forma A de
+# 13.8.5, ademas veras tags env=local-dev + dev_user=$USER
+
+# Check 3: artifacts en el bucket de prod
+aws s3 ls "s3://ml-training-artifacts-${ACCOUNT_SUFFIX}/artifacts/" \
+  --recursive | tail -5
+# Esperado: final_pipeline_POP_*.joblib del run que acabas de correr
+```
+
+> **En consola AWS veras**:
+> - MLflow UI (via ALB) → experiments → tu run mas reciente (con
+>   tags `env=local-dev` + `dev_user=<vos>` solo si aplicaste la
+>   Forma A o B de 13.8.5).
+> - S3 → `ml-training-artifacts-XXXXXX/artifacts/` → joblib + JSONs
+>   del ultimo run con timestamp reciente.
+> - RDS Postgres → no se toca a mano (el server MLflow hace los
+>   inserts).
+
+---
+
 > **Fin de la Parte 13 — customizaciones aplicadas.**
 >
-> Estado final con los 5 patches:
+> Estado final con los patches:
 > - Scheduler L/Mi/V 08-12 PET.
 > - Push a main que toque `src/`, `main.py`, `Dockerfile`, `requirements.txt`
 >   o `scripts/` -> auto-train con wake + train + cool-down 10 min + stop.
 > - Wake serializado: RDS -> MLflow -> Reports.
 > - Otro proyecto FastAPI/Streamlit con role IAM dedicado, snippet de
 >   `load_production_model` y configuracion de env vars.
+> - Trainer local apunta al MLflow de prod via `docker-compose.override.yml`
+>   y los runs locales se taggean `env=local-dev` para no auto-promoverse.
 > - Costo: ~$63/mes (5 menos que el default L-V).
