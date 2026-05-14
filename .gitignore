@@ -57,6 +57,7 @@ mlruns/
 .DS_Store
 Thumbs.db
 Desktop.ini
+*:Zone.Identifier
 
 # ── Archivos temporales ──────────────────────────────────────────────────
 *.log
