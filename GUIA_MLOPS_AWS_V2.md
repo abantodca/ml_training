@@ -492,7 +492,7 @@ Las 4 referencias que aparecen una y otra vez:
   soportada es WSL Ubuntu (NO Git Bash, NO PowerShell). Esta eleccion
   vale de 📖 0.3 hasta el final de la guia.
 - **Task**: las operaciones AWS se invocan como `task <namespace>:<accion>`
-  (e.g. `task infra:apply`, `task batch:retrain VARIETIES=POP`). El
+  (e.g. `task infra:apply`, `task batch:train VARIETIES=POP`). El
   binario de Task se instala **dentro de WSL** (ver 📖 0.3.3); aunque Task
   tambien corre nativo en Windows, mezclar ambos host filesystems con la
   misma carpeta `infra/` da problemas de permisos y line endings.
@@ -4683,9 +4683,20 @@ Crear el archivo con este contenido:
 
 ```yaml
 # =============================================================================
-# tasks/infra.yml  -  Terraform + bootstrap del backend
+# tasks/infra.yml  -  Terraform wrapper + bootstrap del backend
 # =============================================================================
 # Incluido por Taskfile.yml raiz con namespace "infra:".
+#
+# USO TIPICO:
+#   task infra:bootstrap                              UNA VEZ por cuenta+region
+#   task infra:bootstrap-oidc                         UNA VEZ (rol GHA)
+#   task infra:plan [TARGET=module.X]                 ver cambios
+#   task infra:apply [TARGET=module.X]                aplicar (parcial o full)
+#   task infra:output                                 outputs (alb_dns, ecr_urls, ...)
+#   task infra:validate                               fmt -check + validate (pre-commit)
+#   task infra:destroy                                DESTRUCTIVO: todo
+#   task infra:destroy-target TARGET=module.X         DESTRUCTIVO: parcial
+# =============================================================================
 
 version: "3"
 
@@ -4694,30 +4705,29 @@ vars:
 
 tasks:
 
-  # ----- Bootstrap (one-shot) ------------------------------------------------
+  # ═══ Bootstrap (one-shot, idempotente) ══════════════════════════════════════
 
   bootstrap:
-    desc: "Bootstrap backend Terraform (S3 + DynamoDB lock + SLRs). UNA VEZ por cuenta+region. Idempotente"
+    desc: "Backend Terraform (S3 + DynamoDB lock + SLRs). UNA VEZ por cuenta+region"
     cmds:
       - bash infra/bootstrap.sh
 
   bootstrap-oidc:
-    desc: "Crear rol IAM para GitHub Actions via OIDC. UNA VEZ. Idempotente"
+    desc: "Rol IAM para GitHub Actions via OIDC. UNA VEZ"
     cmds:
       - bash infra/bootstrap-oidc.sh
 
-  # ----- Init (interno, deps de plan/apply/destroy) --------------------------
+  # ═══ Init (interno, dep de plan/apply/destroy) ══════════════════════════════
 
   _init:
     internal: true
-    # Resolvemos ACCOUNT_SUFFIX en cada init: cambia entre cuentas (sandbox vs
-    # prod) y queremos el backend correcto sin obligar a setear ACCOUNT_SUFFIX
-    # en .env. `tail -c 7` toma los ultimos 6 chars del Account ID + newline.
+    # SUFFIX se resuelve dinamicamente: cambia entre cuentas (sandbox vs prod)
+    # y queremos el backend correcto sin setearlo en .env.
     vars:
       SUFFIX:
         sh: aws sts get-caller-identity --query Account --output text | tail -c 7
       PROJECT: '{{.PROJECT | default "ml-training"}}'
-      REGION: '{{.AWS_DEFAULT_REGION | default "us-east-1"}}'
+      REGION:  '{{.AWS_DEFAULT_REGION | default "us-east-1"}}'
     cmds:
       - terraform -chdir={{.TF_DIR}} init
         -backend-config=bucket={{.PROJECT}}-tfstate-{{.SUFFIX}}
@@ -4726,7 +4736,7 @@ tasks:
         -backend-config=dynamodb_table={{.PROJECT}}-tflock
         -reconfigure
 
-  # ----- Plan / apply / destroy ----------------------------------------------
+  # ═══ Plan / Apply / Destroy ═════════════════════════════════════════════════
 
   plan:
     desc: "terraform plan. Var opcional: TARGET=module.X"
@@ -4741,21 +4751,22 @@ tasks:
       - terraform -chdir={{.TF_DIR}} apply {{if .TARGET}}-target={{.TARGET}}{{end}} -auto-approve
 
   destroy:
-    desc: "DESTRUCTIVO: terraform destroy completo. Pide confirmacion. Considerar `task cluster:teardown` antes (preserva storage)"
-    prompt: "Esto borrara TODA la infra de envs/prod, incluso storage (S3 buckets, ECR repos). Continuar?"
+    desc: "DESTRUCTIVO: terraform destroy completo. Considerar cluster:teardown antes (preserva storage)"
+    prompt: "Esto borrara TODA la infra de envs/prod (incluso S3 + ECR). Continuar?"
     deps: [_init]
     cmds:
       - terraform -chdir={{.TF_DIR}} destroy -auto-approve
 
   destroy-target:
-    desc: "terraform destroy parcial. Vars: TARGET=module.X (REQUERIDO). Pide confirmacion"
+    desc: "terraform destroy parcial. Vars: TARGET=module.X (REQ)"
     prompt: "Destruir {{.TARGET}}? Asegurate que no tenga dependencias activas"
+    requires:
+      vars: [TARGET]
     deps: [_init]
     cmds:
-      - 'test -n "{{.TARGET}}" || { echo "ERROR falta TARGET=module.X"; exit 1; }'
       - terraform -chdir={{.TF_DIR}} destroy -target={{.TARGET}} -auto-approve
 
-  # ----- Inspeccion ----------------------------------------------------------
+  # ═══ Inspeccion ═════════════════════════════════════════════════════════════
 
   output:
     desc: "Mostrar outputs de envs/prod (alb_dns, ecr_urls, rds_endpoint, ...)"
@@ -4763,25 +4774,27 @@ tasks:
       - terraform -chdir={{.TF_DIR}} output
 
   output-raw:
-    desc: "Mostrar UN output crudo (para scripts). Var: NAME=alb_dns"
+    desc: "Mostrar UN output crudo (para scripts). Var: NAME=alb_dns (REQ)"
     silent: true
+    requires:
+      vars: [NAME]
     cmds:
-      - 'test -n "{{.NAME}}" || { echo "ERROR falta NAME=<output>"; exit 1; }'
       - terraform -chdir={{.TF_DIR}} output -raw {{.NAME}}
 
   validate:
-    desc: "terraform fmt -check + validate. Sin tocar state. Util en pre-commit"
+    desc: "terraform fmt -check + validate (sin tocar state, util en pre-commit)"
     cmds:
       - terraform -chdir={{.TF_DIR}} fmt -check -recursive
       - terraform -chdir={{.TF_DIR}} validate
 
-  # ----- Recovery ------------------------------------------------------------
+  # ═══ Recovery ═══════════════════════════════════════════════════════════════
 
   force-unlock:
-    desc: "Liberar state lock huerfano. Var: LOCK_ID=<id que muestra el error>"
+    desc: "Liberar state lock huerfano. Var: LOCK_ID=<id> (REQ)"
+    requires:
+      vars: [LOCK_ID]
     deps: [_init]
     cmds:
-      - 'test -n "{{.LOCK_ID}}" || { echo "ERROR falta LOCK_ID=<id>"; exit 1; }'
       - terraform -chdir={{.TF_DIR}} force-unlock -force {{.LOCK_ID}}
 ```
 
@@ -4812,24 +4825,31 @@ en vez de `bash infra/bootstrap.sh`) sin re-implementar.
 # tasks/ecr.yml  -  Build + push de las 3 imagenes a ECR
 # =============================================================================
 # Incluido por Taskfile.yml raiz con namespace "ecr:".
+#
+# USO TIPICO:
+#   task ecr:build-all                                build + push de las 3
+#   task ecr:build IMG=trainer                        UNA imagen, tag default
+#   task ecr:build IMG=trainer TAG=v1.2.3             UNA imagen, tag custom
+#   task ecr:list                                     listar tags en ECR
+#
+# IMG = trainer | mlflow | reports
+# =============================================================================
 
 version: "3"
 
 vars:
-  PROJECT: '{{.PROJECT | default "ml-training"}}'
-  REGION: '{{.AWS_DEFAULT_REGION | default "us-east-1"}}'
-
-  # Tags default (override por CLI: task ecr:build IMG=trainer TAG=v1.2.3)
-  TAG_TRAINER: '{{.TAG_TRAINER | default "latest"}}'
-  TAG_MLFLOW: '{{.TAG_MLFLOW | default "v3.12.0"}}'
-  TAG_REPORTS: '{{.TAG_REPORTS | default "stable"}}'
+  PROJECT:     '{{.PROJECT            | default "ml-training"}}'
+  REGION:      '{{.AWS_DEFAULT_REGION | default "us-east-1"}}'
+  TAG_TRAINER: '{{.TAG_TRAINER        | default "latest"}}'
+  TAG_MLFLOW:  '{{.TAG_MLFLOW         | default "v3.12.0"}}'
+  TAG_REPORTS: '{{.TAG_REPORTS        | default "stable"}}'
 
 tasks:
 
-  # ----- Login (12h validez del token) ---------------------------------------
+  # ═══ Login (token 12h, run: once) ═══════════════════════════════════════════
 
   login:
-    desc: "docker login a ECR (token valido 12h). Idempotente"
+    desc: "docker login a ECR. Idempotente, token valido 12h"
     # run: once: si varias tasks dependen de login en una misma corrida,
     # solo se ejecuta una vez.
     run: once
@@ -4840,10 +4860,12 @@ tasks:
       - aws ecr get-login-password --region {{.REGION}}
         | docker login --username AWS --password-stdin {{.ACCOUNT}}.dkr.ecr.{{.REGION}}.amazonaws.com
 
-  # ----- Build + push UNA imagen (parametrizado) -----------------------------
+  # ═══ Build + push UNA imagen ════════════════════════════════════════════════
 
   build:
-    desc: "Build + push UNA imagen. Vars: IMG=trainer|mlflow|reports (REQUERIDO), TAG=<override opcional>"
+    desc: "Build + push UNA imagen. Vars: IMG=trainer|mlflow|reports (REQ), TAG=<override>"
+    requires:
+      vars: [IMG]
     deps: [login]
     vars:
       ACCOUNT:
@@ -4860,7 +4882,7 @@ tasks:
             trainer) echo "{{.PROJECT}}" ;;
             mlflow)  echo "{{.PROJECT}}-mlflow" ;;
             reports) echo "{{.PROJECT}}-reports" ;;
-            *) echo "ERROR_IMG_DESCONOCIDO" ;;
+            *)       echo "ERROR" ;;
           esac
       DOCKERFILE:
         sh: |
@@ -4868,7 +4890,6 @@ tasks:
             trainer) echo "Dockerfile" ;;
             mlflow)  echo "docker/mlflow/Dockerfile" ;;
             reports) echo "docker/reports/Dockerfile" ;;
-            *) echo "INVALID" ;;
           esac
       RESOLVED_TAG:
         sh: |
@@ -4876,11 +4897,10 @@ tasks:
             trainer) echo "{{.TAG | default .TAG_TRAINER}}" ;;
             mlflow)  echo "{{.TAG | default .TAG_MLFLOW}}" ;;
             reports) echo "{{.TAG | default .TAG_REPORTS}}" ;;
-            *) echo "INVALID" ;;
           esac
     cmds:
-      - 'test "{{.IMAGE_NAME}}" != "ERROR_IMG_DESCONOCIDO" || { echo "ERROR IMG debe ser trainer/mlflow/reports (recibido {{.IMG}})"; exit 1; }'
-      - 'echo ">>> Build {{.IMAGE_NAME}}:{{.RESOLVED_TAG}} (sha-{{.GIT_SHA}})"'
+      - 'test "{{.IMAGE_NAME}}" != "ERROR" || { echo "ERROR IMG debe ser trainer|mlflow|reports (recibido {{.IMG}})"; exit 1; }'
+      - 'echo ">>> Build {{.IMAGE_NAME}}:{{.RESOLVED_TAG}}  (sha-{{.GIT_SHA}})"'
       - docker build
         --build-arg GIT_SHA={{.GIT_SHA}}
         --build-arg BUILD_DATE={{.BUILD_DATE}}
@@ -4891,10 +4911,10 @@ tasks:
       - docker push {{.REGISTRY}}/{{.IMAGE_NAME}}:{{.RESOLVED_TAG}}
       - docker push {{.REGISTRY}}/{{.IMAGE_NAME}}:sha-{{.GIT_SHA}}
 
-  # ----- Build + push de las 3 ------------------------------------------------
+  # ═══ Build + push de las 3 ══════════════════════════════════════════════════
 
   build-all:
-    desc: "Build + push de las 3 imagenes (trainer + mlflow + reports) con tags default"
+    desc: "Build + push de las 3 imagenes (trainer + mlflow + reports)"
     deps: [login]
     cmds:
       - task: build
@@ -4904,20 +4924,20 @@ tasks:
       - task: build
         vars: { IMG: reports }
 
-  # ----- Inspeccion -----------------------------------------------------------
+  # ═══ Inspeccion ═════════════════════════════════════════════════════════════
 
   list:
     desc: "Listar las 3 imagenes con tag default presente en cada repo ECR"
     silent: true
     cmds:
-      - 'echo "=== {{.PROJECT}} ({{.TAG_TRAINER}}) ==="'
-      - aws ecr list-images --repository-name {{.PROJECT}} --query 'imageIds[?imageTag==`{{.TAG_TRAINER}}`]' --output table || true
-      - 'echo ""'
-      - 'echo "=== {{.PROJECT}}-mlflow ({{.TAG_MLFLOW}}) ==="'
-      - aws ecr list-images --repository-name {{.PROJECT}}-mlflow --query 'imageIds[?imageTag==`{{.TAG_MLFLOW}}`]' --output table || true
-      - 'echo ""'
-      - 'echo "=== {{.PROJECT}}-reports ({{.TAG_REPORTS}}) ==="'
-      - aws ecr list-images --repository-name {{.PROJECT}}-reports --query 'imageIds[?imageTag==`{{.TAG_REPORTS}}`]' --output table || true
+      - |
+        for spec in "{{.PROJECT}}:{{.TAG_TRAINER}}" "{{.PROJECT}}-mlflow:{{.TAG_MLFLOW}}" "{{.PROJECT}}-reports:{{.TAG_REPORTS}}"; do
+          repo="${spec%:*}"; tag="${spec##*:}"
+          echo "=== $repo ($tag) ==="
+          aws ecr list-images --repository-name "$repo" \
+            --query "imageIds[?imageTag=='$tag']" --output table 2>/dev/null || true
+          echo ""
+        done
 ```
 
 **Por que `run: once` en `login`**: cuando `build-all` lanza las 3 builds
@@ -4943,124 +4963,103 @@ y lo embebe como label (`org.opencontainers.image.created`). Util para
 auditar "que imagen tengo desplegada y desde cuando" via
 `docker inspect <image>`.
 
-### 4.1.6 `tasks/batch.yml` (submit jobs + polling)
+### 4.1.6 `tasks/batch.yml` (training jobs en la nube)
 
 ```yaml
 # =============================================================================
-# tasks/batch.yml  -  Submitir jobs a AWS Batch + polling de status
+# tasks/batch.yml  -  AWS Batch (training jobs en la nube)
 # =============================================================================
 # Incluido por Taskfile.yml raiz con namespace "batch:".
+#
+# USO TIPICO:
+#   task batch:train VARIETIES=POP                    una variedad, espera
+#   task batch:train VARIETIES=POP,VENTURA            multiples en serie
+#   task batch:train VARIETIES=POP TUNING=smoke       sanity check (~1 min)
+#   task batch:train VARIETIES=POP WAIT=false         fire-and-forget
+#   task batch:smoke                                  atajo: POP + smoke
+#   task batch:status                                 jobs activos en queues
+#   task batch:cancel JOB_ID=<id>                     terminar un job
+# =============================================================================
 
 version: "3"
 
 vars:
-  PROJECT: '{{.PROJECT | default "ml-training"}}'
-  JOB_DEF: '{{.JOB_DEF | default (printf "%s-trainer" (.PROJECT | default "ml-training"))}}'
-  QUEUE_SPOT: '{{.QUEUE_SPOT | default (printf "%s-spot" (.PROJECT | default "ml-training"))}}'
-  QUEUE_OD: '{{.QUEUE_OD | default (printf "%s-ondemand" (.PROJECT | default "ml-training"))}}'
-
-  TUNING: '{{.TUNING | default "prod"}}'
-  PARALLEL: '{{.PARALLEL | default "1"}}'
-  WAIT: '{{.WAIT | default "true"}}'
+  PROJECT:    '{{.PROJECT    | default "ml-training"}}'
+  JOB_DEF:    '{{.JOB_DEF    | default (printf "%s-trainer"  .PROJECT)}}'
+  QUEUE_SPOT: '{{.QUEUE_SPOT | default (printf "%s-spot"     .PROJECT)}}'
+  QUEUE_OD:   '{{.QUEUE_OD   | default (printf "%s-ondemand" .PROJECT)}}'
+  TUNING:     '{{.TUNING     | default "prod"}}'
+  PARALLEL:   '{{.PARALLEL   | default "1"}}'
+  WAIT:       '{{.WAIT       | default "true"}}'
 
 tasks:
 
-  # ----- Submit + (opcional) wait ---------------------------------------------
+  # ═══ Entrenar ═══════════════════════════════════════════════════════════════
 
-  submit:
-    desc: "Lanza UN job a Batch. Vars: VARIETY=POP (REQUERIDO), TUNING, WAIT=true|false"
+  train:
+    desc: "Entrena en Batch (1 o N variedades, secuencial). Vars: VARIETIES=POP[,JUPITER] (REQ), TUNING, WAIT"
+    requires:
+      vars: [VARIETIES]
     vars:
+      # prod_xl -> OnDemand (sin interrupcion). Resto -> Spot (~70% cheaper).
       QUEUE: '{{if eq .TUNING "prod_xl"}}{{.QUEUE_OD}}{{else}}{{.QUEUE_SPOT}}{{end}}'
-      JOB_NAME: 'train-{{.VARIETY}}-{{.TUNING}}-{{now | date "20060102-150405"}}'
     cmds:
-      - 'test -n "{{.VARIETY}}" || { echo "ERROR falta VARIETY=<nombre>"; exit 1; }'
       - |
-        JOB_ID=$(aws batch submit-job \
-          --job-name "{{.JOB_NAME}}" \
-          --job-queue "{{.QUEUE}}" \
-          --job-definition "{{.JOB_DEF}}" \
-          --container-overrides '{
-            "command": [
-              "--varieties", "{{.VARIETY}}",
-              "--tuning", "{{.TUNING}}",
-              "--parallel-varieties", "{{.PARALLEL}}"
-            ]
-          }' \
-          --query 'jobId' --output text)
-        echo "Submitted JOB_ID=$JOB_ID  (queue={{.QUEUE}}, def={{.JOB_DEF}})"
-        if [ "{{.WAIT}}" = "true" ]; then
-          task batch:wait JOB_ID=$JOB_ID
-        fi
+        set -e
+        for v in $(echo "{{.VARIETIES}}" | tr ',' ' '); do
+          JOB_ID=$(aws batch submit-job \
+            --job-name       "train-$v-{{.TUNING}}-$(date +%Y%m%d-%H%M%S)" \
+            --job-queue      "{{.QUEUE}}" \
+            --job-definition "{{.JOB_DEF}}" \
+            --container-overrides "{\"command\":[\"--varieties\",\"$v\",\"--tuning\",\"{{.TUNING}}\",\"--parallel-varieties\",\"{{.PARALLEL}}\"]}" \
+            --query jobId --output text)
+          echo ">>> $v  job=$JOB_ID  queue={{.QUEUE}}"
 
-  # ----- Wait sobre un JOB_ID -------------------------------------------------
+          [ "{{.WAIT}}" != "true" ] && continue
 
-  wait:
-    desc: "Polling de un job hasta SUCCEEDED/FAILED. Var: JOB_ID=<id>. Sale con exit 1 si FAILED"
-    cmds:
-      - 'test -n "{{.JOB_ID}}" || { echo "ERROR falta JOB_ID=<id>"; exit 1; }'
-      - |
-        echo "Polling job {{.JOB_ID}} cada 30s..."
-        while true; do
-          STATUS=$(aws batch describe-jobs --jobs "{{.JOB_ID}}" --query 'jobs[0].status' --output text)
-          REASON=$(aws batch describe-jobs --jobs "{{.JOB_ID}}" --query 'jobs[0].statusReason' --output text 2>/dev/null || echo "-")
-          echo "  $(date +%H:%M:%S)  status=$STATUS  reason=$REASON"
-          case "$STATUS" in
-            SUCCEEDED) echo "OK job {{.JOB_ID}} SUCCEEDED"; exit 0 ;;
-            FAILED)    echo "FAIL job {{.JOB_ID}} FAILED $REASON"; exit 1 ;;
-            SUBMITTED|PENDING|RUNNABLE|STARTING|RUNNING) sleep 30 ;;
-            *)         echo "Estado desconocido $STATUS"; exit 2 ;;
-          esac
+          while :; do
+            STATUS=$(aws batch describe-jobs --jobs "$JOB_ID" --query 'jobs[0].status' --output text)
+            echo "  $(date +%H:%M:%S)  $v  $STATUS"
+            case "$STATUS" in
+              SUCCEEDED) break ;;
+              FAILED)    REASON=$(aws batch describe-jobs --jobs "$JOB_ID" --query 'jobs[0].statusReason' --output text)
+                         echo "FAIL $v  reason=$REASON"; exit 1 ;;
+              *)         sleep 30 ;;
+            esac
+          done
         done
 
-  # ----- Smoke test -----------------------------------------------------------
+  # ═══ Smoke test ═════════════════════════════════════════════════════════════
 
   smoke:
-    desc: "Smoke test lanza UN job con VARIETY=POP TUNING=smoke (~1 min). Falla con exit 1 si el job falla"
+    desc: "Sanity check end-to-end (~1 min). Equivalente a train VARIETIES=POP TUNING=smoke"
     cmds:
-      - task: submit
-        vars: { VARIETY: POP, TUNING: smoke, WAIT: "true" }
+      - task: train
+        vars: { VARIETIES: POP, TUNING: smoke }
 
-  # ----- Retrain (multi-variedad, secuencial) --------------------------------
-
-  retrain:
-    desc: "Lanza N jobs (1 por variedad). Vars VARIETIES=POP,JUPITER (REQUERIDO), TUNING, WAIT"
-    cmds:
-      - 'test -n "{{.VARIETIES}}" || { echo "ERROR falta VARIETIES=POP[,JUPITER,...]"; exit 1; }'
-      - |
-        # Submit en serie. Si WAIT=true, espera entre uno y otro (orden
-        # determinista). Si WAIT=false, dispara todos y vuelve.
-        for v in $(echo "{{.VARIETIES}}" | tr ',' ' '); do
-          echo ">>> Lanzando retrain de variedad=$v tuning={{.TUNING}}"
-          task batch:submit VARIETY=$v TUNING={{.TUNING}} WAIT={{.WAIT}} || {
-            echo "FAIL variedad $v fallo. Abortando resto."
-            exit 1
-          }
-        done
-
-  # ----- Estado --------------------------------------------------------------
+  # ═══ Estado ═════════════════════════════════════════════════════════════════
 
   status:
-    desc: "Jobs no terminados (SUBMITTED/PENDING/RUNNABLE/STARTING/RUNNING) en ambas queues"
+    desc: "Jobs activos (SUBMITTED/PENDING/RUNNABLE/STARTING/RUNNING) en ambas queues"
     silent: true
     cmds:
-      - 'echo "=== Queue Spot ({{.QUEUE_SPOT}}) ==="'
       - |
-        for s in SUBMITTED PENDING RUNNABLE STARTING RUNNING; do
-          aws batch list-jobs --job-queue "{{.QUEUE_SPOT}}" --job-status $s \
-            --query 'jobSummaryList[].[jobId,jobName,status,createdAt]' --output table 2>/dev/null || true
-        done
-      - 'echo ""'
-      - 'echo "=== Queue OnDemand ({{.QUEUE_OD}}) ==="'
-      - |
-        for s in SUBMITTED PENDING RUNNABLE STARTING RUNNING; do
-          aws batch list-jobs --job-queue "{{.QUEUE_OD}}" --job-status $s \
-            --query 'jobSummaryList[].[jobId,jobName,status,createdAt]' --output table 2>/dev/null || true
+        for queue in "{{.QUEUE_SPOT}}" "{{.QUEUE_OD}}"; do
+          echo "=== $queue ==="
+          for s in SUBMITTED PENDING RUNNABLE STARTING RUNNING; do
+            aws batch list-jobs --job-queue "$queue" --job-status $s \
+              --query 'jobSummaryList[].[jobId,jobName,status,createdAt]' --output table 2>/dev/null || true
+          done
+          echo ""
         done
 
+  # ═══ Cancelar ═══════════════════════════════════════════════════════════════
+
   cancel:
-    desc: "Cancelar un job RUNNING o PENDING. Var JOB_ID=<id> REASON=<texto>"
+    desc: "Terminar job RUNNING/PENDING. Vars: JOB_ID=<id> (REQ), REASON=<texto>"
+    requires:
+      vars: [JOB_ID]
     cmds:
-      - 'test -n "{{.JOB_ID}}" || { echo "ERROR falta JOB_ID=<id>"; exit 1; }'
       - aws batch terminate-job --job-id "{{.JOB_ID}}" --reason "{{.REASON | default \"cancelled via task\"}}"
 ```
 
@@ -5074,45 +5073,59 @@ selecciona automaticamente.
 rate-limit de Batch. 30s da resolucion suficiente (los jobs duran
 20m-6h) sin saturar.
 
-**Por que `submit` invoca `batch:wait` como sub-task y no inline el
-polling**: separa concerns (submit = "lanzar", wait = "esperar") y
-permite usar `wait` solo (`task batch:wait JOB_ID=<id>`) si ya tenes
-un job lanzado por otra via.
+**Por que `train` colapsa submit + polling + multi-variedad en una sola
+task** (en vez de `submit` + `wait` + `retrain` separados como en V1
+del runbook):
+- El uso comun es "lanza y espera"; tenerlo en un solo loop bash es mas
+  legible que dos tasks que se invocan recursivamente.
+- Multi-variedad es solo un `for v in $(echo "$VARIETIES" | tr ',' ' ')`
+  alrededor del bloque submit+wait. No justifica una task aparte.
+- Si necesitas fire-and-forget, `WAIT=false` saltea el polling.
+- Si necesitas observar un job lanzado por otra via (GitHub Actions,
+  consola AWS), usa `aws batch describe-jobs --jobs <id>` directo.
 
-**Por que `retrain` itera con bash `for` y no con paralelismo Task**:
-los jobs Batch ya corren en paralelo en infraestructura AWS. El loop
-local solo necesita lanzarlos secuencialmente para que el polling sea
-ordenado en la terminal. Si querias todo paralelo, `WAIT=false`.
+**Por que iteramos con bash `for` y no con paralelismo Task**: los jobs
+Batch ya corren en paralelo en infraestructura AWS. El loop local solo
+necesita lanzarlos secuencialmente para que el polling sea ordenado en
+la terminal. Si queres todo paralelo, `WAIT=false`.
 
 ### 4.1.7 `tasks/cluster.yml` (lifecycle scale up/down + teardown)
 
 ```yaml
 # =============================================================================
-# tasks/cluster.yml  -  Lifecycle del cluster AWS (scale up/down + teardown)
+# tasks/cluster.yml  -  Lifecycle del cluster AWS
 # =============================================================================
 # Incluido por Taskfile.yml raiz con namespace "cluster:".
 #
-# Modulos "volatiles" (se reconstruyen en ~10-15 min):
+# Modulos VOLATILES (se reconstruyen en ~10-15 min):
 #   scheduler, lambdas, monitoring, batch, reports, mlflow
-# Modulos "permanentes" (NO se tocan en teardown):
+# Modulos PERMANENTES (NO se tocan en teardown):
 #   network (VPC + NAT $$$), storage (S3 + ECR), backend state
+#
+# USO TIPICO:
+#   task cluster:status                               estado RDS + ECS + Batch
+#   task cluster:scale-up                             encender (RDS + Fargate)
+#   task cluster:scale-down                           apagar (preserva infra)
+#   task cluster:wait-healthy                         polling ALB hasta 200
+#   task cluster:teardown                             destroy volatiles
+#   task cluster:rebuild                              re-apply + scale-up
+# =============================================================================
 
 version: "3"
 
 vars:
-  PROJECT: '{{.PROJECT | default "ml-training"}}'
-  DISPATCHER_FN: '{{.DISPATCHER_FN | default (printf "%s-dispatcher" (.PROJECT | default "ml-training"))}}'
-  TF_DIR: '{{.TF_DIR | default "infra/envs/prod"}}'
-
-  # Modulos volatiles (orden importa para destroy: reverse de apply)
+  PROJECT:       '{{.PROJECT       | default "ml-training"}}'
+  DISPATCHER_FN: '{{.DISPATCHER_FN | default (printf "%s-dispatcher" .PROJECT)}}'
+  TF_DIR:        '{{.TF_DIR        | default "infra/envs/prod"}}'
+  # Orden reverso de apply (importante para destroy con dependencias)
   VOLATILE_MODULES: "module.scheduler module.lambdas module.monitoring module.batch module.reports module.mlflow"
 
 tasks:
 
-  # ----- Estado actual --------------------------------------------------------
+  # ═══ Estado ═════════════════════════════════════════════════════════════════
 
   status:
-    desc: "Estado actual del cluster RDS + ECS services + Batch jobs activos"
+    desc: "Estado del cluster: RDS + ECS services + Batch jobs activos"
     silent: true
     cmds:
       - 'echo "=== RDS ==="'
@@ -5138,29 +5151,24 @@ tasks:
         for q in {{.PROJECT}}-spot {{.PROJECT}}-ondemand; do
           for s in SUBMITTED PENDING RUNNABLE STARTING RUNNING; do
             n=$(aws batch list-jobs --job-queue "$q" --job-status $s --query 'length(jobSummaryList)' --output text 2>/dev/null || echo 0)
-            if [ "$n" -gt 0 ]; then
-              echo "  queue=$q  status=$s  count=$n"
-              total=$((total + n))
-            fi
+            [ "$n" -gt 0 ] && { echo "  queue=$q  status=$s  count=$n"; total=$((total + n)); }
           done
         done
         echo "  TOTAL activos $total"
 
-  # ----- Scale down (apagar) --------------------------------------------------
+  # ═══ Scale (encender / apagar) ══════════════════════════════════════════════
 
   scale-down:
-    desc: "Apaga RDS + ECS services (desired=0). Aborta si hay Batch jobs RUNNING. Invoca Lambda dispatcher"
+    desc: "Apagar (RDS stop + ECS desired=0). Aborta si hay Batch RUNNING"
     cmds:
       - 'echo ">>> Pre-check Batch jobs activos"'
       - task: _batch-jobs-active
       - |
-        # Chequeo previo para fallar antes de tocar nada si hay jobs corriendo.
-        # El dispatcher tambien chequea, pero lo hacemos visible aqui.
         running=$(aws batch list-jobs --job-queue "{{.PROJECT}}-spot" --job-status RUNNING --query 'length(jobSummaryList)' --output text 2>/dev/null || echo 0)
         if [ "$running" -gt 0 ]; then
-          echo "ERROR $running job(s) RUNNING en queue spot. Esperar o cancelar antes de scale-down."
-          echo "       task batch:status   para ver detalle"
-          echo "       task batch:cancel JOB_ID=<id>   para cancelar"
+          echo "ERROR $running job(s) RUNNING. Cancelar primero:"
+          echo "       task batch:status              (ver detalle)"
+          echo "       task batch:cancel JOB_ID=<id>  (cancelar)"
           exit 1
         fi
       - 'echo ">>> Invocando dispatcher Lambda (action=stop)..."'
@@ -5170,10 +5178,8 @@ tasks:
         /tmp/dispatcher-stop.json
       - cat /tmp/dispatcher-stop.json && echo ""
 
-  # ----- Scale up (encender) --------------------------------------------------
-
   scale-up:
-    desc: "Arranca RDS + ECS services (desired=1). Invoca Lambda dispatcher. RDS tarda ~5 min en estar disponible"
+    desc: "Encender (RDS start + ECS desired=1). RDS tarda ~5 min en estar Available"
     cmds:
       - 'echo ">>> Invocando dispatcher Lambda (action=start)..."'
       - aws lambda invoke --function-name {{.DISPATCHER_FN}}
@@ -5182,44 +5188,40 @@ tasks:
         /tmp/dispatcher-start.json
       - cat /tmp/dispatcher-start.json && echo ""
       - 'echo ""'
-      - 'echo "RDS tarda ~5 min en estar disponible. Despues task cluster:wait-healthy"'
+      - 'echo "RDS tarda ~5 min. Despues: task cluster:wait-healthy"'
 
-  # ----- Wait healthy ---------------------------------------------------------
+  # ═══ Wait healthy ═══════════════════════════════════════════════════════════
 
   wait-healthy:
-    desc: "Polling del ALB hasta que MLflow responda 200. Timeout 10 min"
+    desc: "Polling del ALB hasta MLflow 200. Timeout 10 min"
     deps: [_init-alb]
     cmds:
       - |
-        # ALB resuelto via output de Terraform (terraform output -raw alb_dns)
         ALB=$(terraform -chdir={{.TF_DIR}} output -raw alb_dns 2>/dev/null)
         if [ -z "$ALB" ]; then
-          echo "ERROR no se pudo leer terraform output alb_dns. Esta envs/prod aplicada?"
+          echo "ERROR no se pudo leer alb_dns. envs/prod aplicada?"
           exit 1
         fi
         echo "Polling http://$ALB/ cada 15s (timeout 10 min)..."
         for i in $(seq 1 40); do
           code=$(curl -s -o /dev/null -w '%{http_code}' "http://$ALB/" 2>/dev/null || echo 000)
           echo "  $(date +%H:%M:%S)  GET http://$ALB/  -> $code"
-          if [ "$code" = "200" ]; then
-            echo "OK MLflow respondiendo en http://$ALB/"
-            exit 0
-          fi
+          [ "$code" = "200" ] && { echo "OK MLflow respondiendo en http://$ALB/"; exit 0; }
           sleep 15
         done
-        echo "FAIL timeout 10 min esperando ALB. Revisar logs aws logs tail /ecs/{{.PROJECT}}/mlflow --follow"
+        echo "FAIL timeout 10 min. Revisar: aws logs tail /ecs/{{.PROJECT}}/mlflow --follow"
         exit 1
 
   _init-alb:
     internal: true
     cmds:
-      - 'test -d {{.TF_DIR}} || { echo "ERROR {{.TF_DIR}} no existe. Aplicar infra primero - task infra:apply"; exit 1; }'
+      - 'test -d {{.TF_DIR}} || { echo "ERROR {{.TF_DIR}} no existe. Aplicar infra: task infra:apply"; exit 1; }'
 
-  # ----- Teardown / Rebuild ---------------------------------------------------
+  # ═══ Teardown / Rebuild ═════════════════════════════════════════════════════
 
   teardown:
-    desc: "scale-down + destroy de modulos volatiles. Preserva storage + network. Pide confirmacion"
-    prompt: "Esto destruira los modulos volatiles. Storage (S3+ECR) y network (VPC) quedan intactos. Continuar?"
+    desc: "scale-down + destroy modulos volatiles. Preserva storage + network"
+    prompt: "Destruira los modulos volatiles. Storage (S3+ECR) y network (VPC) quedan. Continuar?"
     cmds:
       - task: scale-down
       - 'echo ">>> Destroy modulos volatiles (orden reverso de apply)..."'
@@ -5231,17 +5233,17 @@ tasks:
             exit 1
           }
         done
-      - 'echo "OK teardown completo. Para volver task cluster:rebuild"'
+      - 'echo "OK teardown completo. Para volver: task cluster:rebuild"'
 
   rebuild:
-    desc: "Re-apply de modulos volatiles + scale-up. Reconstruye lo que teardown destruyo"
+    desc: "Re-apply de modulos volatiles + scale-up"
     cmds:
-      - 'echo ">>> Apply completo (los modulos volatiles se re-crean)..."'
+      - 'echo ">>> Apply completo (modulos volatiles se re-crean, resto no-op)..."'
       - task: ":infra:apply"
       - 'echo ">>> scale-up..."'
       - task: scale-up
       - 'echo ""'
-      - 'echo "Listo. task cluster:wait-healthy para confirmar que MLflow responde"'
+      - 'echo "Listo. task cluster:wait-healthy para confirmar MLflow"'
 ```
 
 **Por que invocar el Lambda dispatcher y no `aws cli` directo desde la
@@ -5274,20 +5276,27 @@ dinamicamente garantiza que poll-eamos el ALB actual, no uno fantasma.
 
 ```yaml
 # =============================================================================
-# tasks/mlflow_registry.yml  -  Promotion en MLflow Model Registry (AWS)
+# tasks/mlflow_registry.yml  -  MLflow Model Registry (AWS)
 # =============================================================================
 # Incluido por Taskfile.yml raiz con namespace "mlflow-aws:".
-# Namespace separado del MLflow local (que vive en docker-compose).
+# Separado del MLflow local (que vive en docker-compose).
+#
+# USO TIPICO:
+#   task mlflow-aws:list-versions VARIETY=POP                    ver versiones
+#   task mlflow-aws:current-prod  VARIETY=POP                    ver Production actual
+#   task mlflow-aws:promote VARIETY=POP VERSION=3                gate MAPE<=20 (default)
+#   task mlflow-aws:promote VARIETY=POP VERSION=3 MAX_MAPE=15    gate custom
+# =============================================================================
 
 version: "3"
 
 vars:
-  TF_DIR: '{{.TF_DIR | default "infra/envs/prod"}}'
+  TF_DIR:   '{{.TF_DIR   | default "infra/envs/prod"}}'
   MAX_MAPE: '{{.MAX_MAPE | default "20"}}'
 
 tasks:
 
-  # ----- Helper resolver MLflow URI ------------------------------------------
+  # ═══ Helper: resolver MLflow URI ════════════════════════════════════════════
 
   _mlflow-uri:
     internal: true
@@ -5296,75 +5305,73 @@ tasks:
       - |
         ALB=$(terraform -chdir={{.TF_DIR}} output -raw alb_dns 2>/dev/null)
         if [ -z "$ALB" ]; then
-          echo "ERROR no se pudo leer terraform output alb_dns" >&2
+          echo "ERROR no se pudo leer alb_dns" >&2
           exit 1
         fi
         echo "http://$ALB"
 
-  # ----- Listar versiones de un modelo ---------------------------------------
+  # ═══ Inspeccion ═════════════════════════════════════════════════════════════
 
   list-versions:
-    desc: "Listar versiones de un modelo en el Registry. Var VARIETY=POP (REQUERIDO)"
+    desc: "Listar versiones de un modelo. Var: VARIETY=POP (REQ)"
+    requires:
+      vars: [VARIETY]
     cmds:
-      - 'test -n "{{.VARIETY}}" || { echo "ERROR falta VARIETY=<nombre>"; exit 1; }'
       - |
         URI=$(task mlflow-aws:_mlflow-uri)
         curl -s "$URI/api/2.0/mlflow/registered-models/get?name={{.VARIETY}}" \
           | jq '.registered_model.latest_versions[] | {version, current_stage, run_id, creation_timestamp}'
 
-  # ----- Promote con quality gate --------------------------------------------
-
-  promote:
-    desc: "Promover version a Production con gate MAPE. Vars VARIETY=POP VERSION=N (REQUERIDOS), MAX_MAPE=20"
+  current-prod:
+    desc: "Mostrar version Production actual. Var: VARIETY=POP (REQ)"
+    requires:
+      vars: [VARIETY]
     cmds:
-      - 'test -n "{{.VARIETY}}" || { echo "ERROR falta VARIETY=<nombre>"; exit 1; }'
-      - 'test -n "{{.VERSION}}" || { echo "ERROR falta VERSION=<N>"; exit 1; }'
       - |
         URI=$(task mlflow-aws:_mlflow-uri)
-        echo ">>> Resolviendo run_id de {{.VARIETY}} v{{.VERSION}}..."
+        curl -s "$URI/api/2.0/mlflow/registered-models/get?name={{.VARIETY}}" \
+          | jq '.registered_model.latest_versions[] | select(.current_stage == "Production") | {version, run_id, creation_timestamp}'
+
+  # ═══ Promote con quality gate (MAPE) ════════════════════════════════════════
+
+  promote:
+    desc: "Promover a Production con gate MAPE. Vars: VARIETY=POP VERSION=N (REQ), MAX_MAPE=20"
+    requires:
+      vars: [VARIETY, VERSION]
+    cmds:
+      - |
+        URI=$(task mlflow-aws:_mlflow-uri)
+        echo ">>> {{.VARIETY}} v{{.VERSION}}  (gate MAPE <= {{.MAX_MAPE}})"
+
         RUN_ID=$(curl -s "$URI/api/2.0/mlflow/model-versions/get?name={{.VARIETY}}&version={{.VERSION}}" \
           | jq -r '.model_version.run_id')
         if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
-          echo "ERROR no se encontro {{.VARIETY}} v{{.VERSION}} en el Registry"
+          echo "ERROR no se encontro {{.VARIETY}} v{{.VERSION}}"
           exit 1
         fi
-        echo "    run_id=$RUN_ID"
 
-        echo ">>> Leyendo metric mape_oof..."
         MAPE=$(curl -s "$URI/api/2.0/mlflow/runs/get?run_id=$RUN_ID" \
           | jq -r '.run.data.metrics[] | select(.key == "mape_oof") | .value')
         if [ -z "$MAPE" ] || [ "$MAPE" = "null" ]; then
-          echo "ERROR el run no tiene metric mape_oof. Promote abortado."
+          echo "ERROR el run no tiene mape_oof"
           exit 1
         fi
-        echo "    mape_oof=$MAPE  (umbral max={{.MAX_MAPE}})"
+        echo "    mape_oof=$MAPE"
 
-        # Comparacion float via awk (bash no soporta float nativo).
+        # awk para comparar floats (bash no soporta float nativo)
         OK=$(awk -v m="$MAPE" -v t="{{.MAX_MAPE}}" 'BEGIN { print (m <= t) ? "yes" : "no" }')
         if [ "$OK" != "yes" ]; then
-          echo "GATE FAIL MAPE=$MAPE > {{.MAX_MAPE}}. Promote abortado."
+          echo "GATE FAIL  MAPE=$MAPE > {{.MAX_MAPE}}"
           exit 1
         fi
-        echo "GATE OK."
+        echo "GATE OK"
 
         echo ">>> Transicionando a Production (archive existing)..."
         curl -s -X POST "$URI/api/2.0/mlflow/model-versions/transition-stage" \
           -H "Content-Type: application/json" \
           -d "{\"name\":\"{{.VARIETY}}\",\"version\":\"{{.VERSION}}\",\"stage\":\"Production\",\"archive_existing_versions\":true}" \
           | jq '.model_version | {name, version, current_stage}'
-
-        echo "OK {{.VARIETY}} v{{.VERSION}} ahora en Production."
-
-  # ----- Inspeccion de Production actual -------------------------------------
-
-  current-prod:
-    desc: "Mostrar la version en Production actual de un modelo. Var VARIETY=POP"
-    cmds:
-      - 'test -n "{{.VARIETY}}" || { echo "ERROR falta VARIETY=<nombre>"; exit 1; }'
-      - |
-        URI=$(task mlflow-aws:_mlflow-uri)
-        curl -s "$URI/api/2.0/mlflow/registered-models/get?name={{.VARIETY}}" \
-          | jq '.registered_model.latest_versions[] | select(.current_stage == "Production") | {version, run_id, creation_timestamp}'
+        echo "OK {{.VARIETY}} v{{.VERSION}} en Production"
 ```
 
 **Por que via REST API (`curl + jq`) y no `mlflow` CLI**: el host (Windows
@@ -5397,83 +5404,94 @@ sin borrarlas (siguen accesibles via stage="Archived").
 # Incluido por Taskfile.yml raiz con namespace "aws:".
 # Son ATAJOS que encadenan tasks de otros namespaces (infra, ecr, batch,
 # cluster) para los flujos completos del runbook.
+#
+# USO TIPICO:
+#   task aws:deploy                                   stand-up (storage -> imagenes -> resto)
+#   task aws:smoke                                    deploy + smoke test
+#   task aws:wake                                     encender stack (lunes manana)
+#   task aws:sleep                                    apagar stack (viernes noche)
+#   task aws:teardown                                 destroy volatiles, preserva storage
+#   task aws:rebuild                                  re-apply tras teardown
+#   task aws:destroy                                  DESTRUCTIVO total
+#   task aws:status                                   outputs + cluster status
+# =============================================================================
 
 version: "3"
 
 tasks:
 
-  # ----- Deploy / smoke -------------------------------------------------------
+  # ═══ Deploy / smoke ═════════════════════════════════════════════════════════
 
   deploy:
-    desc: "Deploy completo apply storage -> build 3 imagenes -> apply resto. Equivalente a oleadas A+B+C"
+    desc: "Stand-up completo: storage -> 3 imagenes -> resto (oleadas A+B+C)"
     cmds:
-      - 'echo ">>> Oleada A apply module.storage (S3 + ECR)..."'
+      - 'echo ">>> Oleada A: apply module.storage (S3 + ECR)..."'
       - task: ":infra:apply"
         vars: { TARGET: module.storage }
-      - 'echo ">>> Oleada B build + push 3 imagenes..."'
+      - 'echo ">>> Oleada B: build + push 3 imagenes..."'
       - task: ":ecr:build-all"
-      - 'echo ">>> Oleada C apply resto (network, mlflow, batch, monitoring, ...)..."'
+      - 'echo ">>> Oleada C: apply resto (network, mlflow, batch, monitoring, ...)..."'
       - task: ":infra:apply"
       - 'echo ""'
-      - 'echo "Deploy completo. ALB DNS"'
+      - 'echo "Deploy completo. ALB DNS:"'
       - task: ":infra:output-raw"
         vars: { NAME: alb_dns }
       - 'echo ""'
 
   smoke:
-    desc: "Deploy + smoke test. Falla si el smoke job no completa SUCCEEDED"
+    desc: "Deploy + smoke test (POP, tuning=smoke, ~1 min)"
     cmds:
       - task: deploy
-      - 'echo ">>> Smoke test (POP, tuning=smoke, ~1 min)..."'
+      - 'echo ">>> Smoke test..."'
       - task: ":batch:smoke"
 
-  # ----- Lifecycle (atajos a cluster:) ---------------------------------------
+  # ═══ Lifecycle (atajos a cluster:) ══════════════════════════════════════════
 
   wake:
-    desc: "Encender stack (scale-up + wait-healthy). Para lunes a la manana"
+    desc: "Encender stack (scale-up + sleep 5min + wait-healthy). Para lunes a la manana"
     cmds:
       - task: ":cluster:scale-up"
       - 'echo ""'
-      - 'echo "Esperando ~5 min a que RDS este Available antes de probar ALB..."'
+      - 'echo "Esperando ~5 min a que RDS este Available..."'
       - sleep 300
       - task: ":cluster:wait-healthy"
 
   sleep:
-    desc: "Apagar stack (cluster:scale-down). Para viernes a la noche / fuera de horario"
+    desc: "Apagar stack (scale-down). Para viernes a la noche / fuera de horario"
     cmds:
       - task: ":cluster:scale-down"
 
   teardown:
-    desc: "scale-down + destroy modulos volatiles. Preserva storage + network. Pide confirmacion"
+    desc: "scale-down + destroy modulos volatiles (preserva storage + network)"
     cmds:
       - task: ":cluster:teardown"
 
   rebuild:
-    desc: "Re-apply de modulos volatiles + scale-up. Reverso del teardown"
+    desc: "Re-apply de modulos volatiles + scale-up (reverso del teardown)"
     cmds:
       - task: ":cluster:rebuild"
 
-  # ----- Destroy total --------------------------------------------------------
+  # ═══ Destroy total ══════════════════════════════════════════════════════════
 
   destroy:
-    desc: "DESTRUCTIVO TOTAL terraform destroy de TODO (incluye storage). Pide doble confirmacion"
-    prompt: "Esto destruira COMPLETAMENTE envs/prod (S3 buckets, ECR repos, RDS, todo). Es irreversible. Continuar?"
+    desc: "DESTRUCTIVO TOTAL: terraform destroy de TODO (incluye storage). Doble confirmacion"
+    prompt: "Destruira COMPLETAMENTE envs/prod (S3, ECR, RDS, todo). Irreversible. Continuar?"
     cmds:
-      - 'echo ">>> Doble check drenando Batch jobs primero..."'
+      - 'echo ">>> Drenando Batch jobs primero..."'
       - task: ":cluster:scale-down"
       - 'echo ""'
       - 'echo ">>> terraform destroy total..."'
       - task: ":infra:destroy"
 
-  # ----- Estado --------------------------------------------------------------
+  # ═══ Estado ═════════════════════════════════════════════════════════════════
 
   status:
-    desc: "Estado completo del stack outputs de Terraform + cluster:status"
+    desc: "Estado completo: outputs de Terraform + cluster:status"
     cmds:
       - 'echo "=== Terraform outputs ==="'
       - task: ":infra:output"
       - 'echo ""'
-      - 'echo "=== Cluster status ==="'
+      - 'echo "=== Cluster ==="'
       - task: ":cluster:status"
 ```
 
@@ -5832,7 +5850,7 @@ Si los 5 checks dan OK, la infra esta arriba.
 ## 4.5 Smoke test — entrenar 1 variedad end-to-end
 
 Esto verifica (el item 1 sobre Lambda dispatcher se valida indirectamente
-en 📖 4.7.1 cuando uses `task batch:retrain`; el smoke va directo a Batch):
+en 📖 4.7.1 cuando uses `task batch:train`; el smoke va directo a Batch):
 
 1. Batch submit funciona (SubmitJob directo, sin pasar por Lambda).
 2. EC2 Spot arranca + corre el container.
@@ -5846,19 +5864,21 @@ en 📖 4.7.1 cuando uses `task batch:retrain`; el smoke va directo a Batch):
 
 ### 4.5.1 Como funciona la task `batch:smoke`
 
-La logica vive en `tasks/batch.yml` y tiene 2 pasos:
+`batch:smoke` es un atajo a `batch:train VARIETIES=POP TUNING=smoke`. La
+logica vive en `tasks/batch.yml` (un solo loop bash que hace submit +
+polling por cada variedad):
 
-1. **Submit** (`batch:submit VARIETY=POP TUNING=smoke`): invoca `aws batch
-   submit-job` con la job-definition `ml-training-trainer` y container
-   overrides `--varieties POP --tuning smoke --parallel-varieties 1`.
-2. **Wait** (`batch:wait JOB_ID=<id>`): polling cada 30s sobre
-   `aws batch describe-jobs` hasta que `status` sea `SUCCEEDED` o
-   `FAILED`. Exit 0 / exit 1 respectivamente.
+1. **Submit** via `aws batch submit-job` con la job-definition
+   `ml-training-trainer` y container overrides `--varieties POP
+   --tuning smoke --parallel-varieties 1`.
+2. **Polling** via `aws batch describe-jobs` cada 30s hasta que `status`
+   sea `SUCCEEDED` (exit 0) o `FAILED` (exit 1).
 
-**Por que NO via Lambda dispatcher** (a diferencia del retrain): la
-task local hace submit directo a Batch para tener control fino del
-exit code y diagnostico. El Lambda dispatcher es para invocaciones
-desde cron/EventBridge donde no hay un humano esperando.
+**Por que NO via Lambda dispatcher** (a diferencia del train via
+GitHub Actions): la task local hace submit directo a Batch para tener
+control fino del exit code y diagnostico en la terminal. El Lambda
+dispatcher es para invocaciones desde cron/EventBridge donde no hay un
+humano esperando.
 
 ### 4.5.2 Ejecutar
 
@@ -5943,23 +5963,24 @@ contrato. La implementacion completa de cada task ya se copio inline en
 `tasks/cluster.yml`, `tasks/mlflow_registry.yml`, `tasks/aws.yml`).
 Esta seccion es el **catalogo de uso** de esas tasks ya creadas.
 
-### 4.7.1 Re-entrenamiento (`task batch:retrain`)
+### 4.7.1 Re-entrenamiento (`task batch:train`)
 
-Wrapper sobre el dispatcher Lambda + Batch. Submit + polling automatico
-hasta `SUCCEEDED`/`FAILED`. Si pasas `WAIT=false`, dispara y vuelve.
+Submit + polling automatico hasta `SUCCEEDED`/`FAILED`. Acepta una o N
+variedades (serie, con espera entre cada una). Si pasas `WAIT=false`,
+dispara y vuelve (el notifier ya manda mail al terminar).
 
 ```bash
 # Re-entrenar POP en prod (espera hasta terminar)
-task batch:retrain VARIETIES=POP
+task batch:train VARIETIES=POP
 
 # Multi variedad (lanza N jobs en serie con espera entre cada uno)
-task batch:retrain VARIETIES=POP,JUPITER
+task batch:train VARIETIES=POP,JUPITER
 
 # Fire-and-forget (no esperes — el notifier ya manda mail)
-task batch:retrain VARIETIES=POP WAIT=false
+task batch:train VARIETIES=POP WAIT=false
 
 # prod_xl -> queue On-Demand (~5-6h, evita kills Spot)
-task batch:retrain VARIETIES=POP TUNING=prod_xl
+task batch:train VARIETIES=POP TUNING=prod_xl
 ```
 
 **Por que la queue cambia con TUNING**: `prod_xl` corre 5-6h y la
@@ -6094,8 +6115,8 @@ Mapping de los playbooks Ansible V1 (deprecated) a las tasks V2:
 | `deploy.yml` | `task infra:apply [TARGET=...]` | Generic Terraform wrapper |
 | `destroy.yml` | `task infra:destroy` o `task aws:destroy` | El de aws orquesta scale-down primero |
 | `build_and_push.yml` | `task ecr:build-all` | O `task ecr:build IMG=trainer` |
-| `smoke.yml` | `task batch:smoke` | POP + tuning=smoke |
-| `retrain.yml` | `task batch:retrain VARIETIES=...` | Multi-variedad serial |
+| `smoke.yml` | `task batch:smoke` | POP + tuning=smoke (atajo a `batch:train`) |
+| `retrain.yml` | `task batch:train VARIETIES=...` | 1 o N variedades, serial |
 | `scale_down.yml` | `task cluster:scale-down` o `task aws:sleep` | |
 | `scale_up.yml` | `task cluster:scale-up` o `task aws:wake` | aws:wake incluye wait-healthy |
 | `teardown.yml` | `task cluster:teardown` o `task aws:teardown` | |
@@ -6113,10 +6134,10 @@ Ver `task --list` para el catalogo completo incluyendo helpers
 > Estado actual:
 > - Infra desplegada en AWS, ALB respondiendo 200.
 > - Smoke test OK (1 job de Batch entreno POP, modelos en MLflow Registry y S3).
-> - 6 archivos `tasks/*.yml` con ~30 tasks AWS expuestas en `task --list`:
->   `infra:*` (apply/destroy/plan/bootstrap), `ecr:*` (build-all/login),
->   `batch:*` (submit/retrain/smoke/wait/status), `cluster:*` (scale-up/down/teardown/rebuild),
->   `mlflow-aws:*` (promote/list-versions), `aws:*` (deploy/wake/sleep/destroy).
+> - 6 archivos `tasks/*.yml` con ~25 tasks AWS expuestas en `task --list`:
+>   `infra:*` (apply/destroy/plan/bootstrap/validate), `ecr:*` (build/build-all/login/list),
+>   `batch:*` (train/smoke/status/cancel), `cluster:*` (scale-up/down/teardown/rebuild/wait-healthy),
+>   `mlflow-aws:*` (promote/list-versions/current-prod), `aws:*` (deploy/smoke/wake/sleep/teardown/rebuild/destroy/status).
 > - SNS confirmado (suscripcion email activa).
 >
 > Lo que falta para "produccion completa":
@@ -6376,7 +6397,7 @@ syntax check), docker build, push a ECR como `latest` + `sha-<git-sha>`.
 > - **`contents: read`**: permiso para `actions/checkout`. Sin esto el checkout falla.
 > - **`concurrency`**: si haces 3 push seguidos, solo corre el ultimo. Ahorra ECR builds duplicados. `cancel-in-progress: true` mata el anterior workflow si arrancas uno nuevo (util en PRs donde haces multiple force-push).
 > - **`build-and-push` solo en push a main** (no en PR): controlado por `if: github.event_name == 'push' && github.ref == 'refs/heads/main'`. Un PR corre `lint-and-test` pero NO push a ECR — asi un fork malicioso no puede pushear imagenes a tu ECR aunque pase el CI.
-> - **Por que tageas con `sha-<commit>` Y `latest`**: el `:latest` es lo que el Batch job-def por default pulea (siempre la mas reciente); el `:sha-<commit>` es **inmutable** y te permite hacer rollback explicito (`task batch:retrain TRAINER_IMAGE_TAG=sha-abc123`).
+> - **Por que tageas con `sha-<commit>` Y `latest`**: el `:latest` es lo que el Batch job-def por default pulea (siempre la mas reciente); el `:sha-<commit>` es **inmutable** y te permite hacer rollback explicito (re-deploy de la job-def apuntando a la imagen `sha-abc123`, ver 📖 8.1.4).
 
 ```yaml
 name: CI
@@ -7041,7 +7062,7 @@ acumulado), o pediste un re-train porque cambiaste hiperparametros.
 
 ```bash
 # Opcion A — via Task (preferido para humanos, polling + exit-code visible)
-task batch:retrain VARIETIES=POP TUNING=prod
+task batch:train VARIETIES=POP TUNING=prod
 
 # Opcion B — via GitHub Actions UI (preferido si lo dispara alguien sin AWS CLI)
 # Actions -> Train -> Run workflow -> POP / prod / wait=true
@@ -7071,7 +7092,7 @@ total.
 varieties=(POP JUPITER VENTURA SEKOYA ALLISON STELLA)
 for v in "${varieties[@]}"; do
     echo "==> Retrain $v"
-    task batch:retrain VARIETIES=$v TUNING=prod || {
+    task batch:train VARIETIES=$v TUNING=prod || {
         echo "WARN: $v fallo, continuando con el resto"
     }
 done
@@ -7184,7 +7205,7 @@ aws s3api list-object-versions --bucket "$BUCKET" --prefix BD_HISTORICO_ACUMULAD
 
 # Lanzar re-train de todas las variedades con la data nueva
 for v in POP JUPITER VENTURA SEKOYA ALLISON STELLA; do
-    task batch:retrain VARIETIES=$v TUNING=prod WAIT=false
+    task batch:train VARIETIES=$v TUNING=prod WAIT=false
 done
 ```
 
@@ -7308,7 +7329,7 @@ conectar a `tracking_uri` y obtiene timeout.
 ```bash
 task aws:wake
 # Esperar 5-8 min hasta que ALB responde 200
-task batch:retrain VARIETIES=POP
+task batch:train VARIETIES=POP
 ```
 
 > **Solucion permanente**: aplicar 📖 13.2 (auto-train on push con
