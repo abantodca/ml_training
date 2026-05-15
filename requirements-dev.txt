@@ -8,3 +8,7 @@
 # sklearn ya lo trae como transitiva, pero lo pineamos explicitamente
 # para que los notebooks sean reproducibles.
 scipy==1.16.3
+
+# Linter + formatter (config en pyproject.toml).
+# Reemplaza Black + isort + flake8 + pyupgrade en una sola herramienta.
+ruff==0.15.13

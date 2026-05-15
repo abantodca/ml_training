@@ -59,24 +59,120 @@ version: "3"
 # `.env` es opcional. Si no existe, los defaults sanos de config.py aplican.
 dotenv: [ ".env" ]
 
+# === ANADIR despues del bloque dotenv existente ===
+# Modulos AWS por dominio. Cada include prefija con su namespace, asi las
+# tasks locales (build, up, train, ...) no chocan con las AWS (infra:apply,
+# ecr:build, ...).
+includes:
+  infra:
+    taskfile: ./tasks/infra.yml
+  ecr:
+    taskfile: ./tasks/ecr.yml
+  batch:
+    taskfile: ./tasks/batch.yml
+  cluster:
+    taskfile: ./tasks/cluster.yml
+  mlflow-aws:
+    taskfile: ./tasks/mlflow_registry.yml
+  aws:
+    taskfile: ./tasks/aws.yml
+    
 vars:
   TUNING: "{{.TUNING | default \"prod\"}}"
   VARIETIES: "{{.VARIETIES | default \"POP\"}}"
   PARALLEL: "{{.PARALLEL | default \"1\"}}"
+  PROJECT: "{{.PROJECT | default \"ml-training\"}}"
 
 tasks:
 
   # ═══ Ayuda ══════════════════════════════════════════════════════════════
 
   default:
-    desc: "Indice guiado del proyecto: workflow, ejemplos y URLs (vs `task --list`, que es listado plano alfabetico)"
+    desc: "Quick-start guiado para nuevos usuarios. Mas detalle: `task help` (local) o `task help:aws` (produccion)"
     silent: true
     cmds:
       - |
         echo ""
-        echo "============================================================================="
-        echo " ml_training - pipeline ML (XGB / LGB) sobre Docker"
-        echo "============================================================================="
+        echo "==================================================================="
+        echo " ml_training - predice productividad de cosecha por variedad"
+        echo "==================================================================="
+        echo ""
+        echo " QUE HACE: Entrena modelos ML (XGBoost + LightGBM) para predecir"
+        echo " kg/jornal-hora por variedad. El sistema elige automaticamente"
+        echo " el mejor algoritmo. Dos entornos:"
+        echo ""
+        echo "   [LOCAL]  Docker en tu maquina - desarrollo + experimentos"
+        echo "   [AWS]    Produccion en la nube - batch training + registry"
+        echo ""
+        echo " ================================================================="
+        echo " [LOCAL] PRIMERA VEZ (ejecuta en orden, copia y pega linea x linea):"
+        echo " ================================================================="
+        echo ""
+        echo "   1) task build                              construye el entorno (5-10 min)"
+        echo "   2) task data:split                         prepara los datos historicos"
+        echo "   3) task eda VARIETIES=POP                  revisa la calidad de los datos"
+        echo "   4) task train VARIETIES=POP TUNING=smoke   prueba rapida (~1 min) para"
+        echo "                                              confirmar que todo corre OK"
+        echo ""
+        echo " ================================================================="
+        echo " [LOCAL] DIA A DIA (entorno ya construido):"
+        echo " ================================================================="
+        echo ""
+        echo "   task up                                       enciende los servicios"
+        echo "   task train VARIETIES=POP TUNING=prod          entrenamiento real (~2 h)"
+        echo "   task train VARIETIES=all PARALLEL=3           todas las variedades en paralelo"
+        echo "   task logs                                     ver progreso del entrenamiento"
+        echo "   task down                                     apaga los servicios al terminar"
+        echo ""
+        echo "   Resultados (servicios encendidos):"
+        echo "     http://localhost:5000           MLflow: ranking de entrenamientos"
+        echo "     http://localhost:8080/reports/  Dashboards HTML por variedad"
+        echo ""
+        echo " ================================================================="
+        echo " [AWS] PRODUCCION (requiere credenciales AWS configuradas):"
+        echo " ================================================================="
+        echo ""
+        echo "   task aws:deploy                               stand-up completo del stack"
+        echo "   task aws:wake  /  task aws:sleep              encender / apagar stack"
+        echo "   task batch:train VARIETIES=POP TUNING=prod    entrenar en AWS Batch"
+        echo "   task mlflow-aws:promote VARIETY=POP VERSION=N promover modelo a Production"
+        echo ""
+        echo "   task help:aws                                 referencia AWS completa"
+        echo ""
+        echo " -----------------------------------------------------------------"
+        echo " GLOSARIO RAPIDO (parametros comunes a LOCAL y AWS):"
+        echo " -----------------------------------------------------------------"
+        echo ""
+        echo "   VARIETIES   que variedades entrenar: POP, VENTURA, JUPITER, ... o 'all'"
+        echo "   TUNING      cuanto tarda buscando el mejor modelo:"
+        echo "                  smoke    ~1 min    prueba rapida de que todo corre"
+        echo "                  dev      ~20 min   baseline para iterar codigo/features"
+        echo "                  prod     ~2 h      entrenamiento de produccion (default)"
+        echo "                  prod_xl  ~6 h      busqueda exhaustiva (overnight)"
+        echo "   PARALLEL    cuantas variedades entrenar al mismo tiempo (default 1)"
+        echo ""
+        echo "   Ejemplo: task train VARIETIES=POP,VENTURA TUNING=dev PARALLEL=2"
+        echo ""
+        echo " -----------------------------------------------------------------"
+        echo " MAS COMANDOS:"
+        echo " -----------------------------------------------------------------"
+        echo ""
+        echo "   task help          referencia completa LOCAL (Docker en tu maquina)"
+        echo "   task help:aws      referencia completa AWS  (produccion en la nube)"
+        echo "   task --list        listado plano de TODOS los comandos disponibles"
+        echo ""
+        echo "==================================================================="
+        echo ""
+
+  help:
+    desc: "Referencia completa local: workflow, variables, URLs, cleanup. Para AWS: `task help:aws`"
+    silent: true
+    cmds:
+      - |
+        echo ""
+        echo "==================================================================="
+        echo " ml_training - referencia completa (comandos locales)"
+        echo "==================================================================="
         echo ""
         echo "PRIMERA VEZ (setup inicial, ejecutar en orden):"
         echo "   task build                                  imagen + servicios + URLs"
@@ -111,12 +207,67 @@ tasks:
         echo "   http://localhost:8080/artifacts/   joblib + run_summary + best_params"
         echo "   s3://...                           Backend de artifacts MLflow (S3 real)"
         echo ""
-        echo "CLEANUP:   task clean:docker   (DESTRUCTIVO: borra volumen Postgres)"
+        echo "CLEANUP local:   task clean:docker   (DESTRUCTIVO: borra volumen Postgres)"
         echo ""
-        echo "PRODUCCION AWS: ver GUIA_MLOPS_AWS_V2.md §4 (anade tasks/*.yml AWS)"
+        echo "Para comandos de produccion en AWS:  task help:aws"
+        echo "==================================================================="
         echo ""
-        echo "   Tip: task --list    listado plano de TODAS las tasks"
-        echo "============================================================================="
+
+  help:aws:
+    desc: "Comandos de produccion en AWS: infra, ECR, Batch, lifecycle, registry, destructivos"
+    silent: true
+    cmds:
+      - |
+        echo ""
+        echo "==================================================================="
+        echo " ml_training - PRODUCCION AWS"
+        echo " (tasks namespaced: infra: ecr: batch: cluster: mlflow-aws: aws:)"
+        echo "==================================================================="
+        echo ""
+        echo "ATAJOS HIGH-LEVEL (encadenan otros namespaces):"
+        echo "   task aws:deploy                             stand-up completo (storage + 3 imgs + resto)"
+        echo "   task aws:smoke                              deploy + smoke test (~1 min)"
+        echo "   task aws:wake                               encender stack (scale-up + wait-healthy)"
+        echo "   task aws:sleep                              apagar stack (scale-down)"
+        echo "   task aws:status                             outputs Terraform + cluster status"
+        echo ""
+        echo "INFRA (Terraform):"
+        echo "   task infra:bootstrap                        backend S3 + DynamoDB lock (UNA VEZ)"
+        echo "   task infra:bootstrap-oidc                   rol GitHub Actions via OIDC (UNA VEZ)"
+        echo "   task infra:plan [TARGET=module.X]           ver cambios"
+        echo "   task infra:apply [TARGET=module.X]          aplicar (parcial o full)"
+        echo "   task infra:output                           outputs (alb_dns, ecr_urls, ...)"
+        echo "   task infra:validate                         fmt -check + validate (pre-commit)"
+        echo ""
+        echo "IMAGENES (ECR):"
+        echo "   task ecr:build-all                          build + push las 3 imagenes"
+        echo "   task ecr:build IMG=trainer [TAG=v1.2.3]     build + push UNA imagen (trainer|mlflow|reports)"
+        echo "   task ecr:list                               listar tags en ECR"
+        echo ""
+        echo "TRAINING EN BATCH:"
+        echo "   task batch:train VARIETIES=POP TUNING=prod  entrenar en AWS Batch (espera SUCCEEDED)"
+        echo "   task batch:smoke                            sanity check (POP + smoke, ~1 min)"
+        echo "   task batch:status                           jobs activos (spot + ondemand)"
+        echo "   task batch:cancel JOB_ID=<id>               terminar job RUNNING/PENDING"
+        echo ""
+        echo "CLUSTER LIFECYCLE:"
+        echo "   task cluster:status                         estado RDS + ECS + Batch"
+        echo "   task cluster:scale-up / scale-down          encender / apagar (preserva infra)"
+        echo "   task cluster:wait-healthy                   polling ALB hasta 200 (timeout 10 min)"
+        echo "   task cluster:teardown / rebuild             destroy / restore modulos volatiles"
+        echo ""
+        echo "MLFLOW REGISTRY (AWS):"
+        echo "   task mlflow-aws:list-versions VARIETY=POP   listar versiones del modelo"
+        echo "   task mlflow-aws:current-prod  VARIETY=POP   version Production actual"
+        echo "   task mlflow-aws:promote VARIETY=POP VERSION=N [MAX_MAPE=20]"
+        echo "                                               promover a Production con gate MAPE"
+        echo ""
+        echo "DESTRUCTIVO AWS:"
+        echo "   task aws:teardown                           destroy volatiles (preserva storage + VPC)"
+        echo "   task aws:destroy                            TOTAL: borra S3 + ECR + RDS, irreversible"
+        echo ""
+        echo "DOC AWS COMPLETA: GUIA_MLOPS_AWS_V2.md secciones 4-9 (runbook + troubleshooting)"
+        echo "==================================================================="
         echo ""
 
   # ═══ Datos ══════════════════════════════════════════════════════════════

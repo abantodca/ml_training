@@ -1,0 +1,95 @@
+# =============================================================================
+# tasks/batch.yml  -  AWS Batch (training jobs en la nube)
+# =============================================================================
+# Incluido por Taskfile.yml raiz con namespace "batch:".
+#
+# USO TIPICO:
+#   task batch:train VARIETIES=POP                    una variedad, espera
+#   task batch:train VARIETIES=POP,VENTURA            multiples en serie
+#   task batch:train VARIETIES=POP TUNING=smoke       sanity check (~1 min)
+#   task batch:train VARIETIES=POP WAIT=false         fire-and-forget
+#   task batch:smoke                                  atajo: POP + smoke
+#   task batch:status                                 jobs activos en queues
+#   task batch:cancel JOB_ID=<id>                     terminar un job
+# =============================================================================
+
+version: "3"
+
+vars:
+  PROJECT:    '{{.PROJECT    | default "ml-training"}}'
+  JOB_DEF:    '{{.JOB_DEF    | default (printf "%s-trainer"  .PROJECT)}}'
+  QUEUE_SPOT: '{{.QUEUE_SPOT | default (printf "%s-spot"     .PROJECT)}}'
+  QUEUE_OD:   '{{.QUEUE_OD   | default (printf "%s-ondemand" .PROJECT)}}'
+  TUNING:     '{{.TUNING     | default "prod"}}'
+  PARALLEL:   '{{.PARALLEL   | default "1"}}'
+  WAIT:       '{{.WAIT       | default "true"}}'
+
+tasks:
+
+  # ═══ Entrenar ═══════════════════════════════════════════════════════════════
+
+  train:
+    desc: "Entrena en Batch (1 o N variedades, secuencial). Vars: VARIETIES=POP[,JUPITER] (REQ), TUNING, WAIT"
+    requires:
+      vars: [VARIETIES]
+    vars:
+      # prod_xl -> OnDemand (sin interrupcion). Resto -> Spot (~70% cheaper).
+      QUEUE: '{{if eq .TUNING "prod_xl"}}{{.QUEUE_OD}}{{else}}{{.QUEUE_SPOT}}{{end}}'
+    cmds:
+      - |
+        set -e
+        for v in $(echo "{{.VARIETIES}}" | tr ',' ' '); do
+          JOB_ID=$(aws batch submit-job \
+            --job-name       "train-$v-{{.TUNING}}-$(date +%Y%m%d-%H%M%S)" \
+            --job-queue      "{{.QUEUE}}" \
+            --job-definition "{{.JOB_DEF}}" \
+            --container-overrides "{\"command\":[\"--varieties\",\"$v\",\"--tuning\",\"{{.TUNING}}\",\"--parallel-varieties\",\"{{.PARALLEL}}\"]}" \
+            --query jobId --output text)
+          echo ">>> $v  job=$JOB_ID  queue={{.QUEUE}}"
+
+          [ "{{.WAIT}}" != "true" ] && continue
+
+          while :; do
+            STATUS=$(aws batch describe-jobs --jobs "$JOB_ID" --query 'jobs[0].status' --output text)
+            echo "  $(date +%H:%M:%S)  $v  $STATUS"
+            case "$STATUS" in
+              SUCCEEDED) break ;;
+              FAILED)    REASON=$(aws batch describe-jobs --jobs "$JOB_ID" --query 'jobs[0].statusReason' --output text)
+                         echo "FAIL $v  reason=$REASON"; exit 1 ;;
+              *)         sleep 30 ;;
+            esac
+          done
+        done
+
+  # ═══ Smoke test ═════════════════════════════════════════════════════════════
+
+  smoke:
+    desc: "Sanity check end-to-end (~1 min). Equivalente a train VARIETIES=POP TUNING=smoke"
+    cmds:
+      - task: train
+        vars: { VARIETIES: POP, TUNING: smoke }
+
+  # ═══ Estado ═════════════════════════════════════════════════════════════════
+
+  status:
+    desc: "Jobs activos (SUBMITTED/PENDING/RUNNABLE/STARTING/RUNNING) en ambas queues"
+    silent: true
+    cmds:
+      - |
+        for queue in "{{.QUEUE_SPOT}}" "{{.QUEUE_OD}}"; do
+          echo "=== $queue ==="
+          for s in SUBMITTED PENDING RUNNABLE STARTING RUNNING; do
+            aws batch list-jobs --job-queue "$queue" --job-status $s \
+              --query 'jobSummaryList[].[jobId,jobName,status,createdAt]' --output table 2>/dev/null || true
+          done
+          echo ""
+        done
+
+  # ═══ Cancelar ═══════════════════════════════════════════════════════════════
+
+  cancel:
+    desc: "Terminar job RUNNING/PENDING. Vars: JOB_ID=<id> (REQ), REASON=<texto>"
+    requires:
+      vars: [JOB_ID]
+    cmds:
+      - aws batch terminate-job --job-id "{{.JOB_ID}}" --reason "{{.REASON | default \"cancelled via task\"}}"

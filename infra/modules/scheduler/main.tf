@@ -1,0 +1,152 @@
+locals {
+  start_hour_utc = (var.work_start_hour_local - var.tz_offset_hours + 24) % 24
+  stop_hour_utc  = (var.work_end_hour_local - var.tz_offset_hours + 24) % 24
+}
+
+data "archive_file" "scheduler" {
+  type        = "zip"
+  source_file = "${var.lambdas_src_dir}/scheduler.py"
+  output_path = "${path.module}/scheduler.zip"
+}
+
+data "aws_iam_policy_document" "lambda_assume" {
+  statement {
+    actions = ["sts:AssumeRole"]
+    principals {
+      type        = "Service"
+      identifiers = ["lambda.amazonaws.com"]
+    }
+  }
+}
+
+resource "aws_iam_role" "scheduler" {
+  name               = "${var.project}-scheduler"
+  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+}
+
+resource "aws_iam_role_policy" "scheduler" {
+  role = aws_iam_role.scheduler.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["ecs:UpdateService", "ecs:DescribeServices"]
+        Resource = "*"
+      },
+      {
+        Effect = "Allow"
+        Action = [
+          "rds:StartDBInstance", "rds:StopDBInstance", "rds:DescribeDBInstances"
+        ]
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["batch:ListJobs", "batch:DescribeJobs"]
+        Resource = "*"
+      },
+      {
+        Effect   = "Allow"
+        Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents"]
+        Resource = "*"
+      }
+    ]
+  })
+}
+
+resource "aws_cloudwatch_log_group" "scheduler" {
+  name              = "/aws/lambda/${var.project}-scheduler"
+  retention_in_days = var.log_retention_days
+}
+
+resource "aws_lambda_function" "scheduler" {
+  function_name    = "${var.project}-scheduler"
+  role             = aws_iam_role.scheduler.arn
+  runtime          = "python3.12"
+  handler          = "scheduler.handler"
+  filename         = data.archive_file.scheduler.output_path
+  source_code_hash = data.archive_file.scheduler.output_base64sha256
+  timeout          = 300
+  memory_size      = 256
+
+  environment {
+    variables = {
+      PROJECT            = var.project
+      ECS_CLUSTER        = var.ecs_cluster_name
+      ECS_SVC_MLFLOW     = var.ecs_service_name_mlflow
+      ECS_SVC_REPORTS    = var.ecs_service_name_reports
+      RDS_INSTANCE       = var.rds_instance_id
+      JOB_QUEUE_SPOT     = "${var.project}-job-queue-spot"
+      JOB_QUEUE_ONDEMAND = "${var.project}-job-queue-ondemand"
+    }
+  }
+
+  depends_on = [aws_cloudwatch_log_group.scheduler]
+}
+
+resource "aws_cloudwatch_event_rule" "start" {
+  name                = "${var.project}-start"
+  description         = "L-V ${var.work_start_hour_local}:00 PET start RDS+Fargate"
+  schedule_expression = "cron(0 ${local.start_hour_utc} ? * ${var.workdays_cron} *)"
+}
+
+resource "aws_cloudwatch_event_target" "start" {
+  rule      = aws_cloudwatch_event_rule.start.name
+  target_id = "scheduler-start"
+  arn       = aws_lambda_function.scheduler.arn
+  input     = jsonencode({ action = "start" })
+}
+
+# ----- EventBridge: cron STOP L-V <stop_hour_utc>:00 -----------------
+resource "aws_cloudwatch_event_rule" "stop" {
+  name                = "${var.project}-stop"
+  description         = "L-V ${var.work_end_hour_local}:00 PET stop RDS+Fargate"
+  schedule_expression = "cron(0 ${local.stop_hour_utc} ? * ${var.workdays_cron} *)"
+}
+
+resource "aws_cloudwatch_event_target" "stop" {
+  rule      = aws_cloudwatch_event_rule.stop.name
+  target_id = "scheduler-stop"
+  arn       = aws_lambda_function.scheduler.arn
+  input     = jsonencode({ action = "stop" })
+}
+
+# ----- Cron extra: cada 6h chequea RDS y lo re-stop si quedo RUNNING --
+# (necesario porque RDS auto-arranca despues de 7 dias stopped)
+resource "aws_cloudwatch_event_rule" "rds_keepstop" {
+  name                = "${var.project}-rds-keepstop"
+  description         = "Cada 6h: re-stop RDS si quedo RUNNING fuera de ventana"
+  schedule_expression = "rate(6 hours)"
+}
+
+resource "aws_cloudwatch_event_target" "rds_keepstop" {
+  rule      = aws_cloudwatch_event_rule.rds_keepstop.name
+  target_id = "scheduler-keepstop"
+  arn       = aws_lambda_function.scheduler.arn
+  input     = jsonencode({ action = "keepstop" })
+}
+
+resource "aws_lambda_permission" "start" {
+  statement_id  = "AllowStart"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.scheduler.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.start.arn
+}
+
+resource "aws_lambda_permission" "stop" {
+  statement_id  = "AllowStop"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.scheduler.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.stop.arn
+}
+
+resource "aws_lambda_permission" "keepstop" {
+  statement_id  = "AllowKeepstop"
+  action        = "lambda:InvokeFunction"
+  function_name = aws_lambda_function.scheduler.function_name
+  principal     = "events.amazonaws.com"
+  source_arn    = aws_cloudwatch_event_rule.rds_keepstop.arn
+}

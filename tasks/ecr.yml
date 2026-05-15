@@ -1,0 +1,117 @@
+# =============================================================================
+# tasks/ecr.yml  -  Build + push de las 3 imagenes a ECR
+# =============================================================================
+# Incluido por Taskfile.yml raiz con namespace "ecr:".
+#
+# USO TIPICO:
+#   task ecr:build-all                                build + push de las 3
+#   task ecr:build IMG=trainer                        UNA imagen, tag default
+#   task ecr:build IMG=trainer TAG=v1.2.3             UNA imagen, tag custom
+#   task ecr:list                                     listar tags en ECR
+#
+# IMG = trainer | mlflow | reports
+# =============================================================================
+
+version: "3"
+
+vars:
+  PROJECT:     '{{.PROJECT            | default "ml-training"}}'
+  REGION:      '{{.AWS_DEFAULT_REGION | default "us-east-1"}}'
+  TAG_TRAINER: '{{.TAG_TRAINER        | default "latest"}}'
+  TAG_MLFLOW:  '{{.TAG_MLFLOW         | default "v3.12.0"}}'
+  TAG_REPORTS: '{{.TAG_REPORTS        | default "stable"}}'
+
+tasks:
+
+  # ═══ Login (token 12h, run: once) ═══════════════════════════════════════════
+
+  login:
+    desc: "docker login a ECR. Idempotente, token valido 12h"
+    # run: once: si varias tasks dependen de login en una misma corrida,
+    # solo se ejecuta una vez.
+    run: once
+    vars:
+      ACCOUNT:
+        sh: aws sts get-caller-identity --query Account --output text
+    cmds:
+      - aws ecr get-login-password --region {{.REGION}}
+        | docker login --username AWS --password-stdin {{.ACCOUNT}}.dkr.ecr.{{.REGION}}.amazonaws.com
+
+  # ═══ Build + push UNA imagen ════════════════════════════════════════════════
+
+  build:
+    desc: "Build + push UNA imagen. Vars: IMG=trainer|mlflow|reports (REQ), TAG=<override>"
+    requires:
+      vars: [IMG]
+    deps: [login]
+    vars:
+      ACCOUNT:
+        sh: aws sts get-caller-identity --query Account --output text
+      REGISTRY: '{{.ACCOUNT}}.dkr.ecr.{{.REGION}}.amazonaws.com'
+      GIT_SHA:
+        sh: git rev-parse --short=12 HEAD 2>/dev/null || echo unknown
+      BUILD_DATE:
+        sh: date -u +%Y-%m-%dT%H:%M:%SZ
+      # Resolvemos image name, dockerfile y tag segun IMG
+      IMAGE_NAME:
+        sh: |
+          case "{{.IMG}}" in
+            trainer) echo "{{.PROJECT}}" ;;
+            mlflow)  echo "{{.PROJECT}}-mlflow" ;;
+            reports) echo "{{.PROJECT}}-reports" ;;
+            *)       echo "ERROR" ;;
+          esac
+      DOCKERFILE:
+        sh: |
+          case "{{.IMG}}" in
+            trainer) echo "Dockerfile" ;;
+            mlflow)  echo "docker/mlflow/Dockerfile" ;;
+            reports) echo "docker/reports/Dockerfile" ;;
+          esac
+      RESOLVED_TAG:
+        sh: |
+          case "{{.IMG}}" in
+            trainer) echo "{{.TAG | default .TAG_TRAINER}}" ;;
+            mlflow)  echo "{{.TAG | default .TAG_MLFLOW}}" ;;
+            reports) echo "{{.TAG | default .TAG_REPORTS}}" ;;
+          esac
+    cmds:
+      - 'test "{{.IMAGE_NAME}}" != "ERROR" || { echo "ERROR IMG debe ser trainer|mlflow|reports (recibido {{.IMG}})"; exit 1; }'
+      - 'echo ">>> Build {{.IMAGE_NAME}}:{{.RESOLVED_TAG}}  (sha-{{.GIT_SHA}})"'
+      - docker build
+        --build-arg GIT_SHA={{.GIT_SHA}}
+        --build-arg BUILD_DATE={{.BUILD_DATE}}
+        --build-arg VERSION={{.RESOLVED_TAG}}
+        -t {{.REGISTRY}}/{{.IMAGE_NAME}}:{{.RESOLVED_TAG}}
+        -t {{.REGISTRY}}/{{.IMAGE_NAME}}:sha-{{.GIT_SHA}}
+        -f {{.DOCKERFILE}} .
+      - docker push {{.REGISTRY}}/{{.IMAGE_NAME}}:{{.RESOLVED_TAG}}
+      - docker push {{.REGISTRY}}/{{.IMAGE_NAME}}:sha-{{.GIT_SHA}}
+
+  # ═══ Build + push de las 3 ══════════════════════════════════════════════════
+
+  build-all:
+    desc: "Build + push de las 3 imagenes (trainer + mlflow + reports)"
+    deps: [login]
+    cmds:
+      - task: build
+        vars: { IMG: trainer }
+      - task: build
+        vars: { IMG: mlflow }
+      - task: build
+        vars: { IMG: reports }
+
+  # ═══ Inspeccion ═════════════════════════════════════════════════════════════
+
+  list:
+    desc: "Listar las 3 imagenes con tag default presente en cada repo ECR"
+    silent: true
+    cmds:
+      - |
+        for spec in "{{.PROJECT}}:{{.TAG_TRAINER}}" "{{.PROJECT}}-mlflow:{{.TAG_MLFLOW}}" "{{.PROJECT}}-reports:{{.TAG_REPORTS}}"; do
+          repo="${spec%:*}"; tag="${spec##*:}"
+          echo "=== $repo ($tag) ==="
+          aws ecr list-images --repository-name "$repo" \
+            --query "imageIds[?imageTag=='$tag']" --output table 2>/dev/null || true
+          echo ""
+        done

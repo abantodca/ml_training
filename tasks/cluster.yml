@@ -1,0 +1,152 @@
+# =============================================================================
+# tasks/cluster.yml  -  Lifecycle del cluster AWS
+# =============================================================================
+# Incluido por Taskfile.yml raiz con namespace "cluster:".
+#
+# Modulos VOLATILES (se reconstruyen en ~10-15 min):
+#   scheduler, lambdas, monitoring, batch, reports, mlflow
+# Modulos PERMANENTES (NO se tocan en teardown):
+#   network (VPC + NAT $$$), storage (S3 + ECR), backend state
+#
+# USO TIPICO:
+#   task cluster:status                               estado RDS + ECS + Batch
+#   task cluster:scale-up                             encender (RDS + Fargate)
+#   task cluster:scale-down                           apagar (preserva infra)
+#   task cluster:wait-healthy                         polling ALB hasta 200
+#   task cluster:teardown                             destroy volatiles
+#   task cluster:rebuild                              re-apply + scale-up
+# =============================================================================
+
+version: "3"
+
+vars:
+  PROJECT:       '{{.PROJECT       | default "ml-training"}}'
+  DISPATCHER_FN: '{{.DISPATCHER_FN | default (printf "%s-dispatcher" .PROJECT)}}'
+  TF_DIR:        '{{.TF_DIR        | default "infra/envs/prod"}}'
+  # Orden reverso de apply (importante para destroy con dependencias)
+  VOLATILE_MODULES: "module.scheduler module.lambdas module.monitoring module.batch module.reports module.mlflow"
+
+tasks:
+
+  # ═══ Estado ═════════════════════════════════════════════════════════════════
+
+  status:
+    desc: "Estado del cluster: RDS + ECS services + Batch jobs activos"
+    silent: true
+    cmds:
+      - 'echo "=== RDS ==="'
+      - aws rds describe-db-instances --db-instance-identifier {{.PROJECT}}-mlflow
+        --query 'DBInstances[0].[DBInstanceStatus,DBInstanceClass,Endpoint.Address]'
+        --output table 2>/dev/null || echo "  (RDS no existe o no accesible)"
+      - 'echo ""'
+      - 'echo "=== ECS Services ==="'
+      - aws ecs describe-services --cluster {{.PROJECT}}-cluster
+        --services {{.PROJECT}}-mlflow {{.PROJECT}}-reports
+        --query 'services[].[serviceName,desiredCount,runningCount,pendingCount]'
+        --output table 2>/dev/null || echo "  (ECS no existe o servicios no creados)"
+      - 'echo ""'
+      - 'echo "=== Batch jobs activos ==="'
+      - task: _batch-jobs-active
+
+  _batch-jobs-active:
+    internal: true
+    silent: true
+    cmds:
+      - |
+        total=0
+        for q in {{.PROJECT}}-spot {{.PROJECT}}-ondemand; do
+          for s in SUBMITTED PENDING RUNNABLE STARTING RUNNING; do
+            n=$(aws batch list-jobs --job-queue "$q" --job-status $s --query 'length(jobSummaryList)' --output text 2>/dev/null || echo 0)
+            [ "$n" -gt 0 ] && { echo "  queue=$q  status=$s  count=$n"; total=$((total + n)); }
+          done
+        done
+        echo "  TOTAL activos $total"
+
+  # ═══ Scale (encender / apagar) ══════════════════════════════════════════════
+
+  scale-down:
+    desc: "Apagar (RDS stop + ECS desired=0). Aborta si hay Batch RUNNING"
+    cmds:
+      - 'echo ">>> Pre-check Batch jobs activos"'
+      - task: _batch-jobs-active
+      - |
+        running=$(aws batch list-jobs --job-queue "{{.PROJECT}}-spot" --job-status RUNNING --query 'length(jobSummaryList)' --output text 2>/dev/null || echo 0)
+        if [ "$running" -gt 0 ]; then
+          echo "ERROR $running job(s) RUNNING. Cancelar primero:"
+          echo "       task batch:status              (ver detalle)"
+          echo "       task batch:cancel JOB_ID=<id>  (cancelar)"
+          exit 1
+        fi
+      - 'echo ">>> Invocando dispatcher Lambda (action=stop)..."'
+      - aws lambda invoke --function-name {{.DISPATCHER_FN}}
+        --payload '{"action":"stop"}'
+        --cli-binary-format raw-in-base64-out
+        /tmp/dispatcher-stop.json
+      - cat /tmp/dispatcher-stop.json && echo ""
+
+  scale-up:
+    desc: "Encender (RDS start + ECS desired=1). RDS tarda ~5 min en estar Available"
+    cmds:
+      - 'echo ">>> Invocando dispatcher Lambda (action=start)..."'
+      - aws lambda invoke --function-name {{.DISPATCHER_FN}}
+        --payload '{"action":"start"}'
+        --cli-binary-format raw-in-base64-out
+        /tmp/dispatcher-start.json
+      - cat /tmp/dispatcher-start.json && echo ""
+      - 'echo ""'
+      - 'echo "RDS tarda ~5 min. Despues: task cluster:wait-healthy"'
+
+  # ═══ Wait healthy ═══════════════════════════════════════════════════════════
+
+  wait-healthy:
+    desc: "Polling del ALB hasta MLflow 200. Timeout 10 min"
+    deps: [_init-alb]
+    cmds:
+      - |
+        ALB=$(terraform -chdir={{.TF_DIR}} output -raw alb_dns 2>/dev/null)
+        if [ -z "$ALB" ]; then
+          echo "ERROR no se pudo leer alb_dns. envs/prod aplicada?"
+          exit 1
+        fi
+        echo "Polling http://$ALB/ cada 15s (timeout 10 min)..."
+        for i in $(seq 1 40); do
+          code=$(curl -s -o /dev/null -w '%{http_code}' "http://$ALB/" 2>/dev/null || echo 000)
+          echo "  $(date +%H:%M:%S)  GET http://$ALB/  -> $code"
+          [ "$code" = "200" ] && { echo "OK MLflow respondiendo en http://$ALB/"; exit 0; }
+          sleep 15
+        done
+        echo "FAIL timeout 10 min. Revisar: aws logs tail /ecs/{{.PROJECT}}/mlflow --follow"
+        exit 1
+
+  _init-alb:
+    internal: true
+    cmds:
+      - 'test -d {{.TF_DIR}} || { echo "ERROR {{.TF_DIR}} no existe. Aplicar infra: task infra:apply"; exit 1; }'
+
+  # ═══ Teardown / Rebuild ═════════════════════════════════════════════════════
+
+  teardown:
+    desc: "scale-down + destroy modulos volatiles. Preserva storage + network"
+    prompt: "Destruira los modulos volatiles. Storage (S3+ECR) y network (VPC) quedan. Continuar?"
+    cmds:
+      - task: scale-down
+      - 'echo ">>> Destroy modulos volatiles (orden reverso de apply)..."'
+      - |
+        for mod in {{.VOLATILE_MODULES}}; do
+          echo ">>> terraform destroy -target=$mod"
+          terraform -chdir={{.TF_DIR}} destroy -target=$mod -auto-approve || {
+            echo "FAIL destroy de $mod fallo. Revisar manualmente."
+            exit 1
+          }
+        done
+      - 'echo "OK teardown completo. Para volver: task cluster:rebuild"'
+
+  rebuild:
+    desc: "Re-apply de modulos volatiles + scale-up"
+    cmds:
+      - 'echo ">>> Apply completo (modulos volatiles se re-crean, resto no-op)..."'
+      - task: ":infra:apply"
+      - 'echo ">>> scale-up..."'
+      - task: scale-up
+      - 'echo ""'
+      - 'echo "Listo. task cluster:wait-healthy para confirmar MLflow"'

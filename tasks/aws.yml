@@ -1,0 +1,95 @@
+# =============================================================================
+# tasks/aws.yml  -  Orquestadores high-level del stack AWS
+# =============================================================================
+# Incluido por Taskfile.yml raiz con namespace "aws:".
+# Son ATAJOS que encadenan tasks de otros namespaces (infra, ecr, batch,
+# cluster) para los flujos completos del runbook.
+#
+# USO TIPICO:
+#   task aws:deploy                                   stand-up (storage -> imagenes -> resto)
+#   task aws:smoke                                    deploy + smoke test
+#   task aws:wake                                     encender stack (lunes manana)
+#   task aws:sleep                                    apagar stack (viernes noche)
+#   task aws:teardown                                 destroy volatiles, preserva storage
+#   task aws:rebuild                                  re-apply tras teardown
+#   task aws:destroy                                  DESTRUCTIVO total
+#   task aws:status                                   outputs + cluster status
+# =============================================================================
+
+version: "3"
+
+tasks:
+
+  # ═══ Deploy / smoke ═════════════════════════════════════════════════════════
+
+  deploy:
+    desc: "Stand-up completo: storage -> 3 imagenes -> resto (oleadas A+B+C)"
+    cmds:
+      - 'echo ">>> Oleada A: apply module.storage (S3 + ECR)..."'
+      - task: ":infra:apply"
+        vars: { TARGET: module.storage }
+      - 'echo ">>> Oleada B: build + push 3 imagenes..."'
+      - task: ":ecr:build-all"
+      - 'echo ">>> Oleada C: apply resto (network, mlflow, batch, monitoring, ...)..."'
+      - task: ":infra:apply"
+      - 'echo ""'
+      - 'echo "Deploy completo. ALB DNS:"'
+      - task: ":infra:output-raw"
+        vars: { NAME: alb_dns }
+      - 'echo ""'
+
+  smoke:
+    desc: "Deploy + smoke test (POP, tuning=smoke, ~1 min)"
+    cmds:
+      - task: deploy
+      - 'echo ">>> Smoke test..."'
+      - task: ":batch:smoke"
+
+  # ═══ Lifecycle (atajos a cluster:) ══════════════════════════════════════════
+
+  wake:
+    desc: "Encender stack (scale-up + sleep 5min + wait-healthy). Para lunes a la manana"
+    cmds:
+      - task: ":cluster:scale-up"
+      - 'echo ""'
+      - 'echo "Esperando ~5 min a que RDS este Available..."'
+      - sleep 300
+      - task: ":cluster:wait-healthy"
+
+  sleep:
+    desc: "Apagar stack (scale-down). Para viernes a la noche / fuera de horario"
+    cmds:
+      - task: ":cluster:scale-down"
+
+  teardown:
+    desc: "scale-down + destroy modulos volatiles (preserva storage + network)"
+    cmds:
+      - task: ":cluster:teardown"
+
+  rebuild:
+    desc: "Re-apply de modulos volatiles + scale-up (reverso del teardown)"
+    cmds:
+      - task: ":cluster:rebuild"
+
+  # ═══ Destroy total ══════════════════════════════════════════════════════════
+
+  destroy:
+    desc: "DESTRUCTIVO TOTAL: terraform destroy de TODO (incluye storage). Doble confirmacion"
+    prompt: "Destruira COMPLETAMENTE envs/prod (S3, ECR, RDS, todo). Irreversible. Continuar?"
+    cmds:
+      - 'echo ">>> Drenando Batch jobs primero..."'
+      - task: ":cluster:scale-down"
+      - 'echo ""'
+      - 'echo ">>> terraform destroy total..."'
+      - task: ":infra:destroy"
+
+  # ═══ Estado ═════════════════════════════════════════════════════════════════
+
+  status:
+    desc: "Estado completo: outputs de Terraform + cluster:status"
+    cmds:
+      - 'echo "=== Terraform outputs ==="'
+      - task: ":infra:output"
+      - 'echo ""'
+      - 'echo "=== Cluster ==="'
+      - task: ":cluster:status"

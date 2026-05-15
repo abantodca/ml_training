@@ -1,0 +1,114 @@
+# =============================================================================
+# tasks/infra.yml  -  Terraform wrapper + bootstrap del backend
+# =============================================================================
+# Incluido por Taskfile.yml raiz con namespace "infra:".
+#
+# USO TIPICO:
+#   task infra:bootstrap                              UNA VEZ por cuenta+region
+#   task infra:bootstrap-oidc                         UNA VEZ (rol GHA)
+#   task infra:plan [TARGET=module.X]                 ver cambios
+#   task infra:apply [TARGET=module.X]                aplicar (parcial o full)
+#   task infra:output                                 outputs (alb_dns, ecr_urls, ...)
+#   task infra:validate                               fmt -check + validate (pre-commit)
+#   task infra:destroy                                DESTRUCTIVO: todo
+#   task infra:destroy-target TARGET=module.X         DESTRUCTIVO: parcial
+# =============================================================================
+
+version: "3"
+
+vars:
+  TF_DIR: '{{.TF_DIR | default "infra/envs/prod"}}'
+
+tasks:
+
+  # ═══ Bootstrap (one-shot, idempotente) ══════════════════════════════════════
+
+  bootstrap:
+    desc: "Backend Terraform (S3 + DynamoDB lock + SLRs). UNA VEZ por cuenta+region"
+    cmds:
+      - bash infra/bootstrap.sh
+
+  bootstrap-oidc:
+    desc: "Rol IAM para GitHub Actions via OIDC. UNA VEZ"
+    cmds:
+      - bash infra/bootstrap-oidc.sh
+
+  # ═══ Init (interno, dep de plan/apply/destroy) ══════════════════════════════
+
+  _init:
+    internal: true
+    # SUFFIX se resuelve dinamicamente: cambia entre cuentas (sandbox vs prod)
+    # y queremos el backend correcto sin setearlo en .env.
+    vars:
+      SUFFIX:
+        sh: aws sts get-caller-identity --query Account --output text | tail -c 7
+      PROJECT: '{{.PROJECT | default "ml-training"}}'
+      REGION:  '{{.AWS_DEFAULT_REGION | default "us-east-1"}}'
+    cmds:
+      - terraform -chdir={{.TF_DIR}} init
+        -backend-config=bucket={{.PROJECT}}-tfstate-{{.SUFFIX}}
+        -backend-config=key=envs/prod/terraform.tfstate
+        -backend-config=region={{.REGION}}
+        -backend-config=dynamodb_table={{.PROJECT}}-tflock
+        -reconfigure
+
+  # ═══ Plan / Apply / Destroy ═════════════════════════════════════════════════
+
+  plan:
+    desc: "terraform plan. Var opcional: TARGET=module.X"
+    deps: [_init]
+    cmds:
+      - terraform -chdir={{.TF_DIR}} plan {{if .TARGET}}-target={{.TARGET}}{{end}}
+
+  apply:
+    desc: "terraform apply -auto-approve. Var opcional: TARGET=module.X (apply parcial por oleadas)"
+    deps: [_init]
+    cmds:
+      - terraform -chdir={{.TF_DIR}} apply {{if .TARGET}}-target={{.TARGET}}{{end}} -auto-approve
+
+  destroy:
+    desc: "DESTRUCTIVO: terraform destroy completo. Considerar cluster:teardown antes (preserva storage)"
+    prompt: "Esto borrara TODA la infra de envs/prod (incluso S3 + ECR). Continuar?"
+    deps: [_init]
+    cmds:
+      - terraform -chdir={{.TF_DIR}} destroy -auto-approve
+
+  destroy-target:
+    desc: "terraform destroy parcial. Vars: TARGET=module.X (REQ)"
+    prompt: "Destruir {{.TARGET}}? Asegurate que no tenga dependencias activas"
+    requires:
+      vars: [TARGET]
+    deps: [_init]
+    cmds:
+      - terraform -chdir={{.TF_DIR}} destroy -target={{.TARGET}} -auto-approve
+
+  # ═══ Inspeccion ═════════════════════════════════════════════════════════════
+
+  output:
+    desc: "Mostrar outputs de envs/prod (alb_dns, ecr_urls, rds_endpoint, ...)"
+    cmds:
+      - terraform -chdir={{.TF_DIR}} output
+
+  output-raw:
+    desc: "Mostrar UN output crudo (para scripts). Var: NAME=alb_dns (REQ)"
+    silent: true
+    requires:
+      vars: [NAME]
+    cmds:
+      - terraform -chdir={{.TF_DIR}} output -raw {{.NAME}}
+
+  validate:
+    desc: "terraform fmt -check + validate (sin tocar state, util en pre-commit)"
+    cmds:
+      - terraform -chdir={{.TF_DIR}} fmt -check -recursive
+      - terraform -chdir={{.TF_DIR}} validate
+
+  # ═══ Recovery ═══════════════════════════════════════════════════════════════
+
+  force-unlock:
+    desc: "Liberar state lock huerfano. Var: LOCK_ID=<id> (REQ)"
+    requires:
+      vars: [LOCK_ID]
+    deps: [_init]
+    cmds:
+      - terraform -chdir={{.TF_DIR}} force-unlock -force {{.LOCK_ID}}

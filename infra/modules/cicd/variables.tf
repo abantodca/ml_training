@@ -1,0 +1,10 @@
+variable "project" { type = string }
+variable "github_org" { type = string }
+variable "github_repo" { type = string }
+variable "oidc_provider_arn" { type = string }
+variable "artifacts_bucket_arn" { type = string }
+variable "data_bucket_arn" { type = string }
+variable "ecr_trainer_arn" { type = string }
+variable "job_queue_spot_arn" { type = string }
+variable "job_queue_ondemand_arn" { type = string }
+variable "job_definition_arn" { type = string }

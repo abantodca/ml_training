@@ -1,0 +1,110 @@
+name: Promote model
+
+on:
+  workflow_dispatch:
+    inputs:
+      model_name:
+        description: 'Nombre del modelo en Registry (ej: ml-training-POP)'
+        required: true
+        type: string
+      version:
+        description: 'Version a promover'
+        required: true
+        type: string
+      max_mape:
+        description: 'Umbral MAPE maximo aceptable (%)'
+        required: false
+        default: '20'
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  promote:
+    runs-on: ubuntu-latest
+    #environment: production    # requiere approval manual (configurar en GitHub Settings)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume gha-train role (solo lectura MLflow)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_GHA_TRAIN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: actions/setup-python@v5
+        with: { python-version: '3.13' }
+
+      - run: pip install mlflow==3.12.0 requests
+
+      - name: Quality gate (MAPE check)
+        env:
+          MLFLOW_TRACKING_URI: http://${{ vars.MLFLOW_ALB_DNS }}
+        run: |
+          python <<'PY'
+          import mlflow, os, sys
+          from mlflow.tracking import MlflowClient
+
+          c = MlflowClient()
+          name    = "${{ inputs.model_name }}"
+          version = "${{ inputs.version }}"
+          max_mape = float("${{ inputs.max_mape }}")
+
+          mv = c.get_model_version(name=name, version=version)
+          run = c.get_run(mv.run_id)
+          mape = run.data.metrics.get("mape_oof") or run.data.metrics.get("mape")
+          if mape is None:
+              sys.exit(f"No 'mape_oof' ni 'mape' en run {mv.run_id}")
+          if mape > max_mape:
+              sys.exit(f"GATE FAIL: MAPE={mape:.3f} > umbral={max_mape}")
+          print(f"GATE OK: MAPE={mape:.3f} <= {max_mape}")
+          PY
+
+      - name: A/B comparison contra Production actual
+        env:
+          MLFLOW_TRACKING_URI: http://${{ vars.MLFLOW_ALB_DNS }}
+        run: |
+          python <<'PY'
+          from mlflow.tracking import MlflowClient
+          c = MlflowClient()
+          name    = "${{ inputs.model_name }}"
+          version = "${{ inputs.version }}"
+
+          # Candidato
+          mv_new = c.get_model_version(name=name, version=version)
+          run_new = c.get_run(mv_new.run_id)
+          mape_new = run_new.data.metrics.get("mape_oof") or run_new.data.metrics.get("mape")
+
+          # Production actual (si existe)
+          prod = c.get_latest_versions(name, stages=["Production"])
+          if not prod:
+              print(f"No hay Production previo. Promoviendo {version} sin comparar.")
+              raise SystemExit(0)
+
+          mv_prod = prod[0]
+          run_prod = c.get_run(mv_prod.run_id)
+          mape_prod = run_prod.data.metrics.get("mape_oof") or run_prod.data.metrics.get("mape")
+
+          import sys
+          if mape_new >= mape_prod:
+              sys.exit(f"GATE FAIL: candidato MAPE={mape_new:.3f} no mejora vs Production v{mv_prod.version} MAPE={mape_prod:.3f}")
+          print(f"GATE OK: candidato MAPE={mape_new:.3f} mejora vs Production={mape_prod:.3f}")
+          PY
+
+      - name: Transition a Production
+        env:
+          MLFLOW_TRACKING_URI: http://${{ vars.MLFLOW_ALB_DNS }}
+        run: |
+          python <<'PY'
+          from mlflow.tracking import MlflowClient
+          c = MlflowClient()
+          c.transition_model_version_stage(
+              name="${{ inputs.model_name }}",
+              version="${{ inputs.version }}",
+              stage="Production",
+              archive_existing_versions=True,
+          )
+          print("Transition OK")
+          PY

@@ -1,0 +1,97 @@
+# =============================================================================
+# tasks/mlflow_registry.yml  -  MLflow Model Registry (AWS)
+# =============================================================================
+# Incluido por Taskfile.yml raiz con namespace "mlflow-aws:".
+# Separado del MLflow local (que vive en docker-compose).
+#
+# USO TIPICO:
+#   task mlflow-aws:list-versions VARIETY=POP                    ver versiones
+#   task mlflow-aws:current-prod  VARIETY=POP                    ver Production actual
+#   task mlflow-aws:promote VARIETY=POP VERSION=3                gate MAPE<=20 (default)
+#   task mlflow-aws:promote VARIETY=POP VERSION=3 MAX_MAPE=15    gate custom
+# =============================================================================
+
+version: "3"
+
+vars:
+  TF_DIR:   '{{.TF_DIR   | default "infra/envs/prod"}}'
+  MAX_MAPE: '{{.MAX_MAPE | default "20"}}'
+
+tasks:
+
+  # ═══ Helper: resolver MLflow URI ════════════════════════════════════════════
+
+  _mlflow-uri:
+    internal: true
+    silent: true
+    cmds:
+      - |
+        ALB=$(terraform -chdir={{.TF_DIR}} output -raw alb_dns 2>/dev/null)
+        if [ -z "$ALB" ]; then
+          echo "ERROR no se pudo leer alb_dns" >&2
+          exit 1
+        fi
+        echo "http://$ALB"
+
+  # ═══ Inspeccion ═════════════════════════════════════════════════════════════
+
+  list-versions:
+    desc: "Listar versiones de un modelo. Var: VARIETY=POP (REQ)"
+    requires:
+      vars: [VARIETY]
+    cmds:
+      - |
+        URI=$(task mlflow-aws:_mlflow-uri)
+        curl -s "$URI/api/2.0/mlflow/registered-models/get?name={{.VARIETY}}" \
+          | jq '.registered_model.latest_versions[] | {version, current_stage, run_id, creation_timestamp}'
+
+  current-prod:
+    desc: "Mostrar version Production actual. Var: VARIETY=POP (REQ)"
+    requires:
+      vars: [VARIETY]
+    cmds:
+      - |
+        URI=$(task mlflow-aws:_mlflow-uri)
+        curl -s "$URI/api/2.0/mlflow/registered-models/get?name={{.VARIETY}}" \
+          | jq '.registered_model.latest_versions[] | select(.current_stage == "Production") | {version, run_id, creation_timestamp}'
+
+  # ═══ Promote con quality gate (MAPE) ════════════════════════════════════════
+
+  promote:
+    desc: "Promover a Production con gate MAPE. Vars: VARIETY=POP VERSION=N (REQ), MAX_MAPE=20"
+    requires:
+      vars: [VARIETY, VERSION]
+    cmds:
+      - |
+        URI=$(task mlflow-aws:_mlflow-uri)
+        echo ">>> {{.VARIETY}} v{{.VERSION}}  (gate MAPE <= {{.MAX_MAPE}})"
+
+        RUN_ID=$(curl -s "$URI/api/2.0/mlflow/model-versions/get?name={{.VARIETY}}&version={{.VERSION}}" \
+          | jq -r '.model_version.run_id')
+        if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
+          echo "ERROR no se encontro {{.VARIETY}} v{{.VERSION}}"
+          exit 1
+        fi
+
+        MAPE=$(curl -s "$URI/api/2.0/mlflow/runs/get?run_id=$RUN_ID" \
+          | jq -r '.run.data.metrics[] | select(.key == "mape_oof") | .value')
+        if [ -z "$MAPE" ] || [ "$MAPE" = "null" ]; then
+          echo "ERROR el run no tiene mape_oof"
+          exit 1
+        fi
+        echo "    mape_oof=$MAPE"
+
+        # awk para comparar floats (bash no soporta float nativo)
+        OK=$(awk -v m="$MAPE" -v t="{{.MAX_MAPE}}" 'BEGIN { print (m <= t) ? "yes" : "no" }')
+        if [ "$OK" != "yes" ]; then
+          echo "GATE FAIL  MAPE=$MAPE > {{.MAX_MAPE}}"
+          exit 1
+        fi
+        echo "GATE OK"
+
+        echo ">>> Transicionando a Production (archive existing)..."
+        curl -s -X POST "$URI/api/2.0/mlflow/model-versions/transition-stage" \
+          -H "Content-Type: application/json" \
+          -d "{\"name\":\"{{.VARIETY}}\",\"version\":\"{{.VERSION}}\",\"stage\":\"Production\",\"archive_existing_versions\":true}" \
+          | jq '.model_version | {name, version, current_stage}'
+        echo "OK {{.VARIETY}} v{{.VERSION}} en Production"
