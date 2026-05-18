@@ -67,7 +67,7 @@ resource "aws_lambda_function" "scheduler" {
   handler          = "scheduler.handler"
   filename         = data.archive_file.scheduler.output_path
   source_code_hash = data.archive_file.scheduler.output_base64sha256
-  timeout          = 300
+  timeout          = 900 # Patch 13.3: 15 min (antes 300). Cubre RDS cold start (~5-8 min) + wait MLflow.
   memory_size      = 256
 
   environment {
@@ -79,6 +79,11 @@ resource "aws_lambda_function" "scheduler" {
       RDS_INSTANCE       = var.rds_instance_id
       JOB_QUEUE_SPOT     = "${var.project}-job-queue-spot"
       JOB_QUEUE_ONDEMAND = "${var.project}-job-queue-ondemand"
+      # Patch 13.1: propagar workdays + ventana al _keepstop (sino el
+      # martes/jueves queda "dentro de ventana" y nunca re-para el RDS).
+      WORKDAYS_CRON  = var.workdays_cron
+      WORK_START_UTC = tostring(local.start_hour_utc)
+      WORK_END_UTC   = tostring(local.stop_hour_utc)
     }
   }
 

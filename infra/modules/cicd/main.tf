@@ -110,13 +110,30 @@ resource "aws_iam_role_policy" "train" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect   = "Allow"
-        Action   = ["lambda:InvokeFunction"]
-        Resource = "arn:aws:lambda:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:function:${var.project}-dispatcher"
+        Effect = "Allow"
+        Action = ["lambda:InvokeFunction"]
+        # Patch 13.2: gha-train tambien invoca scheduler para wake/stop
+        # en el workflow auto-train-on-push.yml.
+        Resource = [
+          "arn:aws:lambda:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:function:${var.project}-dispatcher",
+          "arn:aws:lambda:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:function:${var.project}-scheduler"
+        ]
       },
       {
         Effect   = "Allow"
         Action   = ["batch:DescribeJobs", "batch:ListJobs"]
+        Resource = "*"
+      },
+      {
+        # Patch 13.2: chequear estado RDS antes de wake
+        Effect   = "Allow"
+        Action   = ["rds:DescribeDBInstances"]
+        Resource = "*"
+      },
+      {
+        # Patch 13.2: chequear estado de los services Fargate
+        Effect   = "Allow"
+        Action   = ["ecs:DescribeServices"]
         Resource = "*"
       },
       {

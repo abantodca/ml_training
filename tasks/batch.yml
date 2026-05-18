@@ -18,8 +18,8 @@ version: "3"
 vars:
   PROJECT:    '{{.PROJECT    | default "ml-training"}}'
   JOB_DEF:    '{{.JOB_DEF    | default (printf "%s-trainer"  .PROJECT)}}'
-  QUEUE_SPOT: '{{.QUEUE_SPOT | default (printf "%s-spot"     .PROJECT)}}'
-  QUEUE_OD:   '{{.QUEUE_OD   | default (printf "%s-ondemand" .PROJECT)}}'
+  QUEUE_SPOT: '{{.QUEUE_SPOT | default (printf "%s-job-queue-spot"     .PROJECT)}}'
+  QUEUE_OD:   '{{.QUEUE_OD   | default (printf "%s-job-queue-ondemand" .PROJECT)}}'
   TUNING:     '{{.TUNING     | default "prod"}}'
   PARALLEL:   '{{.PARALLEL   | default "1"}}'
   WAIT:       '{{.WAIT       | default "true"}}'
@@ -59,6 +59,40 @@ tasks:
               *)         sleep 30 ;;
             esac
           done
+        done
+
+  # ═══ Entrenar via Lambda dispatcher (path usado por train.yml) ═════════════
+
+  train-lambda:
+    desc: "Submit via Lambda dispatcher (valida variety + S3 hydrate). Vars: VARIETIES (REQ), TUNING, WAIT"
+    requires:
+      vars: [VARIETIES]
+    vars:
+      DISPATCHER_FN: '{{.DISPATCHER_FN | default (printf "%s-dispatcher" .PROJECT)}}'
+    cmds:
+      - |
+        set -e
+        PAYLOAD=$(jq -nc --arg v "{{.VARIETIES}}" --arg t "{{.TUNING}}" \
+          '{varieties: $v, tuning: $t}')
+        aws lambda invoke \
+          --function-name "{{.DISPATCHER_FN}}" \
+          --cli-binary-format raw-in-base64-out \
+          --payload "$PAYLOAD" \
+          /tmp/dispatcher-out.json \
+          --query 'StatusCode' --output text
+        cat /tmp/dispatcher-out.json
+        JOB_ID=$(jq -r '.body.jobId // (.body|fromjson|.jobId)' /tmp/dispatcher-out.json 2>/dev/null || jq -r '.jobId' /tmp/dispatcher-out.json)
+        echo ">>> Submitted via dispatcher  job=$JOB_ID"
+        [ "{{.WAIT}}" != "true" ] && exit 0
+        while :; do
+          STATUS=$(aws batch describe-jobs --jobs "$JOB_ID" --query 'jobs[0].status' --output text)
+          echo "  $(date +%H:%M:%S)  $STATUS"
+          case "$STATUS" in
+            SUCCEEDED) break ;;
+            FAILED)    REASON=$(aws batch describe-jobs --jobs "$JOB_ID" --query 'jobs[0].statusReason' --output text)
+                       echo "FAIL  reason=$REASON"; exit 1 ;;
+            *)         sleep 30 ;;
+          esac
         done
 
   # ═══ Smoke test ═════════════════════════════════════════════════════════════

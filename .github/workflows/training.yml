@@ -1,0 +1,245 @@
+name: Training
+
+# Workflow consolidado (reemplaza train.yml + auto-train-on-push.yml + promote.yml).
+# Tres modos via workflow_dispatch input `action`:
+#   action=train    -> entrena variedades elegidas (con wake/cool-down si MLflow esta apagado)
+#   action=promote  -> promueve un modelo a Production (3 gates: MAPE absoluto + A/B + approval)
+# Tambien auto-trigger:
+#   - workflow_run "Deploy" success -> auto-train si push toco trainer (action=train, varieties=all)
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Que quieres hacer'
+        required: true
+        default: 'train'
+        type: choice
+        options: [train, promote]
+
+      # Inputs para action=train (ignorados si action=promote)
+      varieties:
+        description: '[train] CSV (POP,JUPITER) o "all". Default "all".'
+        required: false
+        default: 'all'
+        type: string
+      tuning:
+        description: '[train] Profile'
+        required: false
+        default: 'prod'
+        type: choice
+        options: [smoke, dev, prod, prod_xl]
+
+      # Inputs para action=promote (ignorados si action=train)
+      model_name:
+        description: '[promote] Nombre completo del modelo en Registry (ej: rnd-forest-POP)'
+        required: false
+        type: string
+      version:
+        description: '[promote] Version a promover'
+        required: false
+        type: string
+      max_mape:
+        description: '[promote] Umbral MAPE maximo aceptable (%)'
+        required: false
+        default: '20'
+        type: string
+
+  workflow_run:
+    workflows: ["Deploy"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: training-${{ github.event.inputs.action || 'auto' }}
+  cancel-in-progress: false
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════
+  # DETECT: decide si hacer train, promote, o nada
+  # ════════════════════════════════════════════════════════════════════════
+  detect:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    outputs:
+      mode:      ${{ steps.decide.outputs.mode }}        # train | promote | skip
+      varieties: ${{ steps.decide.outputs.varieties }}
+      tuning:    ${{ steps.decide.outputs.tuning }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # para git diff before..sha (push de N commits o squash)
+
+      - name: Decide modo
+        id: decide
+        env:
+          BASE_SHA: ${{ github.event.workflow_run.head_sha && github.event.before || '' }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          set -e
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            ACTION="${{ inputs.action }}"
+            echo "mode=$ACTION"                             >> $GITHUB_OUTPUT
+            echo "varieties=${{ inputs.varieties || 'all' }}" >> $GITHUB_OUTPUT
+            echo "tuning=${{ inputs.tuning || 'prod' }}"      >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          # workflow_run (post-Deploy): solo auto-train si toco el trainer
+          BEFORE="${{ github.event.workflow_run.head_branch && github.event.workflow_run.head_sha || '' }}"
+          CHANGED=$(git diff --name-only "${BASE_SHA:-HEAD~1}" "${HEAD_SHA}" 2>/dev/null || echo "")
+          echo "Cambios:"; echo "$CHANGED"
+          if echo "$CHANGED" | grep -qE '^(src/|main\.py|Dockerfile)'; then
+            echo "mode=train"      >> $GITHUB_OUTPUT
+            echo "varieties=all"   >> $GITHUB_OUTPUT
+            echo "tuning=prod"     >> $GITHUB_OUTPUT
+          else
+            echo "mode=skip"       >> $GITHUB_OUTPUT
+            echo "::notice::Push no toco trainer (src/**, main.py, Dockerfile), skip auto-train"
+          fi
+
+  # ════════════════════════════════════════════════════════════════════════
+  # TRAIN PATH: wake -> train -> cool-down-and-stop
+  # ════════════════════════════════════════════════════════════════════════
+  wake-services:
+    needs: detect
+    if: needs.detect.outputs.mode == 'train'
+    runs-on: ubuntu-latest
+    outputs:
+      mlflow_was_up: ${{ steps.check.outputs.was_up }}
+    steps:
+      - name: Assume gha-train role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_GHA_TRAIN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Estado actual de MLflow
+        id: check
+        run: |
+          if curl -fs -o /dev/null --max-time 5 "http://${{ vars.MLFLOW_ALB_DNS }}/health"; then
+            echo "was_up=true"  >> $GITHUB_OUTPUT
+            echo "::notice::MLflow ya esta UP, skip wake"
+          else
+            echo "was_up=false" >> $GITHUB_OUTPUT
+            echo "::notice::MLflow DOWN, invocando scheduler.start"
+          fi
+
+      - name: Wake (scheduler.start) si esta down
+        if: steps.check.outputs.was_up == 'false'
+        run: |
+          aws lambda invoke \
+            --function-name ${{ vars.PROJECT }}-scheduler \
+            --cli-binary-format raw-in-base64-out \
+            --payload '{"action":"start"}' \
+            /tmp/start.out
+          cat /tmp/start.out
+
+      - name: Esperar RDS available
+        if: steps.check.outputs.was_up == 'false'
+        run: |
+          for i in $(seq 1 24); do
+            STATUS=$(aws rds describe-db-instances \
+                       --db-instance-identifier ${{ vars.PROJECT }}-mlflow \
+                       --query 'DBInstances[0].DBInstanceStatus' --output text)
+            echo "RDS=$STATUS"
+            [[ "$STATUS" == "available" ]] && break
+            sleep 30
+          done
+          [[ "$STATUS" == "available" ]] || (echo "::error::RDS no available tras 12 min"; exit 1)
+
+      - name: Esperar ALB MLflow 200
+        if: steps.check.outputs.was_up == 'false'
+        run: |
+          for i in $(seq 1 30); do
+            CODE=$(curl -fs -o /dev/null -w "%{http_code}" --max-time 5 \
+                   "http://${{ vars.MLFLOW_ALB_DNS }}/health" || echo "000")
+            echo "MLflow=$CODE"
+            [[ "$CODE" == "200" ]] && break
+            sleep 10
+          done
+          [[ "$CODE" == "200" ]] || (echo "::error::MLflow no respondio 200 tras 5 min"; exit 1)
+
+  train:
+    needs: [detect, wake-services]
+    if: needs.detect.outputs.mode == 'train'
+    runs-on: ubuntu-latest
+    timeout-minutes: 480
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assume gha-train role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_GHA_TRAIN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Single source of truth: misma logica que un dev correria local.
+      - run: task batch:train-lambda VARIETIES="${{ needs.detect.outputs.varieties }}" TUNING="${{ needs.detect.outputs.tuning }}" WAIT=true
+        env:
+          AWS_DEFAULT_REGION: ${{ vars.AWS_REGION }}
+          PROJECT: ${{ vars.PROJECT }}
+
+  cool-down-and-stop:
+    needs: [detect, wake-services, train]
+    if: |
+      always() && needs.detect.outputs.mode == 'train' &&
+      needs.wake-services.result == 'success' &&
+      needs.wake-services.outputs.mlflow_was_up == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Assume gha-train role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_GHA_TRAIN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Cool-down (10 min para sync S3 + reading dashboards)
+        run: |
+          echo "::notice::Cool-down 600s antes de apagar"
+          sleep 600
+
+      - name: Stop (scheduler.stop)
+        run: |
+          aws lambda invoke \
+            --function-name ${{ vars.PROJECT }}-scheduler \
+            --cli-binary-format raw-in-base64-out \
+            --payload '{"action":"stop"}' \
+            /tmp/stop.out
+          cat /tmp/stop.out
+
+  # ════════════════════════════════════════════════════════════════════════
+  # PROMOTE PATH: requiere approval del environment production
+  # ════════════════════════════════════════════════════════════════════════
+  promote:
+    needs: detect
+    if: needs.detect.outputs.mode == 'promote'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assume gha-train role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_GHA_TRAIN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Single source of truth: 3 gates (MAPE absoluto + A/B + transition)
+      # corren igual que `task mlflow-aws:promote MODEL_NAME=... VERSION=...` local.
+      - run: task mlflow-aws:promote MODEL_NAME="${{ inputs.model_name }}" VERSION="${{ inputs.version }}" MAX_MAPE="${{ inputs.max_mape }}"
+        env:
+          MLFLOW_ALB_DNS: ${{ vars.MLFLOW_ALB_DNS }}

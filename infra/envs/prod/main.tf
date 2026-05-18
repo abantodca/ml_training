@@ -154,3 +154,16 @@ module "cicd" {
   job_queue_ondemand_arn = module.batch.job_queue_ondemand_arn
   job_definition_arn     = module.batch.job_definition_arn
 }
+
+# -------------------------------------------------------------------------
+# Capa 10: Consumer IAM (Patch 13.5 — repo ml-serving consume artifacts read-only)
+# -------------------------------------------------------------------------
+module "consumer_iam" {
+  source = "../../modules/consumer-iam"
+
+  project              = var.project
+  artifacts_bucket_arn = module.storage.artifacts_bucket_arn
+  consumer_oidc_arn    = data.aws_iam_openid_connect_provider.github.arn
+  consumer_org         = var.consumer_org
+  consumer_repo        = var.consumer_repo
+}

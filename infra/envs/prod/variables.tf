@@ -102,3 +102,14 @@ variable "work_end_hour_local" {
   type        = number
   default     = 12
 }
+
+# Patch 13.5: repo consumer (FastAPI/Streamlit) que carga modelos Production
+# desde el S3 artifacts. Se le crea un rol IAM read-only via OIDC.
+variable "consumer_org" {
+  description = "GitHub org del repo consumer (ej. abantodca)."
+  type        = string
+}
+variable "consumer_repo" {
+  description = "GitHub repo del proyecto consumer (ej. ml-serving)."
+  type        = string
+}

@@ -37,6 +37,7 @@ from src.step_05_evaluate.champion import (
 from src.step_05_evaluate.html.winner_dashboard import render_winner_dashboard
 from src.step_06_track.business_export import export_business_excel
 from src.step_06_track.mlflow_registry import register_model, set_experiment
+from src.utils.cloudwatch_metrics import emit_mape_metric
 from src.utils.logger import setup_logging
 from src.utils.sklearn_helpers import dump_json_artifact
 
@@ -145,6 +146,8 @@ def train_variety(
                 f"Registra en MLflow Model Registry."
             )
             args_register = args.register_model
+
+        emit_mape_metric(variety=variety, mape_value=champion.oof_mape)
 
         # Eliminar runs de modelos NO campeon de MLflow Experiments. El usuario
         # quiere ver UN solo run por training (el ganador), no los candidatos.

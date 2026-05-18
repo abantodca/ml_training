@@ -60,3 +60,9 @@ output "gha_train_role_arn" {
   description = "Role que asume GitHub Actions para invocar Lambda dispatcher."
   value       = module.cicd.gha_train_role_arn
 }
+
+# Patch 13.5
+output "consumer_role_arn" {
+  description = "Role que asume el repo consumer (ml-serving) via OIDC para descargar artifacts."
+  value       = module.consumer_iam.consumer_role_arn
+}

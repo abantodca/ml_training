@@ -11,7 +11,7 @@ variable "tz_offset_hours" {
 }
 variable "workdays_cron" {
   type    = string
-  default = "MON-FRI"
+  default = "MON,WED,FRI" # Patch 13.1: solo L/Mi/V (antes: "MON-FRI")
 }
 variable "log_retention_days" { type = number }
 variable "lambdas_src_dir" { type = string }

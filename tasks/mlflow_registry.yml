@@ -26,9 +26,15 @@ tasks:
     silent: true
     cmds:
       - |
+        # Prioridad: env var MLFLOW_ALB_DNS (usada por GHA via vars.MLFLOW_ALB_DNS)
+        # -> fallback: terraform output (uso local, requiere init previo)
+        if [ -n "${MLFLOW_ALB_DNS:-}" ]; then
+          echo "http://$MLFLOW_ALB_DNS"
+          exit 0
+        fi
         ALB=$(terraform -chdir={{.TF_DIR}} output -raw alb_dns 2>/dev/null)
         if [ -z "$ALB" ]; then
-          echo "ERROR no se pudo leer alb_dns" >&2
+          echo "ERROR no se pudo leer alb_dns (ni env MLFLOW_ALB_DNS ni terraform output)" >&2
           exit 1
         fi
         echo "http://$ALB"
@@ -36,62 +42,78 @@ tasks:
   # ═══ Inspeccion ═════════════════════════════════════════════════════════════
 
   list-versions:
-    desc: "Listar versiones de un modelo. Var: VARIETY=POP (REQ)"
+    desc: "Listar versiones de un modelo. Var: MODEL_NAME=rnd-forest-POP (REQ)"
     requires:
-      vars: [VARIETY]
+      vars: [MODEL_NAME]
     cmds:
       - |
         URI=$(task mlflow-aws:_mlflow-uri)
-        curl -s "$URI/api/2.0/mlflow/registered-models/get?name={{.VARIETY}}" \
+        curl -s "$URI/api/2.0/mlflow/registered-models/get?name={{.MODEL_NAME}}" \
           | jq '.registered_model.latest_versions[] | {version, current_stage, run_id, creation_timestamp}'
 
   current-prod:
-    desc: "Mostrar version Production actual. Var: VARIETY=POP (REQ)"
+    desc: "Mostrar version Production actual. Var: MODEL_NAME=rnd-forest-POP (REQ)"
     requires:
-      vars: [VARIETY]
+      vars: [MODEL_NAME]
     cmds:
       - |
         URI=$(task mlflow-aws:_mlflow-uri)
-        curl -s "$URI/api/2.0/mlflow/registered-models/get?name={{.VARIETY}}" \
+        curl -s "$URI/api/2.0/mlflow/registered-models/get?name={{.MODEL_NAME}}" \
           | jq '.registered_model.latest_versions[] | select(.current_stage == "Production") | {version, run_id, creation_timestamp}'
 
   # ═══ Promote con quality gate (MAPE) ════════════════════════════════════════
 
   promote:
-    desc: "Promover a Production con gate MAPE. Vars: VARIETY=POP VERSION=N (REQ), MAX_MAPE=20"
+    desc: "Promover a Production con gate MAPE + A/B contra Production actual. Vars: MODEL_NAME (REQ, ej rnd-forest-POP), VERSION=N (REQ), MAX_MAPE=20"
     requires:
-      vars: [VARIETY, VERSION]
+      vars: [MODEL_NAME, VERSION]
     cmds:
       - |
         URI=$(task mlflow-aws:_mlflow-uri)
-        echo ">>> {{.VARIETY}} v{{.VERSION}}  (gate MAPE <= {{.MAX_MAPE}})"
+        echo ">>> {{.MODEL_NAME}} v{{.VERSION}}  (gate MAPE <= {{.MAX_MAPE}})"
 
-        RUN_ID=$(curl -s "$URI/api/2.0/mlflow/model-versions/get?name={{.VARIETY}}&version={{.VERSION}}" \
+        # ── 1) Gate absoluto: MAPE del candidato <= MAX_MAPE ──────────────────
+        RUN_ID=$(curl -s "$URI/api/2.0/mlflow/model-versions/get?name={{.MODEL_NAME}}&version={{.VERSION}}" \
           | jq -r '.model_version.run_id')
         if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
-          echo "ERROR no se encontro {{.VARIETY}} v{{.VERSION}}"
-          exit 1
+          echo "ERROR no se encontro {{.MODEL_NAME}} v{{.VERSION}}"; exit 1
         fi
-
-        MAPE=$(curl -s "$URI/api/2.0/mlflow/runs/get?run_id=$RUN_ID" \
-          | jq -r '.run.data.metrics[] | select(.key == "mape_oof") | .value')
-        if [ -z "$MAPE" ] || [ "$MAPE" = "null" ]; then
-          echo "ERROR el run no tiene mape_oof"
-          exit 1
+        MAPE_NEW=$(curl -s "$URI/api/2.0/mlflow/runs/get?run_id=$RUN_ID" \
+          | jq -r '.run.data.metrics[] | select(.key == "mape_oof" or .key == "mape") | .value' | head -n1)
+        if [ -z "$MAPE_NEW" ] || [ "$MAPE_NEW" = "null" ]; then
+          echo "ERROR el run no tiene mape_oof ni mape"; exit 1
         fi
-        echo "    mape_oof=$MAPE"
-
-        # awk para comparar floats (bash no soporta float nativo)
-        OK=$(awk -v m="$MAPE" -v t="{{.MAX_MAPE}}" 'BEGIN { print (m <= t) ? "yes" : "no" }')
+        echo "    candidato mape=$MAPE_NEW"
+        OK=$(awk -v m="$MAPE_NEW" -v t="{{.MAX_MAPE}}" 'BEGIN { print (m <= t) ? "yes" : "no" }')
         if [ "$OK" != "yes" ]; then
-          echo "GATE FAIL  MAPE=$MAPE > {{.MAX_MAPE}}"
-          exit 1
+          echo "GATE FAIL absoluto  MAPE=$MAPE_NEW > {{.MAX_MAPE}}"; exit 1
         fi
-        echo "GATE OK"
+        echo "GATE absoluto OK"
 
+        # ── 2) Gate A/B: candidato debe mejorar al Production actual ──────────
+        PROD_VER=$(curl -s "$URI/api/2.0/mlflow/registered-models/get-latest-versions" \
+          -H "Content-Type: application/json" \
+          -d "{\"name\":\"{{.MODEL_NAME}}\",\"stages\":[\"Production\"]}" \
+          | jq -r '.model_versions[0].version // empty')
+        if [ -z "$PROD_VER" ]; then
+          echo "Sin Production previo, skip A/B"
+        else
+          PROD_RUN=$(curl -s "$URI/api/2.0/mlflow/model-versions/get?name={{.MODEL_NAME}}&version=$PROD_VER" \
+            | jq -r '.model_version.run_id')
+          MAPE_PROD=$(curl -s "$URI/api/2.0/mlflow/runs/get?run_id=$PROD_RUN" \
+            | jq -r '.run.data.metrics[] | select(.key == "mape_oof" or .key == "mape") | .value' | head -n1)
+          echo "    Production v$PROD_VER mape=$MAPE_PROD"
+          BETTER=$(awk -v n="$MAPE_NEW" -v p="$MAPE_PROD" 'BEGIN { print (n < p) ? "yes" : "no" }')
+          if [ "$BETTER" != "yes" ]; then
+            echo "GATE FAIL A/B  candidato MAPE=$MAPE_NEW no mejora vs Production v$PROD_VER MAPE=$MAPE_PROD"; exit 1
+          fi
+          echo "GATE A/B OK"
+        fi
+
+        # ── 3) Transition ────────────────────────────────────────────────────
         echo ">>> Transicionando a Production (archive existing)..."
         curl -s -X POST "$URI/api/2.0/mlflow/model-versions/transition-stage" \
           -H "Content-Type: application/json" \
-          -d "{\"name\":\"{{.VARIETY}}\",\"version\":\"{{.VERSION}}\",\"stage\":\"Production\",\"archive_existing_versions\":true}" \
+          -d "{\"name\":\"{{.MODEL_NAME}}\",\"version\":\"{{.VERSION}}\",\"stage\":\"Production\",\"archive_existing_versions\":true}" \
           | jq '.model_version | {name, version, current_stage}'
-        echo "OK {{.VARIETY}} v{{.VERSION}} en Production"
+        echo "OK {{.MODEL_NAME}} v{{.VERSION}} en Production"

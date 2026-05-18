@@ -200,7 +200,7 @@ Al terminar las 5 oleadas tenes corriendo en AWS:
 | **Eventos** | EventBridge rules: 1 cron L-V 08:00 PET start, 1 cron L-V 12:00 PET stop, 1 rule "Batch Job FAILED" → notifier | 24/7 (cron es serverless) |
 | **Alarmas** | CloudWatch alarms: job FAILED, MAPE > umbral (custom metric), ALB 5xx | 24/7 |
 | **Notificaciones** | SNS topic `ml-training-alerts` con suscripcion email (`abantodca@gmail.com`) | 24/7 |
-| **CI/CD** | GitHub Actions con OIDC: `ci.yml` (lint + test + build + push), `train.yml` (workflow_dispatch para entrenar), `promote.yml` (Staging→Production con gate), `terraform-plan.yml` (plan en PRs) | Solo cuando hay push/PR |
+| **CI/CD** | GitHub Actions con OIDC: **`deploy.yml`** (lint + test + build + plan + apply), **`training.yml`** (entrenar + auto-train + promote), **`destroy.yml`** (3 modos: tear-down/destroy/nuke) | Solo cuando hay push/PR |
 
 ### Endpoints en produccion (un solo ALB)
 
@@ -268,7 +268,7 @@ un ADR antes.
 | **Trigger de training** | (a) GitHub Actions `train.yml` workflow_dispatch (wake-train-sleep), (b) `aws lambda invoke ml-training-dispatcher` (asume servicios up). **Sin cron de training, sin S3 PutObject trigger.** | Cualquier user entrena con un click desde GitHub UI eligiendo variedad. Training fuera de ventana wake-ea servicios y los apaga al terminar. | EventBridge cron diario / S3 PutObject trigger (Parte 7.5, futuro). |
 | **Backend de MLflow** | Postgres (backend store) + S3 (artifact store), NO filesystem | Estandar de industria, soporta concurrencia, scale-out. | Filesystem solo en dev local (lo que hace `docker-compose.yml` con Postgres tambien). |
 | **Modelos entrenables** | **XGBoost + LightGBM** (no Random Forest), ambos via `TransformedTargetRegressor` con log1p + cap-p99 sobre `KG/JR_H`. Champion automatico (no flag de usuario). | Es lo que esta en `src/step_04_train/registry.py` hoy. Estabilidad numerica del target garantizada por la transformacion. | Stacking (eliminado del codigo, NO existe). |
-| **Variedades validas** | `POP`, `JUPITER`, `VENTURA`, `SEKOYA`, `ALLISON`, `STELLA` | Hardcoded en `src/orchestration/cli.py:resolve_varieties` y validado en Lambda dispatcher. | Agregar nueva variedad: PR a `cli.py` + variable Terraform `varieties_allowed`. |
+| **Variedades validas** | **Dinamicas** — definidas por las hojas del Excel `data/BD_HISTORICO_ACUMULADO.xlsx`. Hoy son `POP`, `JUPITER`, `VENTURA`, `SEKOYA`, `ALLISON`, `STELLA`. | **Source of truth: el Excel.** `src/step_01_load/data_loader.py::list_varieties()` enumera `pd.ExcelFile(path).sheet_names`. El flag `--varieties all` resuelve via `resolve_varieties()` en `src/orchestration/cli.py`. La variable Terraform `varieties_allowed` es solo un **allow-list defensivo** que el Lambda dispatcher usa para rechazar typos en `aws lambda invoke` (no es donde se "definen" las variedades). | Agregar nueva variedad: agregar hoja al Excel + re-subir a S3 con `aws s3 cp`. Opcional: ampliar el default de `varieties_allowed` si queres que el dispatcher acepte submits directos. |
 | **OIDC vs access keys** | OIDC (sin secrets de larga duracion en GitHub) | Auditable en CloudTrail, sin rotacion manual, blast-radius limitado al repo. | Access keys solo en CI legacy que no soporta OIDC. |
 | **Promotion** | Quality gate (MAPE < umbral) + A/B contra Production actual + approval humano en GitHub Environments | Defense in depth: sklearn no garantiza un MAPE menor por si solo; el A/B compara contra baseline real. | Auto-promote sin approval si MAPE absoluto es <5% (no recomendado). |
 
@@ -469,6 +469,13 @@ Las 4 referencias que aparecen una y otra vez:
 | `$ACCOUNT_ID` | 12 digitos | tfstate bucket, ECR URIs, role ARNs |
 | `$ACCOUNT_SUFFIX` | 6 digitos | sufijo de buckets (para evitar colision con otras cuentas) |
 | `$AWS_DEFAULT_REGION` | `us-east-1` | scope de todo el deployment |
+
+> **Nota sobre Task**: estas vars son utiles solo para los bloques bash
+> manuales de las Partes 0-2 (bootstrap, verificaciones). Los Taskfiles
+> de `tasks/*.yml` NO leen `$ACCOUNT_ID` ni `$ACCOUNT_SUFFIX` del entorno
+> — los recomputan internamente con `aws sts get-caller-identity` (ver
+> `tasks/ecr.yml` y `tasks/infra.yml`). Si exportas estas vars y luego
+> usas `task X`, no las "pasa" a Task; cada task es self-contained.
 
 ### Naming convention de recursos
 
@@ -742,24 +749,15 @@ chmod +x infra/bootstrap.sh
 bash infra/bootstrap.sh
 ```
 
-Salida esperada (resumida):
+Salida esperada (el script es silencioso; solo imprime el resumen final):
 
 ```
-==> Bootstrap config:
-    PROJECT  = ml-training
-    REGION   = us-east-1
-    ACCOUNT  = 123456789012 (suffix=789012)
-    BUCKET   = ml-training-tfstate-789012
-    LOCK_TBL = ml-training-tflock
-
-==> [1/4] Creando S3 bucket ml-training-tfstate-789012...
-==> [2/4] Activando versioning...
-==> [3/4] Activando encryption SSE-S3...
-==> [4/4] Creando DynamoDB table ml-training-tflock...
-==> [5/6] Asegurando SLRs...
-
 ==> BOOTSTRAP COMPLETADO
+    bucket=ml-training-tfstate-789012  lock=ml-training-tflock  region=us-east-1
 ```
+
+Si NO ves esa linea final, algun `aws` command fallo silenciosamente
+arriba (revisa con `bash -x infra/bootstrap.sh` para verlo paso a paso).
 
 **Si re-ejecutas el script**: es idempotente. Va a decir "Ya existe.
 Skip create." en los pasos donde el recurso ya esta, y los SLR no
@@ -1062,7 +1060,7 @@ variable "github_repo" {
 }
 
 variable "varieties_allowed" {
-  description = "Variedades validas. Tiene que matchear src/orchestration/cli.py:resolve_varieties."
+  description = "Allow-list defensivo para el Lambda dispatcher (rechaza submits con variety no listada). NO define las variedades del modelo: la verdad esta en las hojas del Excel (data/BD_HISTORICO_ACUMULADO.xlsx) y se descubre dinamicamente con src/step_01_load/data_loader.py::list_varieties(). Esta lista solo previene typos en `aws lambda invoke`."
   type        = list(string)
   default     = ["POP", "JUPITER", "VENTURA", "SEKOYA", "ALLISON", "STELLA"]
 }
@@ -1297,7 +1295,9 @@ output "gha_train_role_arn" {
 Single-AZ a proposito (Sec 0.2 lockeada). El SG matrix es:
 
 - `sg_alb`: ingress :80 from 0.0.0.0/0 (futuro: WAF + TLS en Parte 10.1)
-- `sg_mlflow`: ingress :5000 from `sg_alb` solo
+- `sg_mlflow`: **dos reglas de ingress desde `sg_alb`**: :5000 (MLflow
+  task escucha ahi) y :80 (modulo reports reusa este SG porque comparte
+  ECS cluster; el container nginx escucha en :80). Nada desde 0.0.0.0/0.
 - `sg_rds`: ingress :5432 from `sg_mlflow` + `sg_batch` (Batch necesita
   conectar a RDS para registrar runs via MLflow Python client)
 - `sg_batch`: egress 443 a internet (S3, ECR, MLflow ALB)
@@ -2956,10 +2956,13 @@ drift cuando Batch scaling lo cambia entre apply y apply.
 
 ```hcl
 resource "aws_batch_compute_environment" "spot" {
-  compute_environment_name = "${var.project}-ce-spot"
-  service_role             = aws_iam_role.batch_service.arn
-  type                     = "MANAGED"
-  state                    = "ENABLED"
+  # AWS provider v6+ usa `name`. El atributo `compute_environment_name`
+  # fue deprecado en v5 y eliminado en v6 -> con `aws ~> 6.0` lockeado
+  # en §3.2.1, `terraform validate` falla si se usa el nombre viejo.
+  name         = "${var.project}-ce-spot"
+  service_role = aws_iam_role.batch_service.arn
+  type         = "MANAGED"
+  state        = "ENABLED"
 
   compute_resources {
     type                = "SPOT"
@@ -2982,10 +2985,10 @@ resource "aws_batch_compute_environment" "spot" {
 }
 
 resource "aws_batch_compute_environment" "ondemand" {
-  compute_environment_name = "${var.project}-ce-ondemand"
-  service_role             = aws_iam_role.batch_service.arn
-  type                     = "MANAGED"
-  state                    = "ENABLED"
+  name         = "${var.project}-ce-ondemand"   # ver nota en bloque "spot" sobre v6
+  service_role = aws_iam_role.batch_service.arn
+  type         = "MANAGED"
+  state        = "ENABLED"
 
   compute_resources {
     type                = "EC2"
@@ -4629,7 +4632,7 @@ brew install go-task
 
 ### 4.1.2 Estructura final
 
-Despues de seguir 📖 4.1.3 a 📖 4.1.9, tu proyecto va a tener:
+Despues de seguir 📖 4.1.3 a 📖 4.1.9 + 📖 4.1.11, tu proyecto va a tener:
 
 ```
 Taskfile.yml                    # raiz: tasks LOCALES (Docker) + includes AWS
@@ -4638,25 +4641,26 @@ tasks/
 ├── ecr.yml                     # ecr:*         build + push 3 imagenes
 ├── batch.yml                   # batch:*       submit jobs + polling
 ├── cluster.yml                 # cluster:*     lifecycle scale up/down + teardown
-├── mlflow_registry.yml         # mlflow-aws:*  promote con quality gate MAPE
-└── aws.yml                     # aws:*         orquestadores high-level (deploy/wake/sleep)
+├── mlflow_registry.yml         # mlflow-aws:*  promote con quality gate MAPE + A/B
+├── aws.yml                     # aws:*         orquestadores high-level (deploy/wake/sleep/nuke)
+└── local.yml                   # local:*       helpers dev local (ensure-buckets, bucket-name)
 ```
 
-**Por que un Taskfile raiz + 6 archivos en `tasks/` y no uno solo**:
+**Por que un Taskfile raiz + 7 archivos en `tasks/` y no uno solo**:
 
 - **Namespacing**: cada `includes:` prefija con `<nombre>:`, asi `task build`
   (local Docker existente) NO choca con `task ecr:build` (AWS nuevo).
 - **Blast radius**: tocar `tasks/batch.yml` no riesga romper `cluster.yml`.
 - **Discoverability**: `task --list` los muestra agrupados por namespace.
 - **Tamano manageable**: un Taskfile monolitico de 600 lineas se vuelve un
-  dolor de revisar; 6 archivos de 80-120 lineas son trozos auto-contenidos.
+  dolor de revisar; 7 archivos de 80-200 lineas son trozos auto-contenidos.
 
 ### 4.1.3 Crear `tasks/` y anadir `PROJECT` al Taskfile raiz
 
 > **Orden importa**: el `includes:` viene en 📖 4.1.10 — DESPUES de crear
-> los 6 archivos referenciados (📖 4.1.4 a 📖 4.1.9). Si pegas el
-> `includes:` ahora, `task --list` falla por "archivo no encontrado"
-> hasta que llegues a 4.1.10.
+> los 7 archivos referenciados (📖 4.1.4 a 📖 4.1.9 + 📖 4.1.11). Si
+> pegas el `includes:` ahora, `task --list` falla por "archivo no
+> encontrado" hasta que llegues a 4.1.10.
 
 ```bash
 mkdir -p tasks
@@ -4976,6 +4980,7 @@ auditar "que imagen tengo desplegada y desde cuando" via
 #   task batch:train VARIETIES=POP,VENTURA            multiples en serie
 #   task batch:train VARIETIES=POP TUNING=smoke       sanity check (~1 min)
 #   task batch:train VARIETIES=POP WAIT=false         fire-and-forget
+#   task batch:train-lambda VARIETIES=POP                       submit via Lambda dispatcher (valida variety + S3 hydrate)
 #   task batch:smoke                                  atajo: POP + smoke
 #   task batch:status                                 jobs activos en queues
 #   task batch:cancel JOB_ID=<id>                     terminar un job
@@ -4986,8 +4991,8 @@ version: "3"
 vars:
   PROJECT:    '{{.PROJECT    | default "ml-training"}}'
   JOB_DEF:    '{{.JOB_DEF    | default (printf "%s-trainer"  .PROJECT)}}'
-  QUEUE_SPOT: '{{.QUEUE_SPOT | default (printf "%s-spot"     .PROJECT)}}'
-  QUEUE_OD:   '{{.QUEUE_OD   | default (printf "%s-ondemand" .PROJECT)}}'
+  QUEUE_SPOT: '{{.QUEUE_SPOT | default (printf "%s-job-queue-spot"     .PROJECT)}}'
+  QUEUE_OD:   '{{.QUEUE_OD   | default (printf "%s-job-queue-ondemand" .PROJECT)}}'
   TUNING:     '{{.TUNING     | default "prod"}}'
   PARALLEL:   '{{.PARALLEL   | default "1"}}'
   WAIT:       '{{.WAIT       | default "true"}}'
@@ -5027,6 +5032,40 @@ tasks:
               *)         sleep 30 ;;
             esac
           done
+        done
+
+  # ═══ Entrenar via Lambda dispatcher (path usado por train.yml) ═════════════
+
+  train-lambda:
+    desc: "Submit via Lambda dispatcher (valida variety + S3 hydrate). Vars: VARIETIES (REQ), TUNING, WAIT"
+    requires:
+      vars: [VARIETIES]
+    vars:
+      DISPATCHER_FN: '{{.DISPATCHER_FN | default (printf "%s-dispatcher" .PROJECT)}}'
+    cmds:
+      - |
+        set -e
+        PAYLOAD=$(jq -nc --arg v "{{.VARIETIES}}" --arg t "{{.TUNING}}" \
+          '{varieties: $v, tuning: $t}')
+        aws lambda invoke \
+          --function-name "{{.DISPATCHER_FN}}" \
+          --cli-binary-format raw-in-base64-out \
+          --payload "$PAYLOAD" \
+          /tmp/dispatcher-out.json \
+          --query 'StatusCode' --output text
+        cat /tmp/dispatcher-out.json
+        JOB_ID=$(jq -r '.body.jobId // (.body|fromjson|.jobId)' /tmp/dispatcher-out.json 2>/dev/null || jq -r '.jobId' /tmp/dispatcher-out.json)
+        echo ">>> Submitted via dispatcher  job=$JOB_ID"
+        [ "{{.WAIT}}" != "true" ] && exit 0
+        while :; do
+          STATUS=$(aws batch describe-jobs --jobs "$JOB_ID" --query 'jobs[0].status' --output text)
+          echo "  $(date +%H:%M:%S)  $STATUS"
+          case "$STATUS" in
+            SUCCEEDED) break ;;
+            FAILED)    REASON=$(aws batch describe-jobs --jobs "$JOB_ID" --query 'jobs[0].statusReason' --output text)
+                       echo "FAIL  reason=$REASON"; exit 1 ;;
+            *)         sleep 30 ;;
+          esac
         done
 
   # ═══ Smoke test ═════════════════════════════════════════════════════════════
@@ -5282,10 +5321,10 @@ dinamicamente garantiza que poll-eamos el ALB actual, no uno fantasma.
 # Separado del MLflow local (que vive en docker-compose).
 #
 # USO TIPICO:
-#   task mlflow-aws:list-versions VARIETY=POP                    ver versiones
-#   task mlflow-aws:current-prod  VARIETY=POP                    ver Production actual
-#   task mlflow-aws:promote VARIETY=POP VERSION=3                gate MAPE<=20 (default)
-#   task mlflow-aws:promote VARIETY=POP VERSION=3 MAX_MAPE=15    gate custom
+#   task mlflow-aws:list-versions MODEL_NAME=rnd-forest-POP                    ver versiones
+#   task mlflow-aws:current-prod  MODEL_NAME=rnd-forest-POP                    ver Production actual
+#   task mlflow-aws:promote MODEL_NAME=rnd-forest-POP VERSION=3                gate MAPE<=20 (default)
+#   task mlflow-aws:promote MODEL_NAME=rnd-forest-POP VERSION=3 MAX_MAPE=15    gate custom
 # =============================================================================
 
 version: "3"
@@ -5303,9 +5342,15 @@ tasks:
     silent: true
     cmds:
       - |
+        # Prioridad: env var MLFLOW_ALB_DNS (usada por GHA via vars.MLFLOW_ALB_DNS)
+        # -> fallback: terraform output (uso local, requiere init previo)
+        if [ -n "${MLFLOW_ALB_DNS:-}" ]; then
+          echo "http://$MLFLOW_ALB_DNS"
+          exit 0
+        fi
         ALB=$(terraform -chdir={{.TF_DIR}} output -raw alb_dns 2>/dev/null)
         if [ -z "$ALB" ]; then
-          echo "ERROR no se pudo leer alb_dns" >&2
+          echo "ERROR no se pudo leer alb_dns (ni env MLFLOW_ALB_DNS ni terraform output)" >&2
           exit 1
         fi
         echo "http://$ALB"
@@ -5313,65 +5358,81 @@ tasks:
   # ═══ Inspeccion ═════════════════════════════════════════════════════════════
 
   list-versions:
-    desc: "Listar versiones de un modelo. Var: VARIETY=POP (REQ)"
+    desc: "Listar versiones de un modelo. Var: MODEL_NAME=rnd-forest-POP (REQ)"
     requires:
-      vars: [VARIETY]
+      vars: [MODEL_NAME]
     cmds:
       - |
         URI=$(task mlflow-aws:_mlflow-uri)
-        curl -s "$URI/api/2.0/mlflow/registered-models/get?name={{.VARIETY}}" \
+        curl -s "$URI/api/2.0/mlflow/registered-models/get?name={{.MODEL_NAME}}" \
           | jq '.registered_model.latest_versions[] | {version, current_stage, run_id, creation_timestamp}'
 
   current-prod:
-    desc: "Mostrar version Production actual. Var: VARIETY=POP (REQ)"
+    desc: "Mostrar version Production actual. Var: MODEL_NAME=rnd-forest-POP (REQ)"
     requires:
-      vars: [VARIETY]
+      vars: [MODEL_NAME]
     cmds:
       - |
         URI=$(task mlflow-aws:_mlflow-uri)
-        curl -s "$URI/api/2.0/mlflow/registered-models/get?name={{.VARIETY}}" \
+        curl -s "$URI/api/2.0/mlflow/registered-models/get?name={{.MODEL_NAME}}" \
           | jq '.registered_model.latest_versions[] | select(.current_stage == "Production") | {version, run_id, creation_timestamp}'
 
   # ═══ Promote con quality gate (MAPE) ════════════════════════════════════════
 
   promote:
-    desc: "Promover a Production con gate MAPE. Vars: VARIETY=POP VERSION=N (REQ), MAX_MAPE=20"
+    desc: "Promover a Production con gate MAPE + A/B contra Production actual. Vars: MODEL_NAME (REQ, ej rnd-forest-POP), VERSION=N (REQ), MAX_MAPE=20"
     requires:
-      vars: [VARIETY, VERSION]
+      vars: [MODEL_NAME, VERSION]
     cmds:
       - |
         URI=$(task mlflow-aws:_mlflow-uri)
-        echo ">>> {{.VARIETY}} v{{.VERSION}}  (gate MAPE <= {{.MAX_MAPE}})"
+        echo ">>> {{.MODEL_NAME}} v{{.VERSION}}  (gate MAPE <= {{.MAX_MAPE}})"
 
-        RUN_ID=$(curl -s "$URI/api/2.0/mlflow/model-versions/get?name={{.VARIETY}}&version={{.VERSION}}" \
+        # ── 1) Gate absoluto: MAPE del candidato <= MAX_MAPE ──────────────────
+        RUN_ID=$(curl -s "$URI/api/2.0/mlflow/model-versions/get?name={{.MODEL_NAME}}&version={{.VERSION}}" \
           | jq -r '.model_version.run_id')
         if [ -z "$RUN_ID" ] || [ "$RUN_ID" = "null" ]; then
-          echo "ERROR no se encontro {{.VARIETY}} v{{.VERSION}}"
-          exit 1
+          echo "ERROR no se encontro {{.MODEL_NAME}} v{{.VERSION}}"; exit 1
         fi
-
-        MAPE=$(curl -s "$URI/api/2.0/mlflow/runs/get?run_id=$RUN_ID" \
-          | jq -r '.run.data.metrics[] | select(.key == "mape_oof") | .value')
-        if [ -z "$MAPE" ] || [ "$MAPE" = "null" ]; then
-          echo "ERROR el run no tiene mape_oof"
-          exit 1
+        MAPE_NEW=$(curl -s "$URI/api/2.0/mlflow/runs/get?run_id=$RUN_ID" \
+          | jq -r '.run.data.metrics[] | select(.key == "mape_oof" or .key == "mape") | .value' | head -n1)
+        if [ -z "$MAPE_NEW" ] || [ "$MAPE_NEW" = "null" ]; then
+          echo "ERROR el run no tiene mape_oof ni mape"; exit 1
         fi
-        echo "    mape_oof=$MAPE"
-
-        # awk para comparar floats (bash no soporta float nativo)
-        OK=$(awk -v m="$MAPE" -v t="{{.MAX_MAPE}}" 'BEGIN { print (m <= t) ? "yes" : "no" }')
+        echo "    candidato mape=$MAPE_NEW"
+        OK=$(awk -v m="$MAPE_NEW" -v t="{{.MAX_MAPE}}" 'BEGIN { print (m <= t) ? "yes" : "no" }')
         if [ "$OK" != "yes" ]; then
-          echo "GATE FAIL  MAPE=$MAPE > {{.MAX_MAPE}}"
-          exit 1
+          echo "GATE FAIL absoluto  MAPE=$MAPE_NEW > {{.MAX_MAPE}}"; exit 1
         fi
-        echo "GATE OK"
+        echo "GATE absoluto OK"
 
+        # ── 2) Gate A/B: candidato debe mejorar al Production actual ──────────
+        PROD_VER=$(curl -s "$URI/api/2.0/mlflow/registered-models/get-latest-versions" \
+          -H "Content-Type: application/json" \
+          -d "{\"name\":\"{{.MODEL_NAME}}\",\"stages\":[\"Production\"]}" \
+          | jq -r '.model_versions[0].version // empty')
+        if [ -z "$PROD_VER" ]; then
+          echo "Sin Production previo, skip A/B"
+        else
+          PROD_RUN=$(curl -s "$URI/api/2.0/mlflow/model-versions/get?name={{.MODEL_NAME}}&version=$PROD_VER" \
+            | jq -r '.model_version.run_id')
+          MAPE_PROD=$(curl -s "$URI/api/2.0/mlflow/runs/get?run_id=$PROD_RUN" \
+            | jq -r '.run.data.metrics[] | select(.key == "mape_oof" or .key == "mape") | .value' | head -n1)
+          echo "    Production v$PROD_VER mape=$MAPE_PROD"
+          BETTER=$(awk -v n="$MAPE_NEW" -v p="$MAPE_PROD" 'BEGIN { print (n < p) ? "yes" : "no" }')
+          if [ "$BETTER" != "yes" ]; then
+            echo "GATE FAIL A/B  candidato MAPE=$MAPE_NEW no mejora vs Production v$PROD_VER MAPE=$MAPE_PROD"; exit 1
+          fi
+          echo "GATE A/B OK"
+        fi
+
+        # ── 3) Transition ────────────────────────────────────────────────────
         echo ">>> Transicionando a Production (archive existing)..."
         curl -s -X POST "$URI/api/2.0/mlflow/model-versions/transition-stage" \
           -H "Content-Type: application/json" \
-          -d "{\"name\":\"{{.VARIETY}}\",\"version\":\"{{.VERSION}}\",\"stage\":\"Production\",\"archive_existing_versions\":true}" \
+          -d "{\"name\":\"{{.MODEL_NAME}}\",\"version\":\"{{.VERSION}}\",\"stage\":\"Production\",\"archive_existing_versions\":true}" \
           | jq '.model_version | {name, version, current_stage}'
-        echo "OK {{.VARIETY}} v{{.VERSION}} en Production"
+        echo "OK {{.MODEL_NAME}} v{{.VERSION}} en Production"
 ```
 
 **Por que via REST API (`curl + jq`) y no `mlflow` CLI**: el host (Windows
@@ -5384,16 +5445,34 @@ es estable cross-version (2.x y 3.x).
 floats nativamente (`[ 19.5 -le 20 ]` falla con "integer expression
 expected"). `awk` lo hace en una linea.
 
-**Por que el gate chequea `mape_oof` y no `mape`**: `mape_oof` es la
+**Por que el gate prefiere `mape_oof` y cae a `mape`**: `mape_oof` es la
 metric out-of-fold (validacion cross-validation), no la del train set.
 La metric del train set siempre se ve bien (overfit); `oof` es lo que
-predice generalizacion.
+predice generalizacion. El `select(.key == "mape_oof" or .key == "mape") | head -n1`
+toma `mape_oof` si existe y `mape` como fallback para runs antiguos.
 
-**Por que `archive_existing_versions: true` en el POST de
-transition-stage**: solo UNA version puede estar "Production" a la vez
-por convencion de seguridad (no querer ambiguedad sobre cual modelo
-sirve trafico). Archivar las anteriores las saca del set "Production"
-sin borrarlas (siguen accesibles via stage="Archived").
+**Por que `MODEL_NAME` en vez de `VARIETY`**: en MLflow Registry los
+modelos se guardan con el nombre completo `rnd-forest-<VARIETY>` (el
+prefijo viene de `MODEL_REGISTRY_PREFIX` en `src/config.py`). Pedir
+`MODEL_NAME=rnd-forest-POP` (y no `VARIETY=POP` con string concat
+oculta) hace explicito que el parametro es el nombre real del registry,
+y permite promover modelos que no sigan ese prefijo si manana cambia.
+
+**Por que 3 gates (absoluto + A/B + transition)**: defense in depth.
+El gate absoluto (`MAPE <= MAX_MAPE`) atrapa modelos catastroficamente
+malos. El A/B (`MAPE_candidato < MAPE_production`) atrapa modelos que
+pasan el absoluto pero degradan respecto al baseline real. Si no hay
+Production previo, el A/B se saltea (primer deploy del modelo). El
+3er paso recien hace `transition-stage` con `archive_existing=true`:
+solo UNA version puede estar "Production" a la vez (las anteriores
+quedan en `Archived`, accesibles pero no servidas).
+
+**Por que `_mlflow-uri` prefiere `MLFLOW_ALB_DNS` antes de
+`terraform output`**: GitHub Actions no corre `terraform init` en
+cada job (ahorra ~30s + necesita credenciales para el backend S3).
+La var `vars.MLFLOW_ALB_DNS` que el workflow exporta como env permite
+que el promote corra sin tocar Terraform. Para uso local, el fallback
+a `terraform output -raw alb_dns` sigue funcionando.
 
 ### 4.1.9 `tasks/aws.yml` (orquestadores high-level)
 
@@ -5413,6 +5492,7 @@ sin borrarlas (siguen accesibles via stage="Archived").
 #   task aws:teardown                                 destroy volatiles, preserva storage
 #   task aws:rebuild                                  re-apply tras teardown
 #   task aws:destroy                                  DESTRUCTIVO total
+#   task aws:nuke                                     IRREVERSIBLE: destroy + tfstate + tflock + OIDC
 #   task aws:status                                   outputs + cluster status
 # =============================================================================
 
@@ -5474,14 +5554,126 @@ tasks:
   # ═══ Destroy total ══════════════════════════════════════════════════════════
 
   destroy:
-    desc: "DESTRUCTIVO TOTAL: terraform destroy de TODO (incluye storage). Doble confirmacion"
-    prompt: "Destruira COMPLETAMENTE envs/prod (S3, ECR, RDS, todo). Irreversible. Continuar?"
+    desc: "DESTRUCTIVO TOTAL: terraform destroy de modulos administrados. Doble confirmacion"
+    prompt: "Destruira envs/prod (S3 + ECR + RDS + ...). Irreversible. Continuar?"
     cmds:
       - 'echo ">>> Drenando Batch jobs primero..."'
       - task: ":cluster:scale-down"
       - 'echo ""'
+      - 'echo ">>> Vaciando buckets S3 con versioning (data + artifacts)..."'
+      - task: _empty-bucket
+        vars: { BUCKET: '{{.PROJECT | default "ml-training"}}-data' }
+      - task: _empty-bucket
+        vars: { BUCKET: '{{.PROJECT | default "ml-training"}}-artifacts' }
+      - 'echo ""'
+      - 'echo ">>> Borrando imagenes ECR..."'
+      - task: _purge-ecr
+        vars: { REPO: '{{.PROJECT | default "ml-training"}}' }
+      - task: _purge-ecr
+        vars: { REPO: '{{.PROJECT | default "ml-training"}}-mlflow' }
+      - task: _purge-ecr
+        vars: { REPO: '{{.PROJECT | default "ml-training"}}-reports' }
+      - 'echo ""'
       - 'echo ">>> terraform destroy total..."'
       - task: ":infra:destroy"
+
+  nuke:
+    desc: "DESTRUCTIVO IRREVERSIBLE: destroy + borrar tfstate bucket + tflock + OIDC provider"
+    prompt: "NUKE COMPLETO: destruira todo, incluido el state remoto (tfstate bucket + tflock) y el OIDC provider. Despues necesitas re-bootstrap. Continuar?"
+    cmds:
+      - task: destroy
+      - 'echo ""'
+      - 'echo ">>> Borrando bucket tfstate (backend Terraform)..."'
+      - task: _delete-tfstate-bucket
+      - 'echo ">>> Borrando DynamoDB tflock..."'
+      - task: _delete-tflock
+      - 'echo ">>> Borrando OIDC provider de GitHub Actions..."'
+      - task: _delete-oidc
+      - 'echo ""'
+      - 'echo "NUKE COMPLETO. Para volver: task infra:bootstrap + task infra:bootstrap-oidc + task aws:deploy"'
+
+  # ═══ Helpers internos del destroy/nuke (no llamar directo) ══════════════════
+
+  _empty-bucket:
+    internal: true
+    requires:
+      vars: [BUCKET]
+    vars:
+      SUFFIX:
+        sh: aws sts get-caller-identity --query Account --output text | tail -c 7
+    cmds:
+      - |
+        FULL="{{.BUCKET}}-{{.SUFFIX}}"
+        if ! aws s3api head-bucket --bucket "$FULL" 2>/dev/null; then
+          echo "  $FULL no existe, skip"; exit 0
+        fi
+        echo "  Vaciando $FULL (versiones + delete markers)..."
+        aws s3api delete-objects --bucket "$FULL" \
+          --delete "$(aws s3api list-object-versions --bucket "$FULL" \
+            --query '{Objects: [Versions[].{Key:Key,VersionId:VersionId},DeleteMarkers[].{Key:Key,VersionId:VersionId}][]}' \
+            --max-items 1000)" 2>/dev/null || echo "  (bucket ya vacio)"
+
+  _purge-ecr:
+    internal: true
+    requires:
+      vars: [REPO]
+    cmds:
+      - |
+        if ! aws ecr describe-repositories --repository-names "{{.REPO}}" >/dev/null 2>&1; then
+          echo "  {{.REPO}} no existe, skip"; exit 0
+        fi
+        IDS=$(aws ecr list-images --repository-name "{{.REPO}}" --query 'imageIds[*]' --output json)
+        if [ "$IDS" = "[]" ]; then
+          echo "  {{.REPO}} vacio"; exit 0
+        fi
+        echo "  Borrando todas las imagenes de {{.REPO}}..."
+        aws ecr batch-delete-image --repository-name "{{.REPO}}" --image-ids "$IDS" >/dev/null
+
+  _delete-tfstate-bucket:
+    internal: true
+    vars:
+      SUFFIX:
+        sh: aws sts get-caller-identity --query Account --output text | tail -c 7
+      BUCKET: '{{.PROJECT | default "ml-training"}}-tfstate'
+    cmds:
+      - |
+        FULL="{{.BUCKET}}-{{.SUFFIX}}"
+        if ! aws s3api head-bucket --bucket "$FULL" 2>/dev/null; then
+          echo "  $FULL no existe, skip"; exit 0
+        fi
+        echo "  Vaciando $FULL..."
+        aws s3api delete-objects --bucket "$FULL" \
+          --delete "$(aws s3api list-object-versions --bucket "$FULL" \
+            --query '{Objects: [Versions[].{Key:Key,VersionId:VersionId},DeleteMarkers[].{Key:Key,VersionId:VersionId}][]}' \
+            --max-items 1000)" 2>/dev/null || true
+        echo "  Borrando $FULL..."
+        aws s3 rb "s3://$FULL"
+
+  _delete-tflock:
+    internal: true
+    vars:
+      TABLE: '{{.PROJECT | default "ml-training"}}-tflock'
+    cmds:
+      - |
+        if aws dynamodb describe-table --table-name "{{.TABLE}}" >/dev/null 2>&1; then
+          aws dynamodb delete-table --table-name "{{.TABLE}}" >/dev/null
+          echo "  {{.TABLE}} borrada"
+        else
+          echo "  {{.TABLE}} no existe, skip"
+        fi
+
+  _delete-oidc:
+    internal: true
+    cmds:
+      - |
+        ARN=$(aws iam list-open-id-connect-providers \
+          --query 'OpenIDConnectProviderList[?contains(Arn, `token.actions.githubusercontent.com`)].Arn' \
+          --output text)
+        if [ -z "$ARN" ]; then
+          echo "  OIDC provider no existe, skip"; exit 0
+        fi
+        echo "  Borrando OIDC provider: $ARN"
+        aws iam delete-open-id-connect-provider --open-id-connect-provider-arn "$ARN"
 
   # ═══ Estado ═════════════════════════════════════════════════════════════════
 
@@ -5519,11 +5711,31 @@ su propio `prompt:`, la segunda de `infra:destroy` que invoca por
 dentro. Es intencional: destruir storage versionado es la operacion mas
 peligrosa del runbook, vale la pena un segundo pulse.
 
+**Por que `aws:destroy` hace 4 cosas antes del `terraform destroy`** (en
+vez de delegar todo a Terraform): los buckets con versioning enabled y
+los repos ECR con imagenes adentro **NO se destruyen** con
+`terraform destroy` plain — Terraform marca el recurso para borrado pero
+AWS rechaza con `BucketNotEmpty`/`RepositoryNotEmpty`. Los helpers
+`_empty-bucket` (borra todas las versiones + delete markers) y
+`_purge-ecr` (borra todas las imagenes) hacen el cleanup previo. El
+`cluster:scale-down` drena Batch jobs activos para evitar que el destroy
+del job-queue falle con "queue has running jobs".
+
+**Por que existe `aws:nuke` separado de `aws:destroy`** (y no un flag
+`--nuke` del destroy): son 2 niveles de blast radius muy distintos.
+`destroy` borra lo que el equipo de prod administra (modulos volatiles +
+storage + ECR). `nuke` ademas borra el **backend de Terraform** (bucket
+tfstate + DynamoDB tflock) y el **OIDC provider** que comparten todos
+los repos GitHub de la cuenta — si tenes otros proyectos usando el mismo
+OIDC, los rompes. `nuke` es para tear-down de cuenta entera o demo
+descartable; despues requiere correr `infra:bootstrap` +
+`infra:bootstrap-oidc` desde cero.
+
 ### 4.1.10 Anadir `includes:` al Taskfile raiz + verificacion final
 
-Ahora que los 6 `tasks/*.yml` existen (📖 4.1.4 a 📖 4.1.9), agregar el
-bloque `includes:` al `Taskfile.yml` raiz, **despues de `dotenv:` y
-antes de `vars:`**:
+Ahora que los 7 `tasks/*.yml` existen (📖 4.1.4 a 📖 4.1.9 + 📖 4.1.11),
+agregar el bloque `includes:` al `Taskfile.yml` raiz, **despues de
+`dotenv:` y antes de `vars:`**:
 
 ```yaml
 # === ANADIR despues del bloque dotenv existente ===
@@ -5543,13 +5755,15 @@ includes:
     taskfile: ./tasks/mlflow_registry.yml
   aws:
     taskfile: ./tasks/aws.yml
+  local:
+    taskfile: ./tasks/local.yml
 ```
 
 Verificacion:
 
 ```bash
 # Lista plana de todas las tasks. Deberian aparecer namespaces
-# infra:*, ecr:*, batch:*, cluster:*, mlflow-aws:*, aws:*
+# infra:*, ecr:*, batch:*, cluster:*, mlflow-aws:*, aws:*, local:*
 task --list
 
 # Indice guiado del proyecto (local + AWS)
@@ -5559,8 +5773,118 @@ task
 task --list-all > /dev/null && echo "OK"
 ```
 
-Si `task --list` muestra los 6 namespaces, el setup esta completo. A
+Si `task --list` muestra los 7 namespaces, el setup esta completo. A
 partir de aca, las oleadas A/B/C (📖 4.2 a 📖 4.5) usan estas tasks.
+
+### 4.1.11 `tasks/local.yml` (helpers para desarrollo local que toca AWS)
+
+Este Taskfile es opcional: existe para el flujo "dev local que quiere
+sincronizar artifacts a S3 sin levantar todo Terraform". Si solo entrenas
+en AWS Batch (que ya crea los buckets via `module.storage`), no lo
+necesitas. Sirve cuando:
+
+- Estas iterando un trainer local (`task train` o `python -m src.cli`)
+  y queres que los artifacts (modelos `.joblib`, plots, reports) suban a
+  S3 para verlos desde Reports nginx o para que un colega los levante.
+- Todavia no aplicaste `module.storage` (la cuenta esta vacia) pero
+  queres tener los buckets ya, idempotentemente.
+
+Crear el archivo con este contenido:
+
+```yaml
+# =============================================================================
+# tasks/local.yml  -  Helpers para desarrollo local que toca AWS
+# =============================================================================
+# Incluido por Taskfile.yml raiz con namespace "local:".
+#
+# USO TIPICO:
+#   task local:ensure-buckets        crea data + artifacts S3 si no existen (idempotente)
+#                                    Reusa los nombres de prod ({project}-data-<suffix>),
+#                                    asi un sync local puede compartir bucket con AWS
+#                                    Batch o no, segun como exportes S3_ARTIFACTS_BUCKET.
+#   task local:bucket-name           imprime el nombre completo de un bucket
+#                                    (var: KIND=data|artifacts)
+# =============================================================================
+
+version: "3"
+
+vars:
+  PROJECT: '{{.PROJECT | default "ml-training"}}'
+  REGION:  '{{.AWS_DEFAULT_REGION | default "us-east-1"}}'
+
+tasks:
+
+  ensure-buckets:
+    desc: "Crea S3 buckets data + artifacts si no existen (idempotente). Misma cuenta+region que prod."
+    silent: true
+    vars:
+      SUFFIX:
+        sh: aws sts get-caller-identity --query Account --output text | tail -c 7
+    cmds:
+      - task: _ensure-bucket
+        vars: { NAME: '{{.PROJECT}}-data-{{.SUFFIX}}' }
+      - task: _ensure-bucket
+        vars: { NAME: '{{.PROJECT}}-artifacts-{{.SUFFIX}}' }
+      - 'echo ""'
+      - 'echo "Listo. Para que el trainer local sincronice a estos buckets, exporta:"'
+      - 'echo "  export S3_DATA_BUCKET={{.PROJECT}}-data-{{.SUFFIX}}"'
+      - 'echo "  export S3_ARTIFACTS_BUCKET={{.PROJECT}}-artifacts-{{.SUFFIX}}"'
+
+  bucket-name:
+    desc: "Imprime el nombre del bucket. Var: KIND=data|artifacts (REQ)"
+    silent: true
+    requires:
+      vars: [KIND]
+    vars:
+      SUFFIX:
+        sh: aws sts get-caller-identity --query Account --output text | tail -c 7
+    cmds:
+      - echo "{{.PROJECT}}-{{.KIND}}-{{.SUFFIX}}"
+
+  _ensure-bucket:
+    internal: true
+    silent: true
+    requires:
+      vars: [NAME]
+    cmds:
+      - |
+        if aws s3api head-bucket --bucket "{{.NAME}}" 2>/dev/null; then
+          echo "  {{.NAME}}  EXISTE (reuso)"
+          exit 0
+        fi
+        echo "  {{.NAME}}  no existe -> creando..."
+        # us-east-1 NO acepta --create-bucket-configuration (es default y AWS lo rechaza)
+        if [ "{{.REGION}}" = "us-east-1" ]; then
+          aws s3api create-bucket --bucket "{{.NAME}}" --region {{.REGION}}
+        else
+          aws s3api create-bucket --bucket "{{.NAME}}" --region {{.REGION}} \
+            --create-bucket-configuration LocationConstraint={{.REGION}}
+        fi
+        # Hardening minimo (mismas defaults que el modulo storage de prod)
+        aws s3api put-bucket-versioning --bucket "{{.NAME}}" \
+          --versioning-configuration Status=Enabled
+        aws s3api put-bucket-encryption --bucket "{{.NAME}}" \
+          --server-side-encryption-configuration \
+          '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+        aws s3api put-public-access-block --bucket "{{.NAME}}" \
+          --public-access-block-configuration \
+          'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true'
+        echo "  {{.NAME}}  CREADO (versioning + AES256 + no public)"
+```
+
+**Por que reusa el naming `{project}-{kind}-{suffix6}` de prod**: si el
+modulo `storage` de Terraform ya creo los buckets, el `head-bucket` del
+helper los detecta y hace `EXISTE (reuso)` — sin colisiones ni duplicacion.
+Si la cuenta esta vacia, `ensure-buckets` los crea con las mismas defaults
+(versioning + AES256 + sin acceso publico) que el modulo. La consecuencia:
+el bucket que ves localmente es exactamente el que va a usar `module.storage`
+cuando aplique, sin migracion de datos.
+
+**Por que `local:` y no `aws:setup-local`**: filosofica. El namespace `aws:`
+es para orquestar el stack en la nube (deploy/wake/sleep/destroy); `local:`
+es para tu maquina. Si manana se agregan helpers tipo
+`local:download-latest-model` o `local:sync-data-from-s3`, viven naturalmente
+aca y no pisan el namespace de orquestacion.
 
 ## 4.2 Ola A — apply storage solo
 
@@ -5959,9 +6283,10 @@ aws sns publish \
 
 Esto materializa los comandos que la Parte 1 (Lifecycle) menciono como
 contrato. La implementacion completa de cada task ya se copio inline en
-📖 4.1.4 a 📖 4.1.9 (`tasks/infra.yml`, `tasks/ecr.yml`, `tasks/batch.yml`,
-`tasks/cluster.yml`, `tasks/mlflow_registry.yml`, `tasks/aws.yml`).
-Esta seccion es el **catalogo de uso** de esas tasks ya creadas.
+📖 4.1.4 a 📖 4.1.9 + 📖 4.1.11 (`tasks/infra.yml`, `tasks/ecr.yml`,
+`tasks/batch.yml`, `tasks/cluster.yml`, `tasks/mlflow_registry.yml`,
+`tasks/aws.yml`, `tasks/local.yml`). Esta seccion es el **catalogo de
+uso** de esas tasks ya creadas.
 
 ### 4.7.1 Re-entrenamiento (`task batch:train`)
 
@@ -6134,10 +6459,11 @@ Ver `task --list` para el catalogo completo incluyendo helpers
 > Estado actual:
 > - Infra desplegada en AWS, ALB respondiendo 200.
 > - Smoke test OK (1 job de Batch entreno POP, modelos en MLflow Registry y S3).
-> - 6 archivos `tasks/*.yml` con ~25 tasks AWS expuestas en `task --list`:
+> - 7 archivos `tasks/*.yml` con ~30 tasks AWS expuestas en `task --list`:
 >   `infra:*` (apply/destroy/plan/bootstrap/validate), `ecr:*` (build/build-all/login/list),
->   `batch:*` (train/smoke/status/cancel), `cluster:*` (scale-up/down/teardown/rebuild/wait-healthy),
->   `mlflow-aws:*` (promote/list-versions/current-prod), `aws:*` (deploy/smoke/wake/sleep/teardown/rebuild/destroy/status).
+>   `batch:*` (train/train-lambda/smoke/status/cancel), `cluster:*` (scale-up/down/teardown/rebuild/wait-healthy),
+>   `mlflow-aws:*` (promote/list-versions/current-prod), `aws:*` (deploy/smoke/wake/sleep/teardown/rebuild/destroy/nuke/status),
+>   `local:*` (ensure-buckets/bucket-name).
 > - SNS confirmado (suscripcion email activa).
 >
 > Lo que falta para "produccion completa":
@@ -6149,6 +6475,8 @@ Ver `task --list` para el catalogo completo incluyendo helpers
 > - **Parte 8-12**: runbook extendido, costos, hardening, troubleshooting.
 >
 # Parte 5 — Patch del trainer (emitir MAPE a CloudWatch)
+
+> **STATUS: APLICADO** (auditoria 2026-05-18). El patch esta integrado en `src/orchestration/variety_runner.py` (import + llamada `emit_mape_metric(variety=variety, mape_value=champion.oof_mape)` despues del bloque mape_ok/gap_ok). `trainer_image_tag` bumpeado a `v0.2.0` en `infra/envs/prod/terraform.tfvars`. La proxima vez que rebuiledes con `task ecr:build IMG=trainer` la imagen llevara el patch.
 
 > **Por que este patch es necesario**: el modulo `monitoring` (3.8)
 > creo alarmas que escuchan el namespace `ml-training/Training` con
@@ -6279,6 +6607,8 @@ docker compose run --rm trainer --varieties POP --tuning smoke
 
 ## 5.5 Commit + re-build + push
 
+> **Nota**: esto YA fue aplicado en commit X. Si necesitas RE-publicar la imagen tras cambiar el codigo, segui los pasos abajo.
+
 ```bash
 git add src/utils/cloudwatch_metrics.py src/orchestration/variety_runner.py
 git commit -m "feat(monitoring): emit MAPE custom metric a CloudWatch con dim=variety"
@@ -6345,6 +6675,123 @@ terraform -chdir=infra/envs/prod output gha_deploy_role_arn
 terraform -chdir=infra/envs/prod output gha_train_role_arn
 ```
 
+## 6.0.1 Filosofia: Task = single source of truth
+
+> **Por que esta seccion existe.** Es la diferencia mas grande entre la V1
+> de esta guia y la V2. La V1 tenia toda la logica de CI duplicada dentro
+> de los `.yml` de GitHub Actions (pip install, terraform init con backend
+> config, docker build con tags, etc.). La V2 mueve **toda** esa logica
+> a `Taskfile.yml` + `tasks/*.yml` y los workflows se vuelven "thin":
+> autentican via OIDC, setean `TF_VAR_*` y llaman `task X`.
+
+### La regla
+
+```
+Si `task X` corre OK en tu laptop → corre OK en CI.
+Si rompe en CI → rompe en local con `task X`.
+```
+
+Esto se logra porque **solo existe UNA implementacion** de cada operacion
+(la que vive en Taskfile). Los workflows son envoltorios delgados.
+
+### Anti-patron que evita la V2
+
+```yaml
+# ❌ V1: logica duplicada entre ci.yml y Taskfile
+# .github/workflows/ci.yml
+- run: pip install -r requirements.txt
+- run: ruff check src/ main.py scripts/
+- run: terraform fmt -check -recursive infra/
+
+# Taskfile.yml (otro lugar, misma logica)
+tasks:
+  lint:
+    cmds:
+      - ruff check src/ main.py scripts/
+```
+
+**Problema**: si manana agregas `mypy`, hay que tocar 2 archivos. Y peor:
+un dev que corre `task lint` local NO ve el `terraform fmt` que CI si
+corre → el PR se rompe en CI pero "funcionaba en local".
+
+### El patron correcto (V2)
+
+```yaml
+# ✅ V2: workflow llama a task, task es SoT
+# .github/workflows/ci.yml
+- uses: arduino/setup-task@v2
+- run: task lint           # ← misma cosa que el dev corre local
+- run: task test
+- run: task infra:validate
+
+# Taskfile.yml
+tasks:
+  lint:
+    cmds:
+      - ruff check src/ main.py scripts/
+```
+
+Cambias el linter en `Taskfile.yml` → CI lo hereda en el siguiente run.
+Single source of truth.
+
+### 6.0.1.1 Matriz de decision: Task vs Terraform vs GHA vs Lambda
+
+Cuando agregues una operacion nueva, esta tabla te dice **donde vive la
+implementacion** (no donde se dispara — eso es siempre GHA workflows).
+
+| Operacion | Herramienta | Por que |
+|---|---|---|
+| Crear VPC, RDS, Batch queue, Lambda, alarmas | **Terraform** (`infra/modules/*`) | Declarativo, idempotente, state |
+| Build + push imagen a ECR | **Task** (`task ecr:build-all`) | Imperativo, encadena `docker build` + ECR login + tag dual `latest`/`sha-XXX` |
+| Submit Batch job + polling hasta SUCCEEDED | **Task** (`task batch:train`) | Encadena `lambda invoke` + `jq` + `aws batch describe-jobs` con loop |
+| Apply Terraform en oleadas + smoke | **Task** (`task aws:deploy`) | Orquesta oleadas A+B+C (storage → 3 imagenes → resto) |
+| Wake / sleep RDS+Fargate | **Task** (`task aws:wake`/`aws:sleep`) | `scale-up` + `sleep 300` + `wait-healthy` — Terraform no hace polling, Lambda scheduler si pero esto es operacion manual |
+| Disparar un entreno bajo demanda | **GHA workflow_dispatch** (`train.yml`) | UI con dropdown de variedades + tuning, accesible desde el browser sin AWS CLI |
+| Approval humano antes de deploy o promote | **GHA `environment: production`** | Solo GHA tiene approval gates con reviewers |
+| Cron L-V 08-12 PET para encender/apagar | **EventBridge + Lambda** (`infra/lambdas/scheduler.py`) | Serverless, sin runner; corre aunque no haya devs |
+| Quality gate MAPE + A/B contra Production | **Task** (`task mlflow-aws:promote`) llamado por GHA | Logica Python compleja, reutilizable local (un dev puede correr `task mlflow-aws:promote VARIETY=POP VERSION=5` para validar antes del workflow) |
+| Apagar todo con confirmacion textual | **GHA workflow** (`destroy.yml`) + **Task** (`task aws:teardown` / `aws:destroy`) | Workflow porque la confirmacion textual `DESTRUIR-ML-TRAINING` + approval son features de GHA; pero la **logica** del destroy vive en Task |
+
+### 6.0.1.2 Excepciones (cuando NO meter en Taskfile)
+
+Tres anti-patrones que evitar:
+
+| Anti-patron | Ejemplo | Donde va en su lugar |
+|---|---|---|
+| **Task que solo corre en CI** | `gha:upload-artifact` (artifacts son feature de GHA) | Step inline en el workflow |
+| **Task wrapper trivial de 1 linea** | `docker:build` que es solo `docker build .` | Eliminar (usar `docker build .` directo) |
+| **Logica que deberia ser Terraform** | `infra:create-vpc` con `aws ec2 create-vpc ...` | Modulo Terraform (`infra/modules/network/main.tf`) |
+
+> **Regla concreta**: si un task no (a) encadena >=2 cosas, (b) pasa
+> variables computadas (`{{.SUFFIX}}` resuelto via `aws sts`), o
+> (c) agrega idempotencia/wait/polling — entonces no justifica el namespace
+> y mejor va inline.
+
+### 6.0.1.3 Donde se ve esto en el repo
+
+```
+ml_training/
+├── Taskfile.yml                       ← root: tasks locales (build, train, lint, test)
+├── tasks/
+│   ├── infra.yml                      ← namespace `infra:` (terraform wrapper)
+│   ├── ecr.yml                        ← namespace `ecr:` (build + push 3 imagenes)
+│   ├── batch.yml                      ← namespace `batch:` (submit + tail jobs)
+│   ├── cluster.yml                    ← namespace `cluster:` (scale-up/down RDS+Fargate)
+│   ├── mlflow_registry.yml            ← namespace `mlflow-aws:` (promote modelos)
+│   └── aws.yml                        ← namespace `aws:` (orquestador macro: deploy/wake/sleep/teardown/destroy)
+└── .github/workflows/
+    ├── deploy.yml                     ← consolida ci + terraform-plan + infra-apply (4 jobs: changes, lint-and-test, build-and-push, terraform-plan, infra-apply). Llama `task lint`, `task test`, `task infra:validate`, `task ecr:build`, `task infra:plan`, `task aws:deploy`.
+    ├── training.yml                   ← consolida train + auto-train + promote (jobs: detect, wake-services, train, cool-down-and-stop, promote). Llama `task batch:train-lambda` (mismo path que el dispatcher Lambda) y `task mlflow-aws:promote`.
+    └── destroy.yml                    ← 3 modos: `task aws:teardown` (TEAR-DOWN) | `task aws:destroy` (DESTROY) | `task aws:nuke` (NUKE).
+```
+
+Total: **~670 lineas de Taskfile + tasks/** vs **~645 lineas de los 3
+workflows consolidados** (deploy 244 + training 245 + destroy 156). La
+V1 tenia 6 workflows gordos con logica inline (~1500 lineas) y casi
+nada en Task — la V2 redistribuye: los workflows son thin shells que
+solo orquestan triggers/permisos/concurrency, y la logica real vive
+en Task (ejecutable identico desde laptop o CI).
+
 ## 6.1 Variables y secrets de GitHub
 
 Settings → Secrets and variables → Actions.
@@ -6360,6 +6807,9 @@ Settings → Secrets and variables → Actions.
 | `ECR_TRAINER` | `<account>.dkr.ecr.us-east-1.amazonaws.com/ml-training` |
 | `MLFLOW_ALB_DNS` | (output de terraform: `alb_dns`) |
 | `PROJECT` | `ml-training` |
+| `ALERT_EMAIL` | email para notificaciones SNS (ej. `abantodca@gmail.com`). La usan `deploy.yml` y `destroy.yml` como `TF_VAR_alert_email`. |
+| `CONSUMER_ORG` | org del consumer repo (ej. `abantodca`). Se inyecta como `TF_VAR_consumer_org` y autoriza al repo consumidor (`ml_serving`) a asumir el rol cross-repo de lectura del Model Registry. |
+| `CONSUMER_REPO` | nombre del consumer repo (ej. `ml_serving`). Se inyecta como `TF_VAR_consumer_repo`. Junto con `CONSUMER_ORG` arma el subject `repo:<org>/<repo>:*` del trust policy. |
 
 **Secrets**: ninguno (OIDC remplaza el caso comun de access keys). Si
 en algun workflow necesitas un Slack webhook u otro secret externo,
@@ -6375,562 +6825,450 @@ gh variable set AWS_GHA_TRAIN_ROLE_ARN  -b "$(terraform -chdir=infra/envs/prod o
 gh variable set ECR_TRAINER             -b "$ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/ml-training"
 gh variable set MLFLOW_ALB_DNS          -b "$(terraform -chdir=infra/envs/prod output -raw alb_dns)"
 gh variable set PROJECT                 -b "ml-training"
+gh variable set ALERT_EMAIL             -b "abantodca@gmail.com"
+gh variable set CONSUMER_ORG            -b "abantodca"
+gh variable set CONSUMER_REPO           -b "ml_serving"
 ```
 
-## 6.2 `.github/workflows/ci.yml` — lint + tests + build + push
+> **Importante**: `ALERT_EMAIL`, `CONSUMER_ORG` y `CONSUMER_REPO` deben
+> estar seteadas **antes** del primer run del job `infra-apply` de
+> `deploy.yml`, sino el step `task aws:deploy` falla con
+> `variable "alert_email"/"consumer_org"/"consumer_repo" required value not provided`.
 
-Trigger: push a `main` o PR. Hace: lint (ruff + terraform fmt + task
-syntax check), docker build, push a ECR como `latest` + `sha-<git-sha>`.
+## 6.2 `.github/workflows/deploy.yml` — consolidado (lint/test/build/plan/apply)
 
-> **🖱️ Equivalente en AWS Console — el flujo OIDC paso a paso para ESTE workflow**:
->
-> Cuando este workflow corre, hay 3 lugares de AWS Console donde "ves" la accion sucediendo:
->
-> | Step del workflow | AWS Console | Que ves ahi |
-> |---|---|---|
-> | `aws-actions/configure-aws-credentials@v4` | **🔐 IAM > Roles > ml-training-gha-deploy > Last activity** | Aparece un timestamp "Used 5 minutes ago" con `STS:AssumeRoleWithWebIdentity`. Y en **CloudTrail > Event history** ves el evento `AssumeRoleWithWebIdentity` con `requestParameters.roleArn=ml-training-gha-deploy`, `responseElements.assumedRoleUser.assumedRoleId=<gha-token-id>`. Esto es el "ack" de que el OIDC trust funciono. |
-> | `aws-actions/amazon-ecr-login@v2` | **🐳 ECR > Repositories > ml-training** | Aparece como ultima auth en el panel. En CloudTrail: evento `GetAuthorizationToken`. |
-> | `docker push` | **🐳 ECR > Repositories > ml-training > Images** | Aparece una imagen nueva con 2 tags: `latest` y `sha-abc123def456`. Cada tag pesa ~1-2 GB pero ECR comparte layers, asi que solo paga el delta (~100 MB/push tipico). |
->
-> **🧠 Conceptualmente — `permissions: id-token: write` es la pieza clave**:
-> - Por default, GHA workflows NO tienen permiso de pedir un OIDC JWT a GitHub. Sin esa linea, `configure-aws-credentials` falla con `Error: Could not load credentials from any providers`.
-> - **`contents: read`**: permiso para `actions/checkout`. Sin esto el checkout falla.
-> - **`concurrency`**: si haces 3 push seguidos, solo corre el ultimo. Ahorra ECR builds duplicados. `cancel-in-progress: true` mata el anterior workflow si arrancas uno nuevo (util en PRs donde haces multiple force-push).
-> - **`build-and-push` solo en push a main** (no en PR): controlado por `if: github.event_name == 'push' && github.ref == 'refs/heads/main'`. Un PR corre `lint-and-test` pero NO push a ECR — asi un fork malicioso no puede pushear imagenes a tu ECR aunque pase el CI.
-> - **Por que tageas con `sha-<commit>` Y `latest`**: el `:latest` es lo que el Batch job-def por default pulea (siempre la mas reciente); el `:sha-<commit>` es **inmutable** y te permite hacer rollback explicito (re-deploy de la job-def apuntando a la imagen `sha-abc123`, ver 📖 8.1.4).
+> **Por que esta seccion existe**. La V1 tenia 3 workflows separados
+> (`ci.yml`, `terraform-plan.yml`, `infra-apply.yml`) que repetian
+> checkout, setup-python, configure-aws-credentials, etc. — y obligaban
+> a mantener 3 archivos sincronizados cada vez que cambiabas la version
+> de Terraform o el rol OIDC. La V2 los consolida en un solo `deploy.yml`
+> con 5 jobs condicionales que comparten estado a traves del job
+> `changes` (`dorny/paths-filter@v3`).
+
+Trigger: push a `main`, PR a `main`, o `workflow_dispatch`. Cinco jobs:
+
+| Job | Disparo | Que hace |
+|---|---|---|
+| `changes` | siempre | `dorny/paths-filter@v3` setea outputs `infra` (si toco `infra/**` o el workflow) y `trainer` (si toco `src/**`, `main.py`, `Dockerfile`, `requirements.txt`). |
+| `lint-and-test` | siempre | Mismo job que el V1 `ci.yml`: instala deps y corre `task lint && task test && task infra:validate`. |
+| `build-and-push` | push a `main` **AND** `trainer == 'true'` | Asume `gha-deploy`, llama `task ecr:build IMG=trainer` (build + push a ECR con tag `latest` + `sha-<sha>`). |
+| `terraform-plan` | PR **AND** `infra == 'true'` | Asume `gha-deploy`, corre `task infra:plan` redirigido a `tfplan.txt`, y postea el output (truncado a 60 KB) como comment en el PR via `actions/github-script@v7`. |
+| `infra-apply` | push a `main` **AND** `infra == 'true'` **AND** `lint-and-test == success` **AND** `build-and-push in (success, skipped)` | `environment: production` (approval manual). Llama `task aws:deploy` con `TF_VAR_trainer_image_tag=sha-<sha>` para pinear el trainer recien construido. Publica URLs en el summary. |
+
+**El archivo real vive en `/home/cabanto/proyectos/ml_random_forest/ml_training/.github/workflows/deploy.yml`** — 244 lineas con todos los `steps` detallados, env vars (`TF_VAR_consumer_org`, `TF_VAR_consumer_repo`, `TF_VAR_alert_email`, `TF_VAR_github_org`, `TF_VAR_github_repo`, `TF_VAR_trainer_image_tag`) e `if:` por job. Esta seccion explica el "que/por que"; el "como exacto" esta versionado en el repo.
+
+> **🔄 Aplicacion del patron 6.0.1**: este workflow es **thin** — cada
+> step pesado (lint, test, validate, build, plan, apply) es una
+> llamada a `task X`. La logica vive en `tasks/*.yml` (📖 4.1) y corre
+> identica desde tu laptop. Si queres validar antes de pushear:
+> `task lint && task test && task infra:validate && task infra:plan`.
+
+### 6.2.1 Esqueleto del workflow
+
+Lo que sigue es el **esqueleto** (triggers + nombres de jobs + `if:`),
+no los steps internos. Para el contenido completo, ver el archivo real.
 
 ```yaml
-name: CI
+name: Deploy
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  push:        { branches: [main] }
+  pull_request: { branches: [main] }
   workflow_dispatch: {}
 
 permissions:
-  id-token: write       # requerido para OIDC
-  contents: read
-
-concurrency:
-  group: ci-${{ github.ref }}
-  cancel-in-progress: true
-
-jobs:
-  lint-and-test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.13'
-          cache: 'pip'
-
-      - name: Install deps
-        run: |
-          pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install ruff pytest pytest-cov
-
-      - name: ruff (lint)
-        run: ruff check src/ main.py scripts/
-
-      - name: pytest (si existen tests)
-        run: |
-          if [ -d tests ]; then
-            pytest tests/ --cov=src --cov-report=term-missing
-          else
-            echo "No tests/ dir, skip"
-          fi
-
-      - name: task validate (syntax check de todos los Taskfiles)
-        uses: arduino/setup-task@v2
-        with:
-          version: 3.x
-      - run: task --list-all > /dev/null
-
-      - name: terraform fmt
-        uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: 1.6.6
-      - run: terraform fmt -check -recursive infra/
-
-  build-and-push:
-    needs: lint-and-test
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Assume gha-deploy role via OIDC
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.AWS_GHA_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-
-      - name: ECR login
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Set tag
-        id: tag
-        run: |
-          echo "sha=sha-$(git rev-parse --short=12 HEAD)" >> $GITHUB_OUTPUT
-          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_OUTPUT
-
-      - name: Build trainer image
-        run: |
-          docker build \
-            --build-arg GIT_SHA=$(git rev-parse --short=12 HEAD) \
-            --build-arg BUILD_DATE=${{ steps.tag.outputs.date }} \
-            --build-arg VERSION=${{ steps.tag.outputs.sha }} \
-            -t ${{ vars.ECR_TRAINER }}:latest \
-            -t ${{ vars.ECR_TRAINER }}:${{ steps.tag.outputs.sha }} \
-            -f Dockerfile .
-
-      - name: Push trainer
-        run: |
-          docker push ${{ vars.ECR_TRAINER }}:latest
-          docker push ${{ vars.ECR_TRAINER }}:${{ steps.tag.outputs.sha }}
-
-      - name: Output image tag (for downstream workflows)
-        run: |
-          echo "::notice title=Pushed::${{ vars.ECR_TRAINER }}:${{ steps.tag.outputs.sha }}"
-```
-
-> **Checkpoint despues de pegar 6.2**: hace un push trivial (e.g.,
-> editar README) y validar que el workflow corre verde:
->
-> ```bash
-> git commit --allow-empty -m "test: trigger ci.yml"
-> git push origin main
-> gh run list --workflow=ci.yml --limit 1
-> # Esperado: status=completed, conclusion=success
-> ```
->
-> Si el workflow falla en "Assume gha-deploy role", el `gh variable
-> set AWS_GHA_DEPLOY_ROLE_ARN` de 📖 6.1 no se ejecuto o el ARN es
-> incorrecto. Corregir antes de pasar a 📖 6.3.
-
-## 6.3 `.github/workflows/terraform-plan.yml` — validar PRs de infra
-
-Cuando un PR toca `infra/**`, corre `terraform plan` y lo postea como
-comment al PR.
-
-> **🖱️ Equivalente en AWS Console — que sucede cuando GHA corre este workflow**:
->
-> | Step del workflow | AWS Console / GitHub | Que ves ahi |
-> |---|---|---|
-> | `configure-aws-credentials` con `gha-deploy` role | **🔐 IAM > Roles > ml-training-gha-deploy** | "Last activity" timestamp. Aunque sea PLAN (read-only conceptualmente), Terraform necesita el rol `gha-deploy` porque hace `s3:GetObject` sobre el state file en `s3://ml-training-tfstate-*`. **El plan en si NO modifica nada en AWS** — solo lee state + refresca recursos para comparar. |
-> | `terraform init` | **🗄️ S3 > ml-training-tfstate-XXXXXX > envs/prod/terraform.tfstate** | Aparece en CloudTrail un `GetObject` sobre `envs/prod/terraform.tfstate`. Y un `GetItem` sobre la tabla DynamoDB `ml-training-tflock` (chequeo si alguien tiene lock activo). |
-> | `terraform plan` | **🔍 CloudTrail > Event history** (filtro: Read events) | Una rafaga de `DescribeXxx` events: `DescribeInstances`, `DescribeDBInstances`, `GetBucketVersioning`, etc. Terraform refresca el state real (lo que existe en AWS) y lo compara con el state file + tu codigo nuevo. **No genera ningun cambio**. |
-> | `actions/github-script` comment | **GitHub > PR > Conversation** | Aparece un comment con `### Terraform plan` y el output dentro de un code fence. El reviewer puede leer "voy a crear/borrar/modificar X". |
->
-> **🧠 Conceptualmente — por que plan y NO apply en PR**:
-> - **`plan` es read-only** → 0 riesgo de romper algo. **`apply` es destructivo** → puede borrar tu RDS.
-> - Esta separacion permite el flujo: PR → reviewer mira el plan → si esta OK, mergea a main → `ci.yml` o un workflow apply-on-merge corre el apply. Asi el apply pasa por code review.
-> - **`continue-on-error: true` en el plan step**: si plan falla (ej. error sintactico), queremos POSTEAR el error al PR (no abortar antes). Despues el step "Fail si plan fallo" hace el exit-code rejection para que el status check rojo bloquee el merge (por branch protection).
-> - **`pull-requests: write` permission**: necesario para `actions/github-script` que postea el comment. Sin esto el script falla con 403.
-
-```yaml
-name: Terraform plan
-
-on:
-  pull_request:
-    paths:
-      - 'infra/**'
-      - '.github/workflows/terraform-plan.yml'
-
-permissions:
   id-token: write
   contents: read
-  pull-requests: write
+  pull-requests: write     # necesario para que terraform-plan comente en PRs
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  plan:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Assume gha-deploy role
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.AWS_GHA_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-
-      - uses: hashicorp/setup-terraform@v3
-        with:
-          terraform_version: 1.6.6
-
-      - name: terraform init
-        working-directory: infra/envs/prod
-        env:
-          # Exportamos como env vars para que bash haga el slice
-          # `${VAR: -6}` sobre un nombre de variable real (no se puede
-          # hacer slice sobre el literal expandido de ${{ vars.X }}).
-          AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
-          PROJECT: ${{ vars.PROJECT }}
-          AWS_REGION: ${{ vars.AWS_REGION }}
-        run: |
-          ACCOUNT_SUFFIX="${AWS_ACCOUNT_ID: -6}"
-          terraform init \
-            -backend-config="bucket=${PROJECT}-tfstate-${ACCOUNT_SUFFIX}" \
-            -backend-config="key=envs/prod/terraform.tfstate" \
-            -backend-config="region=${AWS_REGION}" \
-            -backend-config="dynamodb_table=${PROJECT}-tflock"
-
-      - name: terraform validate
-        working-directory: infra/envs/prod
-        run: terraform validate
-
-      - name: terraform plan
-        id: plan
-        working-directory: infra/envs/prod
-        run: terraform plan -no-color -out=tfplan
-        continue-on-error: true
-
-      - name: Comment plan en el PR
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const output = `### Terraform plan
-            \`\`\`
-            ${{ steps.plan.outputs.stdout }}
-            \`\`\`
-            *exit code: ${{ steps.plan.outcome }}*`;
-            github.rest.issues.createComment({
-              issue_number: context.issue.number,
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              body: output
-            });
-
-      - name: Fail si plan fallo
-        if: steps.plan.outcome == 'failure'
-        run: exit 1
+  changes:                # dorny/paths-filter@v3 -> outputs.infra / outputs.trainer
+  lint-and-test:          # siempre
+  build-and-push:
+    needs: [lint-and-test, changes]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.trainer == 'true'
+  terraform-plan:
+    needs: [lint-and-test, changes]
+    if: github.event_name == 'pull_request' && needs.changes.outputs.infra == 'true'
+  infra-apply:
+    needs: [lint-and-test, changes, build-and-push]
+    environment: production
+    if: |
+      always() &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.lint-and-test.result == 'success' &&
+      (needs.build-and-push.result == 'success' || needs.build-and-push.result == 'skipped') &&
+      needs.changes.outputs.infra == 'true'
 ```
 
-> **Checkpoint despues de pegar 6.3**: abre un PR que toque
-> `infra/envs/prod/variables.tf` (cambio trivial, e.g., agregar un
-> comentario) y verifica que el workflow corre y postea el plan
-> como comment:
+> **🧠 Por que `if: always()` en `infra-apply`**: el job depende de
+> `build-and-push`, pero ese job puede haber sido **skipped** (si el
+> push no toco el trainer). Sin `always()`, el motor de GHA marca
+> `infra-apply` como `skipped` automaticamente. Con `always()` + el
+> check explicito `(success || skipped)` en el `if:`, el apply corre
+> aunque solo cambie infra sin tocar el trainer.
+
+> **🧠 Por que `cancel-in-progress` es condicional**: en PRs queremos
+> cancelar runs viejos cuando se hacen force-push (ahorra CI minutes).
+> En push a main NO queremos cancelar — un apply a medias deja state
+> inconsistente. El `if: github.event_name == 'pull_request'` resuelve
+> ambos casos sin necesidad de dos workflows separados.
+
+> **🧠 Inyeccion de consumer org/repo**: los jobs `terraform-plan` e
+> `infra-apply` exportan `TF_VAR_consumer_org` y `TF_VAR_consumer_repo`
+> desde `vars.CONSUMER_ORG` y `vars.CONSUMER_REPO` (📖 6.1). Sin esas
+> dos vars seteadas en GitHub, Terraform falla con
+> `variable "consumer_org" required value not provided` y el deploy
+> aborta antes de tocar AWS. El subject final del trust cross-repo
+> (`repo:<org>/<repo>:*`) se arma en el modulo `cicd` (📖 3.11).
+
+> **🖱️ Equivalente en AWS Console — que ve cada job en AWS**:
+>
+> | Job | AWS Console | Que aparece |
+> |---|---|---|
+> | `build-and-push` (push main) | **🐳 ECR > Repositories > ml-training > Images** | Imagen nueva con 2 tags (`latest` + `sha-abc123def456`). En CloudTrail: `STS:AssumeRoleWithWebIdentity` + `GetAuthorizationToken` + `PutImage`. |
+> | `terraform-plan` (PR) | **🔍 CloudTrail > Event history** | Rafaga de `DescribeXxx` (read-only). Y un `GetObject` sobre `s3://ml-training-tfstate-*/envs/prod/terraform.tfstate` + `GetItem` sobre la tabla DynamoDB `ml-training-tflock`. **No modifica nada**. |
+> | `infra-apply` (push main, approved) | **🌐 VPC + 🗄️ RDS + 🐳 ECS + ⚙️ Batch + λ Lambda** | El despliegue completo (oleadas A+B+C de `task aws:deploy`). Tipicamente 60-90 recursos creados/modificados, mas las 3 imagenes pusheadas en oleada B (`ml-training`, `ml-training-mlflow`, `ml-training-reports`). |
+> | Approval `environment: production` | **GitHub > Actions > run > "Waiting for review"** | El reviewer recibe email + ve "Review deployments" en la UI. Hasta que clickees "Approve and deploy", el job NO arranca — es la salvaguarda humana antes de tocar prod. |
+
+> **Configuracion previa en GitHub** (UNA sola vez):
+>
+> 1. **Settings → Environments → New environment → `production`**
+> 2. Marca **Required reviewers** → agregate
+> 3. (Opcional) **Deployment branches and tags** → "Selected branches" → `main`
+>
+> Sin esto, el job `infra-apply` arranca sin approval y derrota el
+> proposito de la gate.
+
+> **Checkpoint despues de 6.2**: hace un push trivial a `main` que NO
+> toque ni `infra/**` ni el trainer (e.g., editar este `.md`) y valida
+> que solo corre `lint-and-test`:
 >
 > ```bash
-> gh run list --workflow=terraform-plan.yml --limit 1
+> git commit --allow-empty -m "test: trigger deploy.yml"
+> git push origin main
+> gh run list --workflow=deploy.yml --limit 1
 > # Esperado: status=completed, conclusion=success
-> gh pr view <PR#> --comments
-> # Esperado: comment con el plan terraform como hidden details
+> # En la UI: solo lint-and-test verde. build-and-push, terraform-plan, infra-apply skipped.
 > ```
-
-## 6.4 `.github/workflows/train.yml` — entrenar desde la UI de GitHub
-
-Workflow_dispatch con inputs (variety + tuning). Wakea servicios si
-estan apagados, submitea el job, espera completion, y apaga si los
-wakeo el mismo workflow.
-
-> **🖱️ Equivalente en AWS Console — la cadena de eventos al apretar "Run workflow"**:
 >
-> | Step del workflow | AWS Console | Que ves ahi |
-> |---|---|---|
-> | `configure-aws-credentials` con `gha-train` role | **🔐 IAM > Roles > ml-training-gha-train > Last activity** | Aparece la asuncion del rol. NOTA: este rol es **mucho mas chico** que `gha-deploy` — solo puede invocar el dispatcher Lambda + leer logs. No puede ni hacer apply terraform ni pushear ECR. |
-> | `aws lambda invoke --function-name ml-training-dispatcher` | **λ Lambda > Functions > ml-training-dispatcher > Monitor > Recent invocations** | Aparece una nueva invocacion con timestamp actual. Si haces click ves: input (`{"varieties": "POP", "tuning": "prod"}`), output (`{"statusCode": 200, "body": {"jobId": "abc-123-...", "queue": "ml-training-job-queue-spot"}}`), duration, memory used. |
-> | `aws batch describe-jobs --jobs <jobId>` (en el loop de polling) | **⚙️ AWS Batch > Jobs** | Aparece el job nuevo con status progresion: `SUBMITTED → PENDING → RUNNABLE → STARTING → RUNNING → SUCCEEDED`. Si haces click, ves: imagen ECR usada, command override (`--varieties POP --tuning prod`), env vars, log stream link. |
-> | (Durante RUNNING) | **🖥️ EC2 > Instances** | Aparece UNA EC2 nueva tipo `c6i.2xlarge` con tag `Name=ml-training-batch-spot`. Es la que Batch arranco por demanda. Cuando termine el job, en ~5 min Batch la apaga automaticamente. |
-> | (Durante RUNNING) | **📊 CloudWatch > Log groups > /aws/batch/ml-training > Log streams** | Aparece un stream nuevo (`trainer/default/abc-123`). Adentro ves los `print()` de `main.py` en tiempo real — util para debug live. |
->
-> **🧠 Conceptualmente — por que un dispatcher Lambda en vez de `aws batch submit-job` directo**:
-> - El workflow podria hacer `aws batch submit-job` directo (con el role `gha-train` teniendo `batch:SubmitJob`). PERO eso requeriria que el role tenga permiso de submitir CUALQUIER job-def con CUALQUIER override → blast radius enorme si alguien comprometiera el role.
-> - **Con dispatcher**: el role `gha-train` SOLO tiene `lambda:InvokeFunction` sobre `ml-training-dispatcher`. El dispatcher (`infra/lambdas/dispatcher.py`) valida payload (varieties whitelist, tuning whitelist, s3_data_key regex) ANTES de submitir. Un atacante que comprometa `gha-train` solo puede submitir jobs validos.
-> - **`workflow_dispatch` con `inputs`**: GitHub te da un formulario en la UI (Actions → Train → Run workflow → fields). Util para personas que no usan AWS CLI.
-> - **`concurrency: train-${{ inputs.varieties }}`**: si lanzas 2 trainings de POP en paralelo, el segundo espera al primero. No queremos correr 2 trainings de la misma variedad simultaneo (resultados confusos).
+> Para validar `infra-apply` end-to-end, dispara el workflow manualmente
+> via `gh workflow run deploy.yml` desde `main` (corre lint + apply con
+> approval). Si todo OK, ves los outputs (`alb_dns`, `tracking_uri`,
+> ...) en el summary.
+
+## 6.3 `terraform-plan.yml` (eliminado)
+
+> **§6.3 (terraform-plan.yml) eliminado**: ahora es un job dentro de
+> `deploy.yml` (`terraform-plan`) que solo corre en PRs con cambios a
+> `infra/**`. Comenta el output del plan en el PR via
+> `actions/github-script@v7`. La logica que antes vivia aqui
+> (terraform init/validate/plan + comment al PR) ahora vive en
+> `task infra:plan` + el step `Comentar plan en el PR` del workflow
+> consolidado. Ver 📖 6.2.
+
+## 6.3.5 `infra-apply.yml` (eliminado)
+
+> **§6.3.5 (infra-apply.yml) eliminado**: ahora es un job dentro de
+> `deploy.yml` (`infra-apply`) que solo corre en push a `main` con
+> cambios a `infra/**` y requiere approval del environment
+> `production`. Llama `task aws:deploy` con el mismo
+> `TF_VAR_trainer_image_tag=sha-<sha>` que pinea la imagen recien
+> pusheada por el job `build-and-push`. Ver 📖 6.2.
+
+## 6.4 `.github/workflows/training.yml` — consolidado (train + auto-train + promote)
+
+> **Por que esta seccion existe**. La V1 tenia 3 workflows
+> superpuestos: `train.yml` (manual desde la UI), `auto-train-on-push.yml`
+> (auto-train cuando un push tocaba el trainer) y `promote.yml`
+> (transition a Production con gates). Los 3 compartian wake/cool-down,
+> autenticacion OIDC y conocimiento del Registry — y se desincronizaban
+> facil. La V2 los consolida en un solo `training.yml` con un job
+> `detect` que decide el modo segun el trigger.
+
+Trigger: `workflow_dispatch` (UI manual) **o** `workflow_run` cuando
+`Deploy` completa con success (auto-train). Cinco jobs:
+
+| Job | Disparo | Que hace |
+|---|---|---|
+| `detect` | siempre | Decide el modo. Si `workflow_dispatch`: usa `inputs.action` (`train` o `promote`). Si `workflow_run`: hace `git diff` entre el SHA del push y el anterior — si toco `src/**`, `main.py` o `Dockerfile`, setea `mode=train` con `varieties=all, tuning=prod`; si no, `mode=skip`. |
+| `wake-services` | `mode == 'train'` | Asume `gha-train`, hace `curl /health` al ALB de MLflow. Si DOWN, invoca `${PROJECT}-scheduler` Lambda con `{"action":"start"}` y espera hasta 12 min a que RDS este `available` y 5 min a que MLflow responda 200. Outputs `mlflow_was_up` (`true`/`false`) para que cool-down sepa si apagar. |
+| `train` | `mode == 'train'` | Asume `gha-train`, llama `task batch:train-lambda VARIETIES=... TUNING=... WAIT=true`. **Importante**: usa el MISMO path que el dispatcher Lambda invoca — no hace `aws batch submit-job` directo. Asi un dev local con `task batch:train-lambda` ejecuta IDENTICO el camino. |
+| `cool-down-and-stop` | `mode == 'train'` **AND** `wake-services.outputs.mlflow_was_up == 'false'` | Espera 10 min (cool-down para sync S3 + dashboards), luego invoca `${PROJECT}-scheduler` con `{"action":"stop"}`. **Solo apaga si nosotros lo levantamos** — si MLflow ya estaba UP, no lo apaga. |
+| `promote` | `mode == 'promote'` | `environment: production` (approval manual). Asume `gha-train`, llama `task mlflow-aws:promote MODEL_NAME=... VERSION=... MAX_MAPE=...`. Los 3 gates (MAPE absoluto + A/B vs Production actual + transition con `archive_existing_versions=True`) viven adentro de la task — corre identico en local. |
+
+**El archivo real vive en `/home/cabanto/proyectos/ml_random_forest/ml_training/.github/workflows/training.yml`** — 245 lineas con todos los `steps`, los polling loops de RDS+ALB, el `git diff` del detect, y los env vars. Esta seccion explica el "que/por que".
+
+> **🔄 Aplicacion del patron 6.0.1**: el job `train` es **literalmente
+> una linea**: `task batch:train-lambda VARIETIES=... TUNING=...
+> WAIT=true`. La logica de submitir via dispatcher Lambda + polling +
+> log streaming vive en `tasks/batch.yml`. El job `promote` es
+> similar: `task mlflow-aws:promote ...` — los 3 gates viven en
+> `tasks/mlflow_registry.yml`. Sin esto, los workflows V1 duplicaban
+> la logica en Python embebido y se rompian en cada bump de mlflow.
+
+### 6.4.1 Esqueleto del workflow
 
 ```yaml
-name: Train
+name: Training
 
 on:
   workflow_dispatch:
     inputs:
-      varieties:
-        description: 'Variedades CSV o "all"'
-        required: true
-        default: 'POP'
-        type: string
-      tuning:
-        description: 'Profile'
-        required: true
-        default: 'prod'
-        type: choice
-        options: [smoke, dev, prod, prod_xl]
-      wait:
-        description: 'Esperar hasta SUCCEEDED/FAILED'
-        required: false
-        default: true
-        type: boolean
+      action:     { type: choice, options: [train, promote], default: train }
+      # inputs de action=train (se ignoran si action=promote)
+      varieties:  { type: string, default: 'all' }
+      tuning:     { type: choice, options: [smoke, dev, prod, prod_xl], default: prod }
+      # inputs de action=promote (se ignoran si action=train)
+      model_name: { type: string }
+      version:    { type: string }
+      max_mape:   { type: string, default: '20' }
+
+  workflow_run:                       # auto-train post-deploy
+    workflows: ["Deploy"]
+    types: [completed]
+    branches: [main]
 
 permissions:
   id-token: write
   contents: read
 
 concurrency:
-  # `inputs.X` (estilo nuevo) y `github.event.inputs.X` (estilo legacy)
-  # apuntan al mismo valor en workflow_dispatch. Unificado a inputs.X
-  # en todo este workflow.
-  group: train-${{ inputs.varieties }}
+  group: training-${{ github.event.inputs.action || 'auto' }}
   cancel-in-progress: false
 
 jobs:
-  train:
-    runs-on: ubuntu-latest
-    timeout-minutes: 480     # 8h (matchea job_attempt_seconds)
-    steps:
-      - name: Assume gha-train role
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.AWS_GHA_TRAIN_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-
-      - name: Check MLflow up
-        id: check
-        run: |
-          if curl -fs -o /dev/null --max-time 5 http://${{ vars.MLFLOW_ALB_DNS }}/health; then
-            echo "needs_wake=false" >> $GITHUB_OUTPUT
-            echo "::notice::MLflow up, skip wake"
-          else
-            echo "needs_wake=true" >> $GITHUB_OUTPUT
-            echo "::notice::MLflow down, vamos a wake"
-          fi
-        continue-on-error: true
-
-      # NOTA: requeriria gha-deploy role para invocar scheduler. Como simplificacion,
-      # asumimos que el cron L-V 08-12 esta encendido o el user wakeo a mano via
-      # task aws:wake. Para wake automatico via workflow, ver oleada 5.
-
-      - name: Submit job via dispatcher
-        id: submit
-        run: |
-          PAYLOAD=$(jq -nc \
-            --arg v "${{ inputs.varieties }}" \
-            --arg t "${{ inputs.tuning }}" \
-            '{varieties: $v, tuning: $t}')
-          aws lambda invoke \
-            --function-name ${{ vars.PROJECT }}-dispatcher \
-            --cli-binary-format raw-in-base64-out \
-            --payload "$PAYLOAD" \
-            /tmp/out.json \
-            --query 'StatusCode' --output text
-          cat /tmp/out.json
-          JOB_ID=$(jq -r '.body.jobId' /tmp/out.json)
-          echo "job_id=$JOB_ID" >> $GITHUB_OUTPUT
-          echo "::notice title=Submitted::jobId=$JOB_ID"
-
-      - name: Wait for completion
-        if: ${{ inputs.wait }}
-        run: |
-          JOB_ID=${{ steps.submit.outputs.job_id }}
-          while true; do
-            STATUS=$(aws batch describe-jobs --jobs $JOB_ID \
-                     --query 'jobs[0].status' --output text)
-            echo "$(date -u): $STATUS"
-            if [[ "$STATUS" == "SUCCEEDED" ]]; then
-              echo "::notice title=Done::SUCCEEDED"
-              exit 0
-            fi
-            if [[ "$STATUS" == "FAILED" ]]; then
-              echo "::error title=Failed::Batch job FAILED"
-              exit 1
-            fi
-            sleep 30
-          done
+  detect:                             # decide mode=train|promote|skip
+  wake-services:                      # if: mode == 'train'  -> outputs.mlflow_was_up
+  train:                              # if: mode == 'train'  -> task batch:train-lambda
+  cool-down-and-stop:                 # if: mode == 'train' && was_up == 'false' -> scheduler.stop
+  promote:                            # if: mode == 'promote' -> task mlflow-aws:promote + env=production
 ```
 
-Uso desde GitHub UI:
+> **🧠 Por que el job `train` NO hace `aws batch submit-job` directo**:
+> seguridad. El rol `gha-train` SOLO tiene `lambda:InvokeFunction` sobre
+> `${PROJECT}-dispatcher` (y `scheduler`). Si el job hiciera submit
+> directo, el rol necesitaria `batch:SubmitJob` con resource `*` (no
+> hay forma de scopear a una job-def especifica con overrides). Con
+> el dispatcher en el medio, la validacion de payload (varieties
+> whitelist, tuning whitelist, s3 key regex) vive en Lambda (📖 5.x).
 
-1. Actions → Train → Run workflow
-2. Variety: `POP`
-3. Tuning: `prod`
-4. Wait: true (default)
-5. Run workflow
+> **🧠 Por que `workflow_run on Deploy success`**: cuando un push a
+> main toca el trainer, `Deploy` corre `build-and-push` (nueva imagen
+> en ECR) + `infra-apply` (apunta job-def a `sha-<commit>`). Si esa
+> cadena fue exitosa, queremos auto-entrenar para validar la nueva
+> imagen. El `detect` filtra: solo dispara si el push toco
+> `src/**|main.py|Dockerfile`. Cambios solo a `infra/**` o docs NO
+> disparan auto-train (no cambia comportamiento del modelo).
 
-GitHub Actions te muestra el log en tiempo real y `::notice` con el
-jobId. Si elegis `wait=false`, retorna inmediatamente con el jobId y
-podes verlo en CloudWatch.
+> **🧠 Por que cool-down condicional (`was_up == 'false'`)**: si un
+> humano ya prendio MLflow para mirar dashboards y dispara un train
+> manual desde la UI, NO queremos que el workflow lo apague al
+> terminar. Solo apaga si nosotros lo prendimos. El output
+> `mlflow_was_up` del job `wake-services` es la senal.
 
-> **Checkpoint despues de 6.4**: invoca el workflow desde la UI con
-> `varieties=POP, tuning=smoke, wait=false` y valida que el dispatcher
-> recibe el invoke:
+> **🖱️ Equivalente en AWS Console — la cadena de eventos**:
+>
+> | Job | AWS Console | Que aparece |
+> |---|---|---|
+> | `wake-services` (si DOWN) | **λ Lambda > Functions > ml-training-scheduler > Monitor** | Invocacion con payload `{"action":"start"}`. CloudTrail muestra el resultado: `modify-db-instance` (RDS) + `update-service` (ECS Fargate). |
+> | (durante wake polling) | **🗄️ RDS > Databases > ml-training-mlflow** | Status: `starting` -> `available` (~5-8 min). El workflow hace polling cada 30s hasta 12 min. |
+> | `train` (`task batch:train-lambda`) | **λ Lambda > ml-training-dispatcher > Monitor > Recent invocations** | Aparece invocacion nueva con input `{"varieties":"...","tuning":"..."}` y output con `jobId`. |
+> | `train` (durante run) | **⚙️ Batch > Jobs** | Job pasa `SUBMITTED -> RUNNABLE -> STARTING -> RUNNING -> SUCCEEDED`. EC2 Spot c6i.2xlarge se levanta y se apaga sola en ~5 min post-job. |
+> | `cool-down-and-stop` (si was_up=false) | **λ Lambda > ml-training-scheduler** | Invocacion con `{"action":"stop"}`. Tras eso: RDS `stopping`, Fargate services `desiredCount=0`. |
+> | `promote` | **🌐 ALB > MLflow UI > Models > ml-training-POP** | Badge "Production" se mueve a la version nueva. La anterior va a Archived. RDS recibe UPDATE sobre tabla `model_versions`. |
+
+Uso desde la UI:
+
+1. Actions → Training → Run workflow
+2. **Para entrenar**: `action=train`, `varieties=POP` (o `all`),
+   `tuning=prod` (o `smoke` para validar end-to-end rapido).
+3. **Para promover**: `action=promote`, `model_name=rnd-forest-POP`,
+   `version=5`, `max_mape=20`. Espera el "Waiting for review" y aproba.
+
+> **Checkpoint despues de 6.4**: corre un smoke training y verifica
+> que el dispatcher recibe el invoke:
 >
 > ```bash
-> gh workflow run train.yml -f varieties=POP -f tuning=smoke -f wait=false
-> gh run list --workflow=train.yml --limit 1
-> # Esperado: status=completed (wait=false termina en <30s)
+> gh workflow run training.yml -f action=train -f varieties=POP -f tuning=smoke
+> gh run list --workflow=training.yml --limit 1
+> # Esperado: wake-services (skip si MLflow up) -> train (SUCCEEDED) -> cool-down (skip si was_up)
 > aws logs tail /aws/lambda/ml-training-dispatcher --since 5m
-> # Esperado: log con "SubmitJob OK" y el jobId del Batch
+> # Esperado: log con SubmitJob OK + jobId del Batch
 > ```
 
-## 6.5 `.github/workflows/promote.yml` — Production transition con gate
+## 6.5 `promote.yml` (eliminado)
 
-> **🖱️ Equivalente en AWS Console — promote NO toca AWS, solo MLflow + GitHub Environments**:
->
-> Este workflow es **especial**: NO crea/borra recursos AWS. Solo:
-> 1. Asume `gha-train` role (necesario para que la red interna llegue al ALB).
-> 2. Llama al MLflow REST API via Python client (`mlflow.tracking.MlflowClient.transition_model_version_stage(...)`).
-> 3. MLflow update-ea su DB Postgres (RDS) cambiando el stage del model version de `Staging` a `Production`.
->
-> | Step del workflow | Donde se ve | Que ves |
-> |---|---|---|
-> | `environment: production` | **GitHub > Repo > Settings > Environments > production** | Configurado con "Required reviewers" → vos. Cuando alguien dispara el workflow, GHA pausa en este job y manda mail/notif "Approval required: promote.yml". Hasta que clickees "Approve and deploy", el job no arranca. |
-> | `MlflowClient.get_model_version(...)` | **🌐 ALB > MLflow UI > Models > ml-training-POP > Version N** | Lee metadata: run_id, source artifacts path en S3, current_stage. |
-> | Quality gate (MAPE check) | **🌐 MLflow UI > Experiments > POP > Run <run_id> > Metrics** | Compara `mape_oof` < threshold. Si falla, el workflow exitea y NO promueve. |
-> | A/B vs Production actual | **🌐 MLflow UI > Models > ml-training-POP > Stage=Production** | Compara MAPE del candidato vs MAPE del Production actual. El candidato debe ser **estrictamente mejor**. |
-> | `transition_model_version_stage(stage="Production", archive_existing_versions=True)` | **🌐 MLflow UI > Models > ml-training-POP** | El badge "Production" se mueve a la version nueva. La anterior va a "Archived" automatico. En RDS, esto es un UPDATE sobre tabla `model_versions` SET stage='Production' WHERE name='ml-training-POP' AND version=<N>. |
->
-> **🧠 Conceptualmente — por que un Quality Gate manual es tan importante**:
-> - Sin gate: cualquier training nuevo se vuelve Production automatico → un mal training rompe el sistema downstream (FastAPI/Streamlit que carga `stages=["Production"]`).
-> - Con gate de 3 capas:
->   1. **Threshold absoluto**: MAPE candidato < 20% (configurable).
->   2. **A/B contra incumbent**: candidato debe ser MEJOR que el Production actual. Evita "regression silenciosa" (un training que pasa el threshold absoluto pero es peor que el anterior).
->   3. **Approval humano** (GitHub Environment): un revisor mira metrics + dashboards + decide. La ultima linea de defensa contra "el codigo dice OK pero el dataset cambio raro".
-> - **`environment: production`** y "Required reviewers" en GitHub Settings es lo que hace que el approval sea **bloqueante** — sin esto el workflow corre sin pausa.
-> - **`archive_existing_versions=True`**: cuando promueves v5 a Production, MLflow mueve la v4 (que estaba en Production) a `Archived` automaticamente. Asi siempre hay UNA sola version en Production. Si necesitas rollback, transition la archived de vuelta a Production.
+> **§6.5 (promote.yml) eliminado**: ahora es un job dentro de
+> `training.yml` (`promote`, disparado con `inputs.action=promote`).
+> Usa `task mlflow-aws:promote MODEL_NAME=... VERSION=...
+> MAX_MAPE=...` que aplica los 3 gates (MAPE absoluto + A/B vs
+> Production actual + transition con `archive_existing_versions=True`)
+> identicos a la version V1 — pero ahora la logica vive en
+> `tasks/mlflow_registry.yml` y corre identica en local con
+> `task mlflow-aws:promote ...`. El `environment: production` sigue
+> requiriendo approval manual. Ver 📖 6.4.
+
+## 6.5.5 `.github/workflows/destroy.yml` — 3 modos (TEAR-DOWN / DESTROY / NUKE)
+
+> **Por que esta seccion existe**. Los modos de apagado de
+> 📖 Parte 1 son operaciones de runbook que la V1 corria a mano via
+> `terraform destroy`. Eso tiene dos problemas: (a) si tu laptop no
+> tiene credenciales o estas en vacaciones, nadie puede apagar la
+> infra (sigue facturando), y (b) un `terraform destroy` accidental
+> en la terminal equivocada borra prod sin manera de revertirlo.
+> `destroy.yml` resuelve ambos: corre desde GitHub UI con **doble
+> salvaguarda** y ahora soporta **3 modos** segun cuanto querras
+> destruir.
+
+Trigger: **solo `workflow_dispatch`** (nunca automatico). Inputs:
+
+- `confirmar`: texto literal `DESTRUIR-ML-TRAINING` (sin match exacto el job se skipea).
+- `modo`: choice — `TEAR-DOWN` | `DESTROY` | `NUKE`.
+
+| Modo | Que destruye | Que preserva | Reversible con |
+|---|---|---|---|
+| **TEAR-DOWN** | Modulos volatiles: `mlflow`, `reports`, `batch`, `lambdas`, `monitoring`, `scheduler`. ECS services a 0, Batch compute envs a 0, RDS detenido. | **S3** (artifacts + data + tfstate), **ECR** (las 3 imagenes), **network** (VPC/subnets/NAT), **OIDC provider**, **modulo `cicd`** (roles + variables). | `task aws:rebuild` (~20 min, modelos intactos). Costo restante: ~$8/mes (S3). |
+| **DESTROY** | `terraform destroy` de **TODOS** los modulos administrados (incluido `storage`). Borra buckets de artifacts/data + ECR repos + RDS + VPC + ALB. La task `aws:destroy` ahora vacia buckets con versioning y purga repos ECR ANTES del `terraform destroy` (sino TF falla con `BucketNotEmpty` / `RepositoryHasImages`). | **tfstate bucket** + **tflock DynamoDB** + **OIDC provider** (los recursos de bootstrap). | Re-crear todo via `task aws:deploy` (oleadas A+B+C). Costo: $0/mes. |
+| **NUKE** | **DESTROY** + borra el tfstate bucket + tflock DynamoDB + OIDC provider de IAM. Limpieza total de la cuenta. | Nada del proyecto. | Necesitas re-bootstrap desde cero (📖 Parte 2). |
+
+**El archivo real vive en `/home/cabanto/proyectos/ml_random_forest/ml_training/.github/workflows/destroy.yml`** — 156 lineas con la doble salvaguarda, los 3 steps condicionales (`if: ${{ inputs.modo == 'X' }}`), el cleanup de log groups de Lambda (solo si modo != TEAR-DOWN), y la verificacion post-operacion (EC2 + RDS + Fargate + ALB + ECR + S3 + OIDC provider).
+
+> **🔄 Aplicacion del patron 6.0.1**: cada modo es **una sola linea**:
+> `task --yes aws:teardown`, `task --yes aws:destroy`, `task --yes aws:nuke`.
+> El `--yes` auto-confirma el `prompt:` interactivo del Taskfile (que
+> sigue valido en local cuando corres la task desde tu laptop).
+
+### 6.5.5.1 Doble salvaguarda contra accidentes
+
+```
+┌─ Salvaguarda 1: input textual ────────────────────────────┐
+│                                                           │
+│  El campo "confirmar" requiere escribir literalmente:     │
+│                                                           │
+│     DESTRUIR-ML-TRAINING                                  │
+│                                                           │
+│  El `if:` del job matchea string-exacto. Si escribes      │
+│  "DESTRUIR-ml-training" (lowercase) o "DESTRUIR" o        │
+│  cualquier variacion, el job termina con conclusion=      │
+│  skipped y NO ejecuta destroy.                            │
+└───────────────────────────────────────────────────────────┘
+                        │
+                        ▼
+┌─ Salvaguarda 2: environment approval ─────────────────────┐
+│                                                           │
+│  `environment: production` requiere que un reviewer       │
+│  (vos) clickee "Approve and deploy" en la UI antes de     │
+│  que el job arranque. Si te equivocaste de modo, tenes    │
+│  esta ultima ventana para Cancelar.                       │
+└───────────────────────────────────────────────────────────┘
+```
+
+### 6.5.5.2 Esqueleto del workflow
 
 ```yaml
-name: Promote model
+name: Destroy
 
 on:
   workflow_dispatch:
     inputs:
-      model_name:
-        description: 'Nombre del modelo en Registry (ej: ml-training-POP)'
+      confirmar:
+        description: 'Escribe exactamente: DESTRUIR-ML-TRAINING'
         required: true
-        type: string
-      version:
-        description: 'Version a promover'
-        required: true
-        type: string
-      max_mape:
-        description: 'Umbral MAPE maximo aceptable (%)'
-        required: false
-        default: '20'
-        type: string
+      modo:
+        type: choice
+        options: [TEAR-DOWN, DESTROY, NUKE]
+        default: TEAR-DOWN
 
-permissions:
-  id-token: write
-  contents: read
+permissions: { id-token: write, contents: read }
 
 jobs:
-  promote:
-    runs-on: ubuntu-latest
-    environment: production    # requiere approval manual (configurar en GitHub Settings)
+  destroy:
+    if: ${{ inputs.confirmar == 'DESTRUIR-ML-TRAINING' }}
+    environment: production
     steps:
       - uses: actions/checkout@v4
-
-      - name: Assume gha-train role (solo lectura MLflow)
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          role-to-assume: ${{ vars.AWS_GHA_TRAIN_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-
-      - uses: actions/setup-python@v5
-        with: { python-version: '3.13' }
-
-      - run: pip install mlflow==3.12.0 requests
-
-      - name: Quality gate (MAPE check)
-        env:
-          MLFLOW_TRACKING_URI: http://${{ vars.MLFLOW_ALB_DNS }}
-        run: |
-          python <<'PY'
-          import mlflow, os, sys
-          from mlflow.tracking import MlflowClient
-
-          c = MlflowClient()
-          name    = "${{ inputs.model_name }}"
-          version = "${{ inputs.version }}"
-          max_mape = float("${{ inputs.max_mape }}")
-
-          mv = c.get_model_version(name=name, version=version)
-          run = c.get_run(mv.run_id)
-          mape = run.data.metrics.get("mape_oof") or run.data.metrics.get("mape")
-          if mape is None:
-              sys.exit(f"No 'mape_oof' ni 'mape' en run {mv.run_id}")
-          if mape > max_mape:
-              sys.exit(f"GATE FAIL: MAPE={mape:.3f} > umbral={max_mape}")
-          print(f"GATE OK: MAPE={mape:.3f} <= {max_mape}")
-          PY
-
-      - name: A/B comparison contra Production actual
-        env:
-          MLFLOW_TRACKING_URI: http://${{ vars.MLFLOW_ALB_DNS }}
-        run: |
-          python <<'PY'
-          from mlflow.tracking import MlflowClient
-          c = MlflowClient()
-          name    = "${{ inputs.model_name }}"
-          version = "${{ inputs.version }}"
-
-          # Candidato
-          mv_new = c.get_model_version(name=name, version=version)
-          run_new = c.get_run(mv_new.run_id)
-          mape_new = run_new.data.metrics.get("mape_oof") or run_new.data.metrics.get("mape")
-
-          # Production actual (si existe)
-          prod = c.get_latest_versions(name, stages=["Production"])
-          if not prod:
-              print(f"No hay Production previo. Promoviendo {version} sin comparar.")
-              raise SystemExit(0)
-
-          mv_prod = prod[0]
-          run_prod = c.get_run(mv_prod.run_id)
-          mape_prod = run_prod.data.metrics.get("mape_oof") or run_prod.data.metrics.get("mape")
-
-          import sys
-          if mape_new >= mape_prod:
-              sys.exit(f"GATE FAIL: candidato MAPE={mape_new:.3f} no mejora vs Production v{mv_prod.version} MAPE={mape_prod:.3f}")
-          print(f"GATE OK: candidato MAPE={mape_new:.3f} mejora vs Production={mape_prod:.3f}")
-          PY
-
-      - name: Transition a Production
-        env:
-          MLFLOW_TRACKING_URI: http://${{ vars.MLFLOW_ALB_DNS }}
-        run: |
-          python <<'PY'
-          from mlflow.tracking import MlflowClient
-          c = MlflowClient()
-          c.transition_model_version_stage(
-              name="${{ inputs.model_name }}",
-              version="${{ inputs.version }}",
-              stage="Production",
-              archive_existing_versions=True,
-          )
-          print("Transition OK")
-          PY
+      - name: Assume gha-deploy
+        # ...
+      - name: TEAR-DOWN
+        if: ${{ inputs.modo == 'TEAR-DOWN' }}
+        run: task --yes aws:teardown
+      - name: DESTROY
+        if: ${{ inputs.modo == 'DESTROY' }}
+        run: task --yes aws:destroy
+      - name: NUKE
+        if: ${{ inputs.modo == 'NUKE' }}
+        run: task --yes aws:nuke
+      - name: Limpiar log groups Lambda (modo != TEAR-DOWN)
+        # ...
+      - name: Verificacion post-operacion (lista lo que sobrevive)
+        # ...
 ```
 
-> **Importante**: el job `promote` corre en `environment: production`.
-> En GitHub Settings → Environments → production, configura "Required
-> reviewers" para que requiera approval manual antes de correr. Asi
-> el ultimo paso (transition) NO se ejecuta sin que vos clickees
-> "Approve and deploy".
+> **🖱️ Equivalente en AWS Console — que pasa adentro segun el modo**:
+>
+> | Modo | Recursos visibles despues |
+> |---|---|
+> | **TEAR-DOWN** | 🗄️ S3 buckets ml-training-* siguen. 🐳 ECR repos siguen con imagenes. 🌐 VPC/Subnets/NAT siguen. RDS `ml-training-mlflow` con final snapshot. Fargate services con `desiredCount=0`. Batch compute env con `desiredvCpus=0`. |
+> | **DESTROY** | 🗄️ S3 tfstate bucket + DynamoDB tflock + OIDC provider. Todo lo demas borrado. CloudWatch log groups de Lambdas limpiados explicitamente (sino sobreviven). |
+> | **NUKE** | Nada del proyecto. Cuenta limpia. |
 
-> **Checkpoint despues de 6.5**: ejecuta el workflow con
-> `model=ml-training-POP, version=1` (necesitas al menos 1 version
-> en Staging, generada por algun smoke previo). Confirma que pide
-> approval antes del transition:
+> **🧠 Por que 3 modos y no 2**: la V1 solo tenia TEAR-DOWN y
+> DESTROY. Pero DESTROY no borraba el tfstate ni el OIDC provider
+> (los modulos de bootstrap), asi que la cuenta quedaba con residuos.
+> Para escenarios de "cierre del proyecto" o "migracion de cuenta",
+> NUKE es el barrido final. Para el dia a dia (sprint terminado,
+> ahorrar costo de fin de semana), TEAR-DOWN sigue siendo el modo
+> del 90% de las veces.
+
+> **💥 Errores tipicos del destroy**:
+>
+> | Sintoma | Causa | Solucion |
+> |---|---|---|
+> | `BucketNotEmpty` | Bucket S3 con versioning + objetos no vaciados | `task aws:destroy` ahora vacia con `--all-versions` antes del TF destroy. Si persiste, re-correr el workflow. |
+> | `RepositoryHasImages` (ECR) | ECR repo con imagenes y `force_delete=false` en TF | `task aws:destroy` purga con `aws ecr batch-delete-image` antes del TF destroy. Si persiste, verificar `force_delete=true` en `infra/modules/storage`. |
+> | `DependencyViolation: Network interface ... is currently in use` | Lambdas con ENIs activos. AWS los libera lento (5-15 min) | Esperar 15 min y re-correr. |
+> | Workflow no arranca, status=skipped | Texto de `confirmar` no matcheo exacto | Re-disparar con `DESTRUIR-ML-TRAINING` (case-sensitive, sin espacios). |
+> | Elegiste modo equivocado | Dropdown mal seleccionado | Cancelar antes del approval y re-disparar con el modo correcto. |
+
+> **Checkpoint despues de 6.5.5**: dispara el workflow en modo
+> TEAR-DOWN como dry-run de la confirmacion textual:
 >
 > ```bash
-> gh workflow run promote.yml -f model=ml-training-POP -f version=1
-> gh run watch  # te muestra el "Waiting for review" en vivo
+> # Primero confirma que el `if:` filtra:
+> gh workflow run destroy.yml -f confirmar=destruir -f modo=TEAR-DOWN
+> gh run list --workflow=destroy.yml --limit 1
+> # Esperado: conclusion=skipped (texto no matchea exacto)
+>
+> # Ahora con el texto correcto:
+> gh workflow run destroy.yml -f confirmar=DESTRUIR-ML-TRAINING -f modo=TEAR-DOWN
+> gh run watch
+> # Esperado: "Waiting for review" -> approve -> task --yes aws:teardown
+> # Final: Fargate desiredCount=0, S3 + ECR + Registry intactos
 > ```
+>
+> **NUNCA pruebes DESTROY o NUKE la primera vez** salvo que ya hayas
+> terminado el proyecto. DESTROY es irreversible para artifacts/RDS;
+> NUKE adicionalmente exige re-bootstrap completo.
 
 ## 6.6 Branch protection
 
+El required status check cambio de nombre con la consolidacion: antes
+era `lint-and-test` (job del viejo `ci.yml`); ahora es `Deploy /
+lint-and-test` (el mismo job, pero ya vive dentro del workflow
+consolidado `deploy.yml` con `name: Deploy`).
+
 ```bash
-# Required status checks: el job lint-and-test del ci.yml
+# Required status checks: el job lint-and-test del deploy.yml consolidado
 gh api "repos/${GITHUB_OWNER}/ml_training/branches/main/protection" -X PUT --input - <<EOF
 {
   "required_status_checks": {
     "strict": true,
-    "contexts": ["lint-and-test"]
+    "contexts": ["Deploy / lint-and-test"]
   },
   "enforce_admins": false,
   "required_pull_request_reviews": {
@@ -6941,7 +7279,16 @@ gh api "repos/${GITHUB_OWNER}/ml_training/branches/main/protection" -X PUT --inp
 EOF
 ```
 
-(O configurar via GitHub UI: Settings → Branches → Branch protection rules → Add rule.)
+> **🧠 Por que el formato `<Workflow Name> / <Job ID>`**: GitHub
+> identifica status checks por el par `(workflow display name, job
+> id)`. El workflow tiene `name: Deploy` y el job tiene id
+> `lint-and-test`, asi que el check aparece como `Deploy /
+> lint-and-test` en la API de branch protection y en el dropdown de
+> Settings.
+
+(O configurar via GitHub UI: Settings → Branches → Branch protection
+rules → Add rule → Require status checks to pass → buscar y agregar
+`Deploy / lint-and-test`.)
 
 ---
 
@@ -7983,22 +8330,21 @@ ml_training/
 │   ├── modules/                        # Parte 3 (9 modulos × 2-3 archivos cada uno)
 │   │   └── consumer-iam/               # Parte 13.5 (solo si aplicas Parte 13)
 │   └── lambdas/                        # Parte 3.9, 3.10 (3 archivos .py)
-├── tasks/                              # NUEVO (orquestacion AWS)
+├── tasks/                              # NUEVO (orquestacion AWS + helpers locales)
 │   ├── infra.yml                       # Parte 4.1.4   terraform + bootstrap
 │   ├── ecr.yml                         # Parte 4.1.5   build + push 3 imagenes
-│   ├── batch.yml                       # Parte 4.1.6   submit jobs + polling
+│   ├── batch.yml                       # Parte 4.1.6   submit jobs + polling (+ train-lambda)
 │   ├── cluster.yml                     # Parte 4.1.7   lifecycle scale up/down
-│   ├── mlflow_registry.yml             # Parte 4.1.8   promote con gate MAPE
-│   └── aws.yml                         # Parte 4.1.9   orquestadores high-level
+│   ├── mlflow_registry.yml             # Parte 4.1.8   promote con gate MAPE + A/B
+│   ├── aws.yml                         # Parte 4.1.9   orquestadores high-level (+ nuke)
+│   └── local.yml                       # Parte 4.1.11  helpers dev local (ensure-buckets)
 ├── Taskfile.yml                        # MODIFICADO (Parte 4.1.3 anade includes:)
 ├── docker/                             # SOLO NUEVO el subdir reports/
 │   └── reports/                        # Parte 3.6 (Dockerfile + nginx.conf + entrypoint.sh)
 ├── .github/workflows/                  # NUEVO
-│   ├── ci.yml                          # Parte 6.2
-│   ├── terraform-plan.yml              # Parte 6.3
-│   ├── train.yml                       # Parte 6.4
-│   ├── promote.yml                     # Parte 6.5
-│   └── auto-train-on-push.yml          # Parte 13.2 (solo si aplicas Parte 13)
+│   ├── deploy.yml                      # Parte 6.2 (consolida ci + terraform-plan + infra-apply)
+│   ├── training.yml                    # Parte 6.4 (consolida train + auto-train + promote)
+│   └── destroy.yml                     # Parte 6.5.5 (3 modos: TEAR-DOWN / DESTROY / NUKE)
 ├── src/                                # MODIFICADO
 │   ├── orchestration/variety_runner.py # Parte 5.3 (agrega emit_mape_metric tras quality gate)
 │   └── utils/cloudwatch_metrics.py     # Parte 5.2 (archivo nuevo)
@@ -8037,23 +8383,32 @@ aplicada). Total LOC agregadas: ~3500 (HCL + Python + YAML + Markdown).
 
 ---
 
-# Parte 13 — Customizaciones puntuales (patches sobre Partes 1-12)
+# Parte 13 — Customizaciones puntuales (patches PROPUESTOS, no aplicados aun)
 
+> **STATUS**: los 5 patches de esta parte estan **todos APLICADOS post-auditoria 2026-05-18**;
+> mantener documentacion para historicidad y como referencia para
+> futuros forks que quieran adoptarlos selectivamente. Si queres
+> re-aplicar alguno tras cambios, segui las instrucciones del
+> sub-bloque y corre `task infra:apply TARGET=module.X` correspondiente.
+>
 > **Por que esta parte existe**: las Partes 1-12 son la guia generica
-> que sirve para cualquier deployment. Esta Parte 13 son los **5
-> patches especificos** que pediste para TU caso de uso:
+> que sirve para cualquier deployment. Esta Parte 13 documenta **5
+> patches** que podes aplicar a tu caso de uso particular:
 >
-> 1. Scheduler L/Mi/V (no L-V) — Sec 13.1
-> 2. Auto-train on push con wake/sleep — Sec 13.2
-> 3. Orden serializado de wake (RDS → MLflow → Reports) — Sec 13.3
-> 4. URLs locales documentadas (para que el dev sepa donde mirar local vs prod) — Sec 13.4
-> 5. Como otro proyecto (FastAPI + Streamlit) consume este MLflow — Sec 13.5
+> 1. Scheduler L/Mi/V (no L-V) — Sec 13.1 — **no aplicado**
+> 2. Auto-train on push con wake/sleep — Sec 13.2 — **no aplicado** (workflow `auto-train-on-push.yml` no existe)
+> 3. Orden serializado de wake (RDS → MLflow → Reports) — Sec 13.3 — **no aplicado** (scheduler.py sigue paralelo)
+> 4. URLs locales documentadas (para que el dev sepa donde mirar local vs prod) — Sec 13.4 — solo doc
+> 5. Como otro proyecto (FastAPI + Streamlit) consume este MLflow — Sec 13.5 — **modulo consumer-iam no creado**
+> 6. MLflow local→prod (override del compose) — Sec 13.8 — **parcial** (codigo soporta override via `MLFLOW_TRACKING_URI`, falta `docker-compose.override.yml`)
 >
-> Aplicarlos DESPUES de que Oleadas 1-5 esten funcionando. Si los
-> aplicas en mitad, podes dejar el state Terraform en estado
-> inconsistente.
+> Aplicarlos DESPUES de que Oleadas 1-5 esten funcionando. Cada patch
+> es independiente; podes adoptar 0, 1, varios o todos. Si los aplicas
+> en mitad de un stand-up, podes dejar el state Terraform inconsistente.
 
 ## 13.1 Scheduler L/Mi/V (en vez de L-V)
+
+> **STATUS: APLICADO** (commit despues de auditoria 2026-05-18). workdays_cron default ahora "MON,WED,FRI", Lambda recibe WORKDAYS_CRON+WORK_START_UTC+WORK_END_UTC, scheduler.py::_keepstop parametriza via _parse_workdays. Re-apply: `task infra:apply TARGET=module.scheduler`.
 
 **Por que se cambia**: pediste que solo encienda lunes, miercoles y
 viernes — no martes ni jueves. Reduce el uso de Fargate + RDS a
@@ -8207,6 +8562,8 @@ task aws:sleep
 ```
 
 ## 13.2 Auto-train on push con wake + cool-down + auto-stop
+
+> **STATUS: APLICADO** (commit despues de auditoria 2026-05-18). El workflow auto-train-on-push.yml fue CREADO y luego ABSORBIDO en training.yml (ver §6.4 reescrita). La policy gha-train ahora incluye lambda:InvokeFunction sobre scheduler, rds:DescribeDBInstances, ecs:DescribeServices. Re-apply: `task infra:apply TARGET=module.cicd`.
 
 **Por que se hace**: pediste que el flujo sea:
 
@@ -8532,6 +8889,8 @@ Tiempo total esperado: ~75-90 min (5 min wake + 30-50 min train + 10 min cool-do
 
 ## 13.3 Orden serializado de wake (RDS → MLflow → Reports)
 
+> **STATUS: APLICADO** (commit despues de auditoria 2026-05-18). scheduler.py::_start ahora secuencial (RDS available -> MLflow running -> Reports). Lambda timeout bumpeado a 900s. Re-apply: `task infra:apply TARGET=module.scheduler`.
+
 **Por que se serializa**: en el `scheduler.py` original (Parte 3.10.4),
 las 3 acciones de start se invocan en paralelo: el `ecs.update_service`
 para MLflow se manda sin esperar a que RDS este available. Por como
@@ -8699,6 +9058,8 @@ desde tu bash contra el MLflow de AWS sin necesidad de levantar
 docker compose.
 
 ## 13.5 Consumir el MLflow productivo desde OTRO proyecto (FastAPI + Streamlit)
+
+> **STATUS: APLICADO** (commit despues de auditoria 2026-05-18). Modulo `infra/modules/consumer-iam/` creado, cableado en envs/prod/main.tf como Capa 10. Variables consumer_org="abantodca" y consumer_repo="ml_serving" en terraform.tfvars. Output `consumer_role_arn` agregado. Re-apply: `task infra:apply TARGET=module.consumer_iam`.
 
 **Por que esta seccion**: pediste preparar el terreno para que tu
 proyecto de inferencia (FastAPI + Streamlit, en repo separado) pueda
@@ -9106,6 +9467,8 @@ aws iam get-role --role-name ml-training-consumer --query 'Role.Arn' --output te
 ---
 
 ## 13.8 Local + S3 + Produccion — reutilizar el setup sin perder runs locales
+
+> **STATUS: APLICADO**. docker-compose.yml usa `MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}` (override-friendly). Se agrego `docker-compose.override.yml.example` como template (el override real no se commitea, esta en .gitignore).
 
 **Por que se documenta**: el `docker-compose.yml` actual ya usa S3
 (`S3_MLFLOW_BUCKET` para artifacts de MLflow + `S3_ARTIFACTS_BUCKET`

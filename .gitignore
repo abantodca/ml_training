@@ -80,3 +80,6 @@ terraform.rc
 # Lambdas .zip (Terraform los crea desde Python source)
 infra/modules/lambdas/*.zip
 infra/modules/scheduler/*.zip
+
+# Patch 13.8 - override del compose para apuntar a prod (NO commitear)
+docker-compose.override.yml

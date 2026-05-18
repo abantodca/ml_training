@@ -76,7 +76,10 @@ includes:
     taskfile: ./tasks/mlflow_registry.yml
   aws:
     taskfile: ./tasks/aws.yml
-    
+  local:
+    taskfile: ./tasks/local.yml
+
+
 vars:
   TUNING: "{{.TUNING | default \"prod\"}}"
   VARIETIES: "{{.VARIETIES | default \"POP\"}}"
@@ -271,6 +274,26 @@ tasks:
         echo ""
 
   # ═══ Datos ══════════════════════════════════════════════════════════════
+
+  # ═══ Calidad de codigo (CI + local) ═════════════════════════════════════
+  # Estas tasks son la "single source of truth" para lint+test. Las llaman
+  # tanto los devs en local (pre-commit) como GitHub Actions en CI. Si
+  # cambia el set de checks, se toca aqui y CI lo hereda automaticamente.
+
+  lint:
+    desc: "Lint Python (ruff). Corre en el host (no requiere Docker)"
+    cmds:
+      - ruff check src/ main.py scripts/
+
+  test:
+    desc: "Tests con cobertura (pytest). Si no hay carpeta tests/, no falla"
+    cmds:
+      - |
+        if [ -d tests ]; then
+          pytest tests/ --cov=src --cov-report=term-missing
+        else
+          echo "No tests/ dir, skip"
+        fi
 
   data:split:
     desc: "Genera data/training/DB-HISTORICA.xlsx desde data/BD_HISTORICO_ACUMULADO.xlsx. Corre dentro del container (no requiere Python en el host)"

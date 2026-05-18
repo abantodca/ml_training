@@ -74,14 +74,126 @@ tasks:
   # ═══ Destroy total ══════════════════════════════════════════════════════════
 
   destroy:
-    desc: "DESTRUCTIVO TOTAL: terraform destroy de TODO (incluye storage). Doble confirmacion"
-    prompt: "Destruira COMPLETAMENTE envs/prod (S3, ECR, RDS, todo). Irreversible. Continuar?"
+    desc: "DESTRUCTIVO TOTAL: terraform destroy de modulos administrados. Doble confirmacion"
+    prompt: "Destruira envs/prod (S3 + ECR + RDS + ...). Irreversible. Continuar?"
     cmds:
       - 'echo ">>> Drenando Batch jobs primero..."'
       - task: ":cluster:scale-down"
       - 'echo ""'
+      - 'echo ">>> Vaciando buckets S3 con versioning (data + artifacts)..."'
+      - task: _empty-bucket
+        vars: { BUCKET: '{{.PROJECT | default "ml-training"}}-data' }
+      - task: _empty-bucket
+        vars: { BUCKET: '{{.PROJECT | default "ml-training"}}-artifacts' }
+      - 'echo ""'
+      - 'echo ">>> Borrando imagenes ECR..."'
+      - task: _purge-ecr
+        vars: { REPO: '{{.PROJECT | default "ml-training"}}' }
+      - task: _purge-ecr
+        vars: { REPO: '{{.PROJECT | default "ml-training"}}-mlflow' }
+      - task: _purge-ecr
+        vars: { REPO: '{{.PROJECT | default "ml-training"}}-reports' }
+      - 'echo ""'
       - 'echo ">>> terraform destroy total..."'
       - task: ":infra:destroy"
+
+  nuke:
+    desc: "DESTRUCTIVO IRREVERSIBLE: destroy + borrar tfstate bucket + tflock + OIDC provider"
+    prompt: "NUKE COMPLETO: destruira todo, incluido el state remoto (tfstate bucket + tflock) y el OIDC provider. Despues necesitas re-bootstrap. Continuar?"
+    cmds:
+      - task: destroy
+      - 'echo ""'
+      - 'echo ">>> Borrando bucket tfstate (backend Terraform)..."'
+      - task: _delete-tfstate-bucket
+      - 'echo ">>> Borrando DynamoDB tflock..."'
+      - task: _delete-tflock
+      - 'echo ">>> Borrando OIDC provider de GitHub Actions..."'
+      - task: _delete-oidc
+      - 'echo ""'
+      - 'echo "NUKE COMPLETO. Para volver: task infra:bootstrap + task infra:bootstrap-oidc + task aws:deploy"'
+
+  # ═══ Helpers internos del destroy/nuke (no llamar directo) ══════════════════
+
+  _empty-bucket:
+    internal: true
+    requires:
+      vars: [BUCKET]
+    vars:
+      SUFFIX:
+        sh: aws sts get-caller-identity --query Account --output text | tail -c 7
+    cmds:
+      - |
+        FULL="{{.BUCKET}}-{{.SUFFIX}}"
+        if ! aws s3api head-bucket --bucket "$FULL" 2>/dev/null; then
+          echo "  $FULL no existe, skip"; exit 0
+        fi
+        echo "  Vaciando $FULL (versiones + delete markers)..."
+        aws s3api delete-objects --bucket "$FULL" \
+          --delete "$(aws s3api list-object-versions --bucket "$FULL" \
+            --query '{Objects: [Versions[].{Key:Key,VersionId:VersionId},DeleteMarkers[].{Key:Key,VersionId:VersionId}][]}' \
+            --max-items 1000)" 2>/dev/null || echo "  (bucket ya vacio)"
+
+  _purge-ecr:
+    internal: true
+    requires:
+      vars: [REPO]
+    cmds:
+      - |
+        if ! aws ecr describe-repositories --repository-names "{{.REPO}}" >/dev/null 2>&1; then
+          echo "  {{.REPO}} no existe, skip"; exit 0
+        fi
+        IDS=$(aws ecr list-images --repository-name "{{.REPO}}" --query 'imageIds[*]' --output json)
+        if [ "$IDS" = "[]" ]; then
+          echo "  {{.REPO}} vacio"; exit 0
+        fi
+        echo "  Borrando todas las imagenes de {{.REPO}}..."
+        aws ecr batch-delete-image --repository-name "{{.REPO}}" --image-ids "$IDS" >/dev/null
+
+  _delete-tfstate-bucket:
+    internal: true
+    vars:
+      SUFFIX:
+        sh: aws sts get-caller-identity --query Account --output text | tail -c 7
+      BUCKET: '{{.PROJECT | default "ml-training"}}-tfstate'
+    cmds:
+      - |
+        FULL="{{.BUCKET}}-{{.SUFFIX}}"
+        if ! aws s3api head-bucket --bucket "$FULL" 2>/dev/null; then
+          echo "  $FULL no existe, skip"; exit 0
+        fi
+        echo "  Vaciando $FULL..."
+        aws s3api delete-objects --bucket "$FULL" \
+          --delete "$(aws s3api list-object-versions --bucket "$FULL" \
+            --query '{Objects: [Versions[].{Key:Key,VersionId:VersionId},DeleteMarkers[].{Key:Key,VersionId:VersionId}][]}' \
+            --max-items 1000)" 2>/dev/null || true
+        echo "  Borrando $FULL..."
+        aws s3 rb "s3://$FULL"
+
+  _delete-tflock:
+    internal: true
+    vars:
+      TABLE: '{{.PROJECT | default "ml-training"}}-tflock'
+    cmds:
+      - |
+        if aws dynamodb describe-table --table-name "{{.TABLE}}" >/dev/null 2>&1; then
+          aws dynamodb delete-table --table-name "{{.TABLE}}" >/dev/null
+          echo "  {{.TABLE}} borrada"
+        else
+          echo "  {{.TABLE}} no existe, skip"
+        fi
+
+  _delete-oidc:
+    internal: true
+    cmds:
+      - |
+        ARN=$(aws iam list-open-id-connect-providers \
+          --query 'OpenIDConnectProviderList[?contains(Arn, `token.actions.githubusercontent.com`)].Arn' \
+          --output text)
+        if [ -z "$ARN" ]; then
+          echo "  OIDC provider no existe, skip"; exit 0
+        fi
+        echo "  Borrando OIDC provider: $ARN"
+        aws iam delete-open-id-connect-provider --open-id-connect-provider-arn "$ARN"
 
   # ═══ Estado ═════════════════════════════════════════════════════════════════
 

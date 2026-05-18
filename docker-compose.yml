@@ -100,7 +100,10 @@ services:
       # /health de mlflow responda 200. Evita race condition en primer run.
       mlflow: { condition: service_healthy }
     environment:
-      MLFLOW_TRACKING_URI: http://mlflow:5000
+      # Patch 13.8: permite override desde el shell (export MLFLOW_TRACKING_URI=...)
+      # o desde docker-compose.override.yml. Default: el container `mlflow` del compose.
+      # Para apuntar a prod: `export MLFLOW_TRACKING_URI=http://<ALB-DNS>` y reusar compose.
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
       # Mismas creds que mlflow: leemos del ~/.aws del host (montado abajo).
       AWS_SHARED_CREDENTIALS_FILE: /aws/credentials
       AWS_CONFIG_FILE: /aws/config

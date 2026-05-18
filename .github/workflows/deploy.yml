@@ -1,0 +1,244 @@
+name: Deploy
+
+# Workflow consolidado (reemplaza ci.yml + terraform-plan.yml + infra-apply.yml).
+# Estrategia thin: cada job autentica via OIDC y delega en `task X`.
+#
+# Jobs y disparos:
+#   lint-and-test   -> SIEMPRE (push, PR, manual)
+#   build-and-push  -> solo push a main (publica trainer en ECR con sha + latest)
+#   terraform-plan  -> solo PR a main con cambios en infra/** (comenta plan en PR)
+#   infra-apply     -> solo push a main (orquesta task aws:deploy con approval)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────
+  # Detectar qué cambios trae el push/PR para activar jobs condicionales
+  # ────────────────────────────────────────────────────────────────────────
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      infra:   ${{ steps.filter.outputs.infra }}
+      trainer: ${{ steps.filter.outputs.trainer }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            infra:
+              - 'infra/**'
+              - '.github/workflows/deploy.yml'
+            trainer:
+              - 'src/**'
+              - 'main.py'
+              - 'Dockerfile'
+              - 'requirements.txt'
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Lint + tests (siempre)
+  # ────────────────────────────────────────────────────────────────────────
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Python deps
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      # Single source of truth: las mismas tasks que un dev corre local.
+      - run: task lint
+      - run: task test
+      - run: task infra:validate
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Build + push trainer a ECR (solo push a main con cambios al trainer)
+  # ────────────────────────────────────────────────────────────────────────
+  build-and-push:
+    needs: [lint-and-test, changes]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.trainer == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assume gha-deploy role via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_GHA_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - run: task ecr:build IMG=trainer
+        env:
+          AWS_DEFAULT_REGION: ${{ vars.AWS_REGION }}
+          PROJECT: ${{ vars.PROJECT }}
+
+      - name: Output image tag
+        run: |
+          echo "::notice title=Pushed::${{ vars.ECR_TRAINER }}:sha-$(git rev-parse --short=12 HEAD)"
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Terraform plan en PRs (comenta el diff en el PR)
+  # ────────────────────────────────────────────────────────────────────────
+  terraform-plan:
+    needs: [lint-and-test, changes]
+    if: github.event_name == 'pull_request' && needs.changes.outputs.infra == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume gha-deploy role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_GHA_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: task infra:plan (tee a tfplan.txt)
+        id: plan
+        env:
+          AWS_DEFAULT_REGION: ${{ vars.AWS_REGION }}
+          PROJECT: ${{ vars.PROJECT }}
+          TF_VAR_alert_email:   ${{ vars.ALERT_EMAIL }}
+          TF_VAR_github_org:    ${{ github.repository_owner }}
+          TF_VAR_github_repo:   ${{ github.event.repository.name }}
+          TF_VAR_consumer_org:  ${{ vars.CONSUMER_ORG }}
+          TF_VAR_consumer_repo: ${{ vars.CONSUMER_REPO }}
+        run: |
+          set -o pipefail
+          task infra:plan 2>&1 | tee tfplan.txt
+        continue-on-error: true
+
+      - name: Comentar plan en el PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const planOutput = fs.readFileSync('tfplan.txt', 'utf8').slice(-60000);
+            const body = `### Terraform plan\n\n\`\`\`\n${planOutput}\n\`\`\`\n*exit code: ${{ steps.plan.outcome }}*`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Fail si plan fallo
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Apply infra (solo push a main, con approval del environment production)
+  # ────────────────────────────────────────────────────────────────────────
+  infra-apply:
+    needs: [lint-and-test, changes, build-and-push]
+    # build-and-push puede no haberse ejecutado (sin cambios al trainer). Lo permitimos via always() + needs.lint-and-test.result==success.
+    if: |
+      always() &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.lint-and-test.result == 'success' &&
+      (needs.build-and-push.result == 'success' || needs.build-and-push.result == 'skipped') &&
+      needs.changes.outputs.infra == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: tf-apply-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume gha-deploy role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_GHA_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: task aws:deploy (oleadas A+B+C)
+        env:
+          AWS_DEFAULT_REGION:       ${{ vars.AWS_REGION }}
+          PROJECT:                  ${{ vars.PROJECT }}
+          TF_VAR_alert_email:       ${{ vars.ALERT_EMAIL }}
+          TF_VAR_github_org:        ${{ github.repository_owner }}
+          TF_VAR_github_repo:       ${{ github.event.repository.name }}
+          TF_VAR_consumer_org:      ${{ vars.CONSUMER_ORG }}
+          TF_VAR_consumer_repo:     ${{ vars.CONSUMER_REPO }}
+          # Pinea el trainer al SHA recien construido. Sin esto queda "latest".
+          TF_VAR_trainer_image_tag: sha-${{ github.sha }}
+        run: task aws:deploy
+
+      - name: Capturar outputs
+        id: out
+        working-directory: infra/envs/prod
+        run: |
+          echo "alb_dns=$(terraform output -raw alb_dns)"                   >> $GITHUB_OUTPUT
+          echo "tracking_uri=$(terraform output -raw tracking_uri)"         >> $GITHUB_OUTPUT
+          echo "job_queue_spot=$(terraform output -raw job_queue_spot)"     >> $GITHUB_OUTPUT
+          echo "dispatcher=$(terraform output -raw dispatcher_function_name)" >> $GITHUB_OUTPUT
+
+      - name: Summary
+        run: |
+          {
+            echo "## Despliegue aplicado"
+            echo ""
+            echo "| Recurso | Valor |"
+            echo "|---|---|"
+            echo "| MLflow UI | ${{ steps.out.outputs.tracking_uri }} |"
+            echo "| Reports | http://${{ steps.out.outputs.alb_dns }}/reports/ |"
+            echo "| Artifacts | http://${{ steps.out.outputs.alb_dns }}/artifacts/ |"
+            echo "| Batch queue Spot | ${{ steps.out.outputs.job_queue_spot }} |"
+            echo "| Lambda dispatcher | ${{ steps.out.outputs.dispatcher }} |"
+            echo ""
+            echo "**Trainer image tag:** \`sha-${{ github.sha }}\`"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
