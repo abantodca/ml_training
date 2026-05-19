@@ -28,6 +28,14 @@
 >    de WSL. NO Git Bash, NO PowerShell (memoria `feedback_shell_bash.md`).
 >    Esta decision se aplica desde 📖 0.3 hasta el final.
 >
+> 4. **Local primero, produccion despues.** El orden de lectura es
+>    **siempre**: (a) tener el trainer corriendo end-to-end en
+>    `docker compose` via `task train` (📖 0.5), (b) recien ahi pasar
+>    al bootstrap + Terraform + Batch (📖 Parte 1 en adelante). El
+>    mismo `Dockerfile` se usa en local y en ECR — no hay "imagen de
+>    dev". Si la 📖 0.5 no pasa, **no avanzar** a la Parte 1: cualquier
+>    bug del trainer se debuggea en local, no en Batch.
+>
 > **Que NO es esta V2**: un tutorial introductorio. Asume que ya conoces
 > Terraform modular, Docker multi-stage, AWS Batch / ECS Fargate / RDS,
 > GitHub Actions con OIDC y MLflow Tracking + Registry. Si te falta una
@@ -44,11 +52,17 @@
 
 ## Indice general (de toda la V2, oleadas 1-5)
 
+> **Orden de lectura**: **local primero, produccion despues.** Hacer
+> 📖 0.1 → 0.5 (trainer corriendo en `docker compose` + smoke OK) antes
+> de pasar a 📖 Parte 1 (bootstrap AWS). Si la 0.5 falla, no continuar:
+> debuggear en local. El mismo `Dockerfile` se usa en ambos lados.
+
 - **Parte 0 — Antes de empezar** *(oleada 1, ⬇ abajo)*
   - 0.1 Que construye esta guia
   - 0.2 Decisiones lockeadas
   - 0.3 Prerrequisitos verificables
   - 0.4 Convenciones (bash desde la raiz, naming, regions)
+  - **0.5 Desarrollo local end-to-end** *(checkpoint obligatorio antes del bootstrap)*
 - **Parte 1 — Overview del lifecycle y stand-up** *(oleada 1, ⬇ abajo)*
   - 1.1 STAND-UP — primera vez, de cero a produccion
   - 1.2 Otros modos (TEAR-DOWN / REBUILD / DESTROY) — pointer a 📖 8.5-📖 8.7
@@ -509,6 +523,352 @@ Las 4 referencias que aparecen una y otra vez:
 - **PowerShell / Git Bash**: la guia NO esta optimizada para PowerShell
   ni Git Bash. Usar siempre WSL Ubuntu en Windows
   (memoria `feedback_shell_bash.md`).
+
+---
+
+## 0.5 Desarrollo local end-to-end (antes del bootstrap AWS)
+
+> **Por que existe esta seccion**. El smoke chico de 📖 0.3.5 sirve para
+> "verificar que el trainer no esta roto" antes del bootstrap, pero no
+> es un setup de trabajo: no explica como se entrenan modelos reales en
+> local, ni la diferencia entre `task build` y `task up`, ni que parte
+> del setup ya toca AWS aunque no hayas hecho el bootstrap. Esta seccion
+> documenta el **entorno de desarrollo diario**: cuando un dev se sienta
+> a iterar sobre el codigo del trainer (cambiar features, ajustar tuning,
+> probar una variedad nueva), todo eso ocurre aca — **no** en AWS Batch.
+>
+> La regla mental:
+>
+> | Que estas haciendo | Donde | Como |
+> |---|---|---|
+> | Iterar sobre `src/` (features, pipelines, tuning) | Local | `task train VARIETIES=POP TUNING=dev` (Docker) |
+> | Verificar end-to-end antes de un push a main | Local | `task train ... TUNING=smoke` (~1 min) |
+> | Entrenamiento productivo (campeon a Registry) | AWS Batch | `task batch:train` (despues del stand-up) |
+> | Auto-retrain on push | AWS Batch via GHA | `.github/workflows/training.yml` (📖 6.4) |
+>
+> **El mismo `Dockerfile` que usas en `docker compose` es el que se
+> pushea a ECR**: no hay "imagen de dev" distinta de "imagen de prod".
+> El compose de local y el job-def de Batch montan el mismo binario,
+> con env vars distintas (ver 📖 13.8.2 para la tabla comparativa).
+
+### 0.5.1 Que vamos a tener corriendo en local
+
+Cuatro servicios definidos en `docker-compose.yml` raiz:
+
+| Servicio | Imagen | Rol | Puerto host |
+|---|---|---|---|
+| `postgres` | `postgres:15-alpine` | Backend store de MLflow (metadata: runs, params, metrics, Model Registry) — vive en volumen Docker `pg-data` | — (interno) |
+| `mlflow` | Build de `docker/mlflow/Dockerfile` (MLflow 3.12 + psycopg2 + boto3) | Tracking server. UI + REST API. Lee/escribe metadata a `postgres` y artifacts a S3 | `127.0.0.1:5000` |
+| `reports` | `nginx:1.27-alpine` | Sirve `./reports/` y `./artifacts/` del host como HTTP estatico (autoindex) | `127.0.0.1:8080` |
+| `trainer` | Build del `Dockerfile` raiz (Python 3.13 + requirements) | One-shot: corre `main.py` con args. No es servicio de fondo; lo invoca `task train` | — |
+
+Dataflow local (que va a donde):
+
+```
+data/BD_HISTORICO_ACUMULADO.xlsx     (input crudo, lo aportas vos)
+        │
+        │ task data:split  (corre `scripts/prepare_data.py` en el container)
+        ▼
+data/training/DB-HISTORICA.xlsx       (1 hoja por variedad, filtrado a >=100 filas)
+        │
+        │ task train  (corre `main.py` en el container `trainer`)
+        ▼
+artifacts/  reports/  logs/           (host bind-mounts)
+        │                ┌──────────────────────┐
+        ├──── mlflow ───▶│ Postgres (volumen)   │  metadata, params, metrics
+        │                └──────────────────────┘
+        │                ┌──────────────────────┐
+        ├──── mlflow ───▶│ S3_MLFLOW_BUCKET     │  artifacts MLflow (joblib, plots)
+        │                └──────────────────────┘
+        │                ┌──────────────────────┐
+        └──── s3_sync ──▶│ S3_ARTIFACTS_BUCKET  │  artifacts/ + reports/ del run
+                         └──────────────────────┘
+```
+
+> **Punto clave**: `artifacts/` y `reports/` del host **son los mismos
+> directorios** que sirve nginx en `127.0.0.1:8080` y que el trainer
+> escribe via bind-mount. No hay capa extra. Si abris
+> `http://localhost:8080/artifacts/` y no ves nada, es que el run aun
+> no terminó o falló antes de escribir.
+
+### 0.5.2 Por que el "local" NO es 100% offline
+
+El `docker-compose.yml` actual **requiere dos buckets S3** al arrancar
+(`S3_MLFLOW_BUCKET` y `S3_ARTIFACTS_BUCKET`). Sin ellos:
+
+```bash
+# Sintoma tipico:
+docker compose up -d
+# ERROR: Set S3_MLFLOW_BUCKET in .env
+```
+
+La razon es deliberada:
+
+- **MLflow se configura con `--default-artifact-root s3://...`** (no
+  filesystem local). Asi el modelo `joblib` ya queda en S3 desde el
+  momento del log, sin pasos extra. Cuando despues movas el trainer a
+  Batch, el contrato no cambia.
+- **El trainer hace `s3_sync` post-run** (📖 13.8.1) para subir
+  `artifacts/` y `reports/` "crudos" (no via MLflow). Es la misma logica
+  que corre en Batch.
+
+Si nunca configuraste credenciales AWS:
+
+```bash
+# 1) Instalar AWS CLI v2 (📖 0.3.1) si no esta
+aws --version
+
+# 2) Configurar un profile (las creds van en ~/.aws/credentials)
+aws configure --profile default
+# Access Key ID, Secret Access Key, region us-east-1, output json
+
+# 3) Verificar
+aws sts get-caller-identity
+# Esperado: { "UserId": "...", "Account": "<12-digitos>", "Arn": "..." }
+```
+
+> **Sin AWS, no hay setup local funcional.** Si tu caso de uso es
+> 100% offline (laptop sin conexion), tendras que parchear
+> `docker-compose.yml` para usar `--default-artifact-root file:///app/artifacts`
+> y borrar el bloque `s3_sync` en `main.py:236`. **No esta soportado por
+> esta guia** — el costo de mantenerlo es alto y el caso de uso es raro.
+
+### 0.5.3 Crear buckets S3 sandbox (UNA vez)
+
+Para evitar mezclar "buckets de dev" con "buckets de prod" cuando
+hagas el stand-up (📖 Parte 4), usa nombres distintos. La task
+`local:ensure-buckets` los crea idempotentemente con el mismo
+hardening que `modules/storage` (versioning + AES256 + no public):
+
+```bash
+# Desde la raiz del repo, profile AWS ya configurado
+export PROJECT="ml-training"
+export AWS_DEFAULT_REGION="us-east-1"
+
+task local:ensure-buckets
+# Esperado:
+#   ml-training-data-<suffix>       CREADO (o EXISTE)
+#   ml-training-artifacts-<suffix>  CREADO (o EXISTE)
+#
+#   Listo. Para que el trainer local sincronice a estos buckets, exporta:
+#     export S3_DATA_BUCKET=ml-training-data-<suffix>
+#     export S3_ARTIFACTS_BUCKET=ml-training-artifacts-<suffix>
+```
+
+> **Nota**: el bucket de MLflow (artifacts del server) y el bucket de
+> `s3_sync` (artifacts del trainer) **pueden ser el mismo**. La
+> separacion solo importa si vas a aplicar politicas IAM o lifecycle
+> distintas. Para empezar, usa `ml-training-artifacts-<suffix>` para
+> ambos en `.env`.
+
+Verificacion:
+
+```bash
+# Confirmar que se crearon con el hardening correcto
+SUFFIX=$(aws sts get-caller-identity --query Account --output text | tail -c 7)
+aws s3api get-bucket-versioning --bucket "ml-training-artifacts-${SUFFIX}"
+# Esperado: { "Status": "Enabled" }
+```
+
+### 0.5.4 Configuracion del `.env`
+
+```bash
+# Desde la raiz del repo
+cp .env.example .env
+```
+
+Editar `.env` y completar **los dos buckets obligatorios** (los demas
+quedan en sus defaults sanos):
+
+```bash
+# Despues de `task local:ensure-buckets` ya sabes los nombres
+SUFFIX=$(aws sts get-caller-identity --query Account --output text | tail -c 7)
+echo "S3_MLFLOW_BUCKET=ml-training-artifacts-${SUFFIX}"     >> .env
+echo "S3_ARTIFACTS_BUCKET=ml-training-artifacts-${SUFFIX}"  >> .env
+```
+
+Variables del `.env` por categoria (referencia completa en `.env.example`):
+
+| Variable | Cuando override | Default |
+|---|---|---|
+| `S3_MLFLOW_BUCKET` | **OBLIGATORIA** | (sin default — falla si vacia) |
+| `S3_ARTIFACTS_BUCKET` | **OBLIGATORIA** | (sin default — falla si vacia) |
+| `AWS_PROFILE` | Si usas un profile distinto de `default` | `default` |
+| `AWS_DEFAULT_REGION` | Si tus buckets viven en otra region | `us-east-1` |
+| `POSTGRES_PASSWORD` | En equipo / red compartida (no laptop personal) | `mlflow` (OK para dev solo en localhost) |
+| `TRAINER_MEM` / `TRAINER_CPUS` | Laptop con menos de 16 GB / 4 CPUs | `8g` / `4` |
+
+> **Por que no van AWS Access/Secret Keys en `.env`**: el compose monta
+> `~/.aws:/aws:ro` adentro del container (`docker-compose.yml:52`, `:119`)
+> y el SDK las lee via `AWS_SHARED_CREDENTIALS_FILE` + `AWS_PROFILE`.
+> Asi no duplicas secrets ni tenes que pasar `-e AWS_ACCESS_KEY_ID=...`.
+
+### 0.5.5 Primera vez: build + data + smoke
+
+Ya con `.env` completo, ejecutar **en orden** (no saltearse pasos):
+
+```bash
+# (1) Build de la imagen del trainer + arranque de servicios
+task build
+# Tarda 5-10 min la primera vez (compila wheels en Stage 1 del Dockerfile).
+# Al final imprime las URLs:
+#   MLflow UI       http://localhost:5000
+#   Reports HTML    http://localhost:8080/reports/
+#   Artifacts       http://localhost:8080/artifacts/
+
+# (2) Generar el dataset de training a partir del Excel acumulado
+task data:split
+# Lee  data/BD_HISTORICO_ACUMULADO.xlsx
+# Escribe data/training/DB-HISTORICA.xlsx (1 hoja por variedad)
+# Si tu Excel se llama distinto, ajustar el comando en Taskfile.yml o
+# correr `scripts/prepare_data.py` a mano con --input.
+
+# (3) (Opcional) EDA estadistico de una variedad
+task eda VARIETIES=POP
+# Genera reports/EDA_POP_<timestamp>.html (BP/DW/ADF/VIF/MI/PSI)
+# Abrir: http://localhost:8080/reports/
+
+# (4) Smoke test del trainer (~1 minuto)
+task train VARIETIES=POP TUNING=smoke
+# Esperado al final del log:
+#   FIN | variedades=1 | falladas=0 | tiempo_total=...s
+#   Campeones por variedad:
+#     POP                       -> xgb composite=...
+```
+
+Verificacion visual:
+
+```bash
+# (a) MLflow UI muestra el experimento "POP" con 2 runs (xgb + lgb)
+open http://localhost:5000
+
+# (b) Reports HTML tiene el dashboard de la variedad
+open http://localhost:8080/reports/
+
+# (c) Artifacts del run en S3 (no en disco local — los joblib van a S3)
+SUFFIX=$(aws sts get-caller-identity --query Account --output text | tail -c 7)
+aws s3 ls "s3://ml-training-artifacts-${SUFFIX}/artifacts/" --recursive | tail -10
+# Esperado: final_pipeline_POP_*.joblib + run_summary_*.json
+```
+
+Si **cualquiera** de los 4 pasos falla, **no continues a la Parte 1**:
+ir a 📖 0.5.8 (troubleshooting).
+
+### 0.5.6 Workflow diario
+
+```bash
+# Manana — arrancar servicios (sin rebuild)
+task up
+
+# Iterar
+task train VARIETIES=POP TUNING=dev          # ~20 min, baseline para iterar
+task train VARIETIES=POP TUNING=prod         # ~2 h, entrenamiento real
+task train VARIETIES=all PARALLEL=3          # todas las variedades, 3 en paralelo
+task train VARIETIES=POP,VENTURA TUNING=dev  # subset, secuencial
+
+# Seguir el progreso en vivo
+task logs                                    # tail de trainer + mlflow
+
+# Regenerar el dashboard agregado sin re-entrenar
+task reports:dashboard
+
+# Tras tocar src/ o requirements.txt -> rebuild
+task build                                   # rebuilda trainer + reinicia servicios
+
+# Noche — apagar (preserva volumen Postgres + S3)
+task down
+```
+
+**Perfiles de `TUNING`** (presupuesto Optuna):
+
+| Perfil | Duracion | CV | Cuando |
+|---|---|---|---|
+| `smoke` | ~1 min | 2x2 | Sanity check post-cambio en codigo |
+| `dev` | ~20 min | 3x3 | Iterar sobre features / decisiones de modeling |
+| `prod` | ~2 h | 5x3 | Entrenamiento productivo (default) |
+| `prod_xl` | ~6 h | 6x3 | Busqueda exhaustiva overnight |
+
+> **Cuidado con `task clean:docker`**: borra el volumen `pg-data` y con
+> el TODOS los runs MLflow (metadata, params, metrics, ranking). Los
+> joblib viven en S3 y sobreviven, pero el "contexto" (que run produjo
+> que joblib) se pierde. Si queres no perder runs locales nunca,
+> aplicar el patch de 📖 13.8 (apuntar el trainer al MLflow productivo).
+
+### 0.5.7 Verificacion end-to-end (5 checks)
+
+Despues del primer `task train ... TUNING=smoke` exitoso:
+
+```bash
+# Check 1: MLflow server responde
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:5000/health
+# Esperado: 200
+
+# Check 2: Postgres tiene el experimento + 2 runs
+docker compose exec postgres psql -U mlflow -d mlflow -c \
+  "SELECT e.name, COUNT(r.run_uuid) FROM experiments e LEFT JOIN runs r ON r.experiment_id=e.experiment_id GROUP BY e.name;"
+# Esperado: POP | 2  (1 xgb + 1 lgb; el "champion" es un alias, no un run extra)
+
+# Check 3: joblib del campeon en S3
+SUFFIX=$(aws sts get-caller-identity --query Account --output text | tail -c 7)
+aws s3 ls "s3://ml-training-artifacts-${SUFFIX}/artifacts/" | grep final_pipeline_POP
+# Esperado: al menos 1 .joblib con timestamp reciente
+
+# Check 4: nginx sirve reports
+curl -s -o /dev/null -w "%{http_code}\n" http://localhost:8080/reports/
+# Esperado: 200 (o 301 si autoindex redirige)
+
+# Check 5: run_summary_AGGREGATE.json existe en host
+cat artifacts/run_summary_AGGREGATE.json | jq '.champions'
+# Esperado: { "POP": "xgb" } (o "lgb" — depende del run)
+```
+
+Si los 5 dan OK, el setup local esta funcional. Podes pasar a la
+Parte 1 (lifecycle AWS) cuando estes listo — el codigo del trainer ya
+no cambia entre local y prod, solo el contexto (Batch vs compose).
+
+### 0.5.8 Troubleshooting local (catalogo)
+
+| Sintoma | Causa probable | Fix |
+|---|---|---|
+| `ERROR: Set S3_MLFLOW_BUCKET in .env` | `.env` no existe o le falta la var | `cp .env.example .env` + completar 📖 0.5.4 |
+| `Unable to locate credentials` en logs de mlflow/trainer | `~/.aws/credentials` no existe o `AWS_PROFILE` apunta a un profile inexistente | `aws configure` + `cat ~/.aws/credentials` para confirmar |
+| `NoSuchBucket` al arrancar mlflow | Buckets en `.env` no existen | `task local:ensure-buckets` |
+| MLflow rechaza requests con `Host header ... not allowed` | Cliente apunta a un host distinto de `mlflow:5000` / `localhost:5000` | Override en `command:` del compose (linea `--allowed-hosts`), o usar el URI default |
+| Trainer arranca y muere con `OOMKilled` (137) | `mem_limit: 8g` insuficiente para tu variedad | `TRAINER_MEM=16g` en `.env`, despues `task down && task up` |
+| `Port 5000/8080 is already allocated` | Otro proceso usa esos puertos | `lsof -i :5000` / `lsof -i :8080`, matarlo, o cambiar `ports:` en compose |
+| `task train` no encuentra `DB-HISTORICA.xlsx` | Saltaste `task data:split` | Correr `task data:split` primero |
+| `git_commit=unknown` en MLflow tag | El container no monta `.git/` (excluido por `.dockerignore`) | OK en dev local; en `task train` la version normal ya inyecta `GIT_SHA` via `-e` |
+| `task train` corre en el HOST en vez del container | `task` no levanto servicios | `task up` antes; o usar `task build` la primera vez |
+| Postgres healthcheck queda en `starting` para siempre | Imagen postgres corrupta o disco lleno | `docker compose down -v` (CUIDADO: borra runs), `docker system prune`, reintentar |
+| `mlflow` arranca pero `task train` falla con `Connection refused: mlflow:5000` | Service discovery del compose en red Docker rota | `docker compose down && task up`; si persiste, `docker network prune` |
+| `nginx 403 Forbidden` en `/reports/` | `reports/` del host vacio o sin permisos | Correr al menos 1 `task train`; verificar `ls -la reports/` |
+| `task train ... TUNING=prod` se queda colgado | `PARALLEL` muy alto + `TRAINER_CPUS=4` → oversubscription | Bajar `PARALLEL` o subir `TRAINER_CPUS`; ver `main.py:_resolve_parallelism` |
+
+### 0.5.9 Proximo paso: pasar a AWS
+
+Con el smoke local OK, lo que falta es llevar el **mismo** trainer a
+AWS Batch:
+
+1. Bootstrap del state Terraform (📖 Parte 2) — UNA vez por cuenta.
+2. Aplicar modulos (📖 Parte 3-4) — VPC, S3, ECR, MLflow ECS, Batch.
+3. Build + push de la imagen del trainer a ECR — `task ecr:build IMG=trainer`.
+4. Smoke test en Batch — `task batch:smoke`.
+
+Lo que **no cambia** entre local y AWS:
+- El `Dockerfile`. Es el mismo binario.
+- El codigo de `main.py` y `src/`. Lee env vars; en local lee del
+  `.env`, en Batch lee de la job definition.
+- El modelo final. Mismo joblib, mismo MAPE.
+
+Lo que **si cambia**:
+- `MLFLOW_TRACKING_URI`: en local `http://mlflow:5000`, en Batch
+  `http://<ALB-DNS>` (el MLflow Fargate).
+- Postgres: en local es contenedor, en AWS es RDS.
+- Creds AWS: en local via `~/.aws` montado, en Batch via IAM Task Role
+  (sin volumenes — el SDK las resuelve del metadata endpoint).
+
+Ver 📖 13.8 si queres ademas que tu **laptop entrene contra el MLflow
+de prod** (asi ningun run local queda huerfano en el Postgres local).
 
 ---
 
