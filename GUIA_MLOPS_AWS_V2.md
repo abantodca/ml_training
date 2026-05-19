@@ -1829,6 +1829,16 @@ variable "work_end_hour_local" {
   type        = number
   default     = 12
 }
+
+variable "consumer_org" {
+  description = "Org de GitHub del repo consumer (FastAPI+Streamlit) que asume el rol cross-repo via OIDC. Ver §13.5."
+  type        = string
+}
+
+variable "consumer_repo" {
+  description = "Nombre del repo consumer (ej. ml_serving). Junto con consumer_org arma el subject del trust policy."
+  type        = string
+}
 ```
 
 ### 3.2.4 `infra/envs/prod/terraform.tfvars` (NO COMMITEAR)
@@ -1837,6 +1847,10 @@ variable "work_end_hour_local" {
 alert_email = "abantodca@gmail.com"
 github_org  = "abantodca"
 github_repo = "ml_training"
+
+# Para Patch 13.5 — repo consumer que consume Model Registry via OIDC
+consumer_org  = "abantodca"      # <- tu org GH
+consumer_repo = "ml_serving"     # <- nombre del repo consumer
 ```
 
 Agregar a `.gitignore`:
@@ -8180,6 +8194,265 @@ jobs:
 > - **Pitfall tipico**: si el job `infra-apply` falla con `AccessDenied for sts:AssumeRoleWithWebIdentity`, revisar el trust policy del rol `ml-training-gha-deploy` — el `sub` debe permitir `repo:<org>/<repo>:*` (no solo `repo:<org>/<repo>:ref:refs/heads/main`).
 > - **Commit sugerido**: `feat(ci): deploy workflow (lint+test+build+plan+apply)`
 
+### 6.2.2 Archivo completo `.github/workflows/deploy.yml`
+
+Para reconstruir el archivo desde cero (no solo el esqueleto), pegar
+el contenido siguiente EXACTAMENTE. Las 244 lineas incluyen todos los
+steps de los 5 jobs (`changes`, `lint-and-test`, `build-and-push`,
+`terraform-plan`, `infra-apply`) con sus `if:`, env vars `TF_VAR_*`,
+`role-to-assume`, y el comentario del plan al PR via `github-script`.
+
+```yaml
+name: Deploy
+
+# Workflow consolidado (reemplaza ci.yml + terraform-plan.yml + infra-apply.yml).
+# Estrategia thin: cada job autentica via OIDC y delega en `task X`.
+#
+# Jobs y disparos:
+#   lint-and-test   -> SIEMPRE (push, PR, manual)
+#   build-and-push  -> solo push a main (publica trainer en ECR con sha + latest)
+#   terraform-plan  -> solo PR a main con cambios en infra/** (comenta plan en PR)
+#   infra-apply     -> solo push a main (orquesta task aws:deploy con approval)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  # ────────────────────────────────────────────────────────────────────────
+  # Detectar qué cambios trae el push/PR para activar jobs condicionales
+  # ────────────────────────────────────────────────────────────────────────
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      infra:   ${{ steps.filter.outputs.infra }}
+      trainer: ${{ steps.filter.outputs.trainer }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            infra:
+              - 'infra/**'
+              - '.github/workflows/deploy.yml'
+            trainer:
+              - 'src/**'
+              - 'main.py'
+              - 'Dockerfile'
+              - 'requirements.txt'
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Lint + tests (siempre)
+  # ────────────────────────────────────────────────────────────────────────
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+          cache: 'pip'
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Install Python deps
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+
+      # Single source of truth: las mismas tasks que un dev corre local.
+      - run: task lint
+      - run: task test
+      - run: task infra:validate
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Build + push trainer a ECR (solo push a main con cambios al trainer)
+  # ────────────────────────────────────────────────────────────────────────
+  build-and-push:
+    needs: [lint-and-test, changes]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && needs.changes.outputs.trainer == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assume gha-deploy role via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_GHA_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - run: task ecr:build IMG=trainer
+        env:
+          AWS_DEFAULT_REGION: ${{ vars.AWS_REGION }}
+          PROJECT: ${{ vars.PROJECT }}
+
+      - name: Output image tag
+        run: |
+          echo "::notice title=Pushed::${{ vars.ECR_TRAINER }}:sha-$(git rev-parse --short=12 HEAD)"
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Terraform plan en PRs (comenta el diff en el PR)
+  # ────────────────────────────────────────────────────────────────────────
+  terraform-plan:
+    needs: [lint-and-test, changes]
+    if: github.event_name == 'pull_request' && needs.changes.outputs.infra == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume gha-deploy role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_GHA_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: task infra:plan (tee a tfplan.txt)
+        id: plan
+        env:
+          AWS_DEFAULT_REGION: ${{ vars.AWS_REGION }}
+          PROJECT: ${{ vars.PROJECT }}
+          TF_VAR_alert_email:   ${{ vars.ALERT_EMAIL }}
+          TF_VAR_github_org:    ${{ github.repository_owner }}
+          TF_VAR_github_repo:   ${{ github.event.repository.name }}
+          TF_VAR_consumer_org:  ${{ vars.CONSUMER_ORG }}
+          TF_VAR_consumer_repo: ${{ vars.CONSUMER_REPO }}
+        run: |
+          set -o pipefail
+          task infra:plan 2>&1 | tee tfplan.txt
+        continue-on-error: true
+
+      - name: Comentar plan en el PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const planOutput = fs.readFileSync('tfplan.txt', 'utf8').slice(-60000);
+            const body = `### Terraform plan\n\n\`\`\`\n${planOutput}\n\`\`\`\n*exit code: ${{ steps.plan.outcome }}*`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: body
+            });
+
+      - name: Fail si plan fallo
+        if: steps.plan.outcome == 'failure'
+        run: exit 1
+
+  # ────────────────────────────────────────────────────────────────────────
+  # Apply infra (solo push a main, con approval del environment production)
+  # ────────────────────────────────────────────────────────────────────────
+  infra-apply:
+    needs: [lint-and-test, changes, build-and-push]
+    # build-and-push puede no haberse ejecutado (sin cambios al trainer). Lo permitimos via always() + needs.lint-and-test.result==success.
+    if: |
+      always() &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.lint-and-test.result == 'success' &&
+      (needs.build-and-push.result == 'success' || needs.build-and-push.result == 'skipped') &&
+      needs.changes.outputs.infra == 'true'
+    runs-on: ubuntu-latest
+    environment: production
+    concurrency:
+      group: tf-apply-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume gha-deploy role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_GHA_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: task aws:deploy (oleadas A+B+C)
+        env:
+          AWS_DEFAULT_REGION:       ${{ vars.AWS_REGION }}
+          PROJECT:                  ${{ vars.PROJECT }}
+          TF_VAR_alert_email:       ${{ vars.ALERT_EMAIL }}
+          TF_VAR_github_org:        ${{ github.repository_owner }}
+          TF_VAR_github_repo:       ${{ github.event.repository.name }}
+          TF_VAR_consumer_org:      ${{ vars.CONSUMER_ORG }}
+          TF_VAR_consumer_repo:     ${{ vars.CONSUMER_REPO }}
+          # Pinea el trainer al SHA recien construido. Sin esto queda "latest".
+          TF_VAR_trainer_image_tag: sha-${{ github.sha }}
+        run: task aws:deploy
+
+      - name: Capturar outputs
+        id: out
+        working-directory: infra/envs/prod
+        run: |
+          echo "alb_dns=$(terraform output -raw alb_dns)"                   >> $GITHUB_OUTPUT
+          echo "tracking_uri=$(terraform output -raw tracking_uri)"         >> $GITHUB_OUTPUT
+          echo "job_queue_spot=$(terraform output -raw job_queue_spot)"     >> $GITHUB_OUTPUT
+          echo "dispatcher=$(terraform output -raw dispatcher_function_name)" >> $GITHUB_OUTPUT
+
+      - name: Summary
+        run: |
+          {
+            echo "## Despliegue aplicado"
+            echo ""
+            echo "| Recurso | Valor |"
+            echo "|---|---|"
+            echo "| MLflow UI | ${{ steps.out.outputs.tracking_uri }} |"
+            echo "| Reports | http://${{ steps.out.outputs.alb_dns }}/reports/ |"
+            echo "| Artifacts | http://${{ steps.out.outputs.alb_dns }}/artifacts/ |"
+            echo "| Batch queue Spot | ${{ steps.out.outputs.job_queue_spot }} |"
+            echo "| Lambda dispatcher | ${{ steps.out.outputs.dispatcher }} |"
+            echo ""
+            echo "**Trainer image tag:** \`sha-${{ github.sha }}\`"
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+```
+
+> **Nota de mantenimiento**: §6.2.1 (esqueleto) y §6.2.2 (archivo
+> completo) deben mantenerse en sync con `.github/workflows/deploy.yml`.
+> Si cambias el workflow real, actualizar AMBOS.
+
 ## 6.3 `terraform-plan.yml` (eliminado)
 
 > **§6.3 (terraform-plan.yml) eliminado**: ahora es un job dentro de
@@ -8349,6 +8622,258 @@ Uso desde la UI:
 > - **Pitfall tipico**: el job `detect` necesita `permissions: actions: read` para que `gh run list --workflow Deploy` funcione; sin eso falla con `403` silencioso y cae al fallback `${HEAD_SHA}^` que solo cubre single-commit pushes (squash merges fallan).
 > - **Commit sugerido**: `feat(ci): training workflow consolidado (train+auto-train+promote)`
 
+### 6.4.2 Archivo completo `.github/workflows/training.yml`
+
+Para reconstruir el archivo desde cero (no solo el esqueleto), pegar
+el contenido siguiente EXACTAMENTE. Las 236 lineas incluyen el job
+`detect` con `gh run list` para BASE_SHA correcto, los jobs
+`wake-services` y `cool-down-and-stop` que delegan a `task cluster:*`,
+el job `train` con `task batch:train-lambda WAIT=true`, y el job
+`promote` con `environment: production`.
+
+```yaml
+name: Training
+
+# Workflow consolidado (reemplaza train.yml + auto-train-on-push.yml + promote.yml).
+# Tres modos via workflow_dispatch input `action`:
+#   action=train    -> entrena variedades elegidas (con wake/cool-down si MLflow esta apagado)
+#   action=promote  -> promueve un modelo a Production (3 gates: MAPE absoluto + A/B + approval)
+# Tambien auto-trigger:
+#   - workflow_run "Deploy" success -> auto-train si push toco trainer (action=train, varieties=all)
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Que quieres hacer'
+        required: true
+        default: 'train'
+        type: choice
+        options: [train, promote]
+
+      # Inputs para action=train (ignorados si action=promote)
+      varieties:
+        description: '[train] CSV (POP,JUPITER) o "all". Default "all".'
+        required: false
+        default: 'all'
+        type: string
+      tuning:
+        description: '[train] Profile'
+        required: false
+        default: 'prod'
+        type: choice
+        options: [smoke, dev, prod, prod_xl]
+
+      # Inputs para action=promote (ignorados si action=train)
+      model_name:
+        description: '[promote] Nombre completo del modelo en Registry (ej: rnd-forest-POP)'
+        required: false
+        type: string
+      version:
+        description: '[promote] Version a promover'
+        required: false
+        type: string
+      max_mape:
+        description: '[promote] Umbral MAPE maximo aceptable (%)'
+        required: false
+        default: '20'
+        type: string
+
+  workflow_run:
+    workflows: ["Deploy"]
+    types: [completed]
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+  actions:  read  # gh run list (detect.BASE_SHA en auto-train)
+
+concurrency:
+  group: training-${{ github.event.inputs.action || 'auto' }}
+  cancel-in-progress: false
+
+jobs:
+  # ════════════════════════════════════════════════════════════════════════
+  # DETECT: decide si hacer train, promote, o nada
+  # ════════════════════════════════════════════════════════════════════════
+  detect:
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    outputs:
+      mode:      ${{ steps.decide.outputs.mode }}        # train | promote | skip
+      varieties: ${{ steps.decide.outputs.varieties }}
+      tuning:    ${{ steps.decide.outputs.tuning }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # historial completo: BASE_SHA puede ser viejo
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+
+      - name: Decide modo
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -e
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "mode=${{ inputs.action }}"                  >> $GITHUB_OUTPUT
+            echo "varieties=${{ inputs.varieties || 'all' }}" >> $GITHUB_OUTPUT
+            echo "tuning=${{ inputs.tuning || 'prod' }}"      >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # workflow_run (post-Deploy): solo auto-train si toco el trainer.
+          # Para fijar BASE_SHA buscamos el ultimo Deploy success ANTERIOR
+          # (cubre push de N commits y squash merges; HEAD~1 fallaba en ambos).
+          HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
+          PREV_SHA=$(gh run list \
+            --workflow Deploy \
+            --branch main \
+            --status success \
+            --limit 20 \
+            --json headSha \
+            --jq "[.[] | select(.headSha != \"$HEAD_SHA\")] | .[0].headSha" 2>/dev/null || echo "")
+
+          if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "null" ]; then
+            BASE_SHA="$PREV_SHA"
+            echo "::notice::Diff contra ultimo Deploy success $BASE_SHA..$HEAD_SHA"
+          else
+            BASE_SHA="${HEAD_SHA}^"
+            echo "::notice::Primer auto-train (sin Deploy previo). Diff contra parent $BASE_SHA..$HEAD_SHA"
+          fi
+
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || echo "")
+          echo "Cambios:"; echo "$CHANGED"
+
+          if echo "$CHANGED" | grep -qE '^(src/|main\.py|Dockerfile|requirements\.txt|scripts/)'; then
+            echo "mode=train"      >> $GITHUB_OUTPUT
+            echo "varieties=all"   >> $GITHUB_OUTPUT
+            echo "tuning=prod"     >> $GITHUB_OUTPUT
+          else
+            echo "mode=skip"       >> $GITHUB_OUTPUT
+            echo "::notice::Push no toco trainer (src/**, main.py, Dockerfile, requirements.txt, scripts/**), skip auto-train"
+          fi
+
+  # ════════════════════════════════════════════════════════════════════════
+  # TRAIN PATH: wake -> train -> cool-down-and-stop
+  # ════════════════════════════════════════════════════════════════════════
+  wake-services:
+    needs: detect
+    if: needs.detect.outputs.mode == 'train'
+    runs-on: ubuntu-latest
+    outputs:
+      mlflow_was_up: ${{ steps.wake.outputs.was_up }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assume gha-train role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_GHA_TRAIN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Single source of truth: misma logica que `task cluster:wake-and-wait` local.
+      - name: Wake + esperar healthy
+        id: wake
+        env:
+          MLFLOW_ALB_DNS: ${{ vars.MLFLOW_ALB_DNS }}
+          PROJECT: ${{ vars.PROJECT }}
+          STATUS_FILE: /tmp/wake-status
+        run: |
+          task cluster:wake-and-wait
+          echo "was_up=$(cat $STATUS_FILE)" >> $GITHUB_OUTPUT
+
+  train:
+    needs: [detect, wake-services]
+    if: needs.detect.outputs.mode == 'train'
+    runs-on: ubuntu-latest
+    timeout-minutes: 480
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assume gha-train role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_GHA_TRAIN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Single source of truth: misma logica que un dev correria local.
+      - run: task batch:train-lambda VARIETIES="${{ needs.detect.outputs.varieties }}" TUNING="${{ needs.detect.outputs.tuning }}" WAIT=true
+        env:
+          AWS_DEFAULT_REGION: ${{ vars.AWS_REGION }}
+          PROJECT: ${{ vars.PROJECT }}
+
+  cool-down-and-stop:
+    needs: [detect, wake-services, train]
+    if: |
+      always() && needs.detect.outputs.mode == 'train' &&
+      needs.wake-services.result == 'success' &&
+      needs.wake-services.outputs.mlflow_was_up == 'false'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assume gha-train role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_GHA_TRAIN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Single source of truth: misma logica que `task cluster:cool-down-and-stop` local.
+      - run: task cluster:cool-down-and-stop
+        env:
+          AWS_DEFAULT_REGION: ${{ vars.AWS_REGION }}
+          PROJECT: ${{ vars.PROJECT }}
+
+  # ════════════════════════════════════════════════════════════════════════
+  # PROMOTE PATH: requiere approval del environment production
+  # ════════════════════════════════════════════════════════════════════════
+  promote:
+    needs: detect
+    if: needs.detect.outputs.mode == 'promote'
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Assume gha-train role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_GHA_TRAIN_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      # Single source of truth: 3 gates (MAPE absoluto + A/B + transition)
+      # corren igual que `task mlflow-aws:promote MODEL_NAME=... VERSION=...` local.
+      - run: task mlflow-aws:promote MODEL_NAME="${{ inputs.model_name }}" VERSION="${{ inputs.version }}" MAX_MAPE="${{ inputs.max_mape }}"
+        env:
+          MLFLOW_ALB_DNS: ${{ vars.MLFLOW_ALB_DNS }}
+```
+
+> **Nota de mantenimiento**: §6.4.1 (esqueleto) y §6.4.2 (archivo
+> completo) deben mantenerse en sync con `.github/workflows/training.yml`.
+> Si cambias el workflow real, actualizar AMBOS.
+
 ## 6.5 `promote.yml` (eliminado)
 
 > **§6.5 (promote.yml) eliminado**: ahora es un job dentro de
@@ -8507,6 +9032,179 @@ jobs:
 > - **Verificar**: `gh workflow run destroy.yml -f confirmar=NOPE -f modo=TEAR-DOWN` debe registrar un run que termina con `conclusion=skipped` (porque `confirmar != DESTRUIR-ML-TRAINING`); confirmable via `gh run list --workflow=destroy.yml --limit 1`.
 > - **Pitfall tipico**: el modo `NUKE` elimina el tfstate bucket + DynamoDB lock + OIDC provider; la doble salvaguarda con `environment: production` + string magica `DESTRUIR-ML-TRAINING` son CRITICAS — no las saques aunque parezcan redundantes.
 > - **Commit sugerido**: `feat(ci): destroy workflow con 3 modos`
+
+### 6.5.5.3 Archivo completo `.github/workflows/destroy.yml`
+
+Para reconstruir el archivo desde cero, pegar el contenido siguiente
+EXACTAMENTE. Las 156 lineas incluyen la doble salvaguarda
+(`if: inputs.confirmar == 'DESTRUIR-ML-TRAINING'` + `environment:
+production`), las 3 ramas TEAR-DOWN / DESTROY / NUKE que delegan a
+`task --yes aws:teardown` / `aws:destroy` / `aws:nuke`, el step de
+limpieza de CloudWatch log groups, y la verificacion post-operacion.
+
+```yaml
+name: Destroy
+
+# Workflow consolidado para destruir infra. Tres modos via input `modo`:
+#   TEAR-DOWN -> destroy de volatiles (mlflow, reports, batch, lambdas, monitoring,
+#                scheduler). Preserva S3, ECR, network, tfstate, OIDC.
+#                Reversible con `task aws:rebuild`. Costo restante: ~$8/mes (S3).
+#   DESTROY   -> terraform destroy de TODOS los modulos administrados (incluido
+#                storage). Borra buckets + ECR + RDS + VPC. PRESERVA tfstate + OIDC.
+#                Reversible re-creando todo via `task aws:deploy`.
+#   NUKE      -> DESTROY + borrar tfstate bucket + tflock DynamoDB + OIDC provider.
+#                Limpieza total de la cuenta. Despues necesitas re-bootstrap.
+#
+# Doble salvaguarda:
+#   1) Input textual exacto: "DESTRUIR-ML-TRAINING".
+#   2) environment: production -> approval manual.
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmar:
+        description: 'Escribe exactamente: DESTRUIR-ML-TRAINING'
+        required: true
+        type: string
+      modo:
+        description: 'TEAR-DOWN (preserva storage) | DESTROY (borra storage, preserva tfstate+OIDC) | NUKE (borra TODO)'
+        required: true
+        default: TEAR-DOWN
+        type: choice
+        options:
+          - TEAR-DOWN
+          - DESTROY
+          - NUKE
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: destroy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  destroy:
+    if: ${{ inputs.confirmar == 'DESTRUIR-ML-TRAINING' }}
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Assume gha-deploy role
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_GHA_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.6
+
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Capturar nombres de Lambdas (log groups los crea AWS, no TF)
+        id: lambdas
+        run: |
+          FNS=$(aws lambda list-functions \
+            --query 'Functions[?starts_with(FunctionName, `ml-training-`)].FunctionName' \
+            --output text || true)
+          echo "fns=${FNS}" >> $GITHUB_OUTPUT
+
+      - name: TEAR-DOWN (volatiles, preserva storage + network)
+        if: ${{ inputs.modo == 'TEAR-DOWN' }}
+        env:
+          AWS_DEFAULT_REGION:   ${{ vars.AWS_REGION }}
+          PROJECT:              ${{ vars.PROJECT }}
+          TF_VAR_alert_email:   ${{ vars.ALERT_EMAIL }}
+          TF_VAR_github_org:    ${{ github.repository_owner }}
+          TF_VAR_github_repo:   ${{ github.event.repository.name }}
+          TF_VAR_consumer_org:  ${{ vars.CONSUMER_ORG }}
+          TF_VAR_consumer_repo: ${{ vars.CONSUMER_REPO }}
+        run: task --yes aws:teardown
+
+      - name: DESTROY (todos los modulos, preserva tfstate + OIDC)
+        if: ${{ inputs.modo == 'DESTROY' }}
+        env:
+          AWS_DEFAULT_REGION:   ${{ vars.AWS_REGION }}
+          PROJECT:              ${{ vars.PROJECT }}
+          TF_VAR_alert_email:   ${{ vars.ALERT_EMAIL }}
+          TF_VAR_github_org:    ${{ github.repository_owner }}
+          TF_VAR_github_repo:   ${{ github.event.repository.name }}
+          TF_VAR_consumer_org:  ${{ vars.CONSUMER_ORG }}
+          TF_VAR_consumer_repo: ${{ vars.CONSUMER_REPO }}
+        run: task --yes aws:destroy
+
+      - name: NUKE (TODO + tfstate + tflock + OIDC)
+        if: ${{ inputs.modo == 'NUKE' }}
+        env:
+          AWS_DEFAULT_REGION:   ${{ vars.AWS_REGION }}
+          PROJECT:              ${{ vars.PROJECT }}
+          TF_VAR_alert_email:   ${{ vars.ALERT_EMAIL }}
+          TF_VAR_github_org:    ${{ github.repository_owner }}
+          TF_VAR_github_repo:   ${{ github.event.repository.name }}
+          TF_VAR_consumer_org:  ${{ vars.CONSUMER_ORG }}
+          TF_VAR_consumer_repo: ${{ vars.CONSUMER_REPO }}
+        run: task --yes aws:nuke
+
+      - name: Limpiar log groups de Lambdas (cleanup post-destroy)
+        if: ${{ always() && inputs.modo != 'TEAR-DOWN' && steps.lambdas.outputs.fns != '' }}
+        run: |
+          for FN in ${{ steps.lambdas.outputs.fns }}; do
+            LG="/aws/lambda/${FN}"
+            if aws logs describe-log-groups --log-group-name-prefix "$LG" \
+                 --query "logGroups[?logGroupName=='$LG'].logGroupName" --output text \
+                 | grep -q "$LG"; then
+              aws logs delete-log-group --log-group-name "$LG"
+              echo "Borrado: $LG"
+            fi
+          done
+
+      - name: Verificacion post-operacion
+        if: ${{ always() }}
+        run: |
+          echo "=== EC2 con tag Project=ml-training ==="
+          aws ec2 describe-instances \
+            --filters "Name=tag:Project,Values=ml-training" \
+                      "Name=instance-state-name,Values=running,pending,stopping,stopped" \
+            --query 'Reservations[].Instances[].InstanceId' --output text || true
+          echo ""
+          echo "=== RDS del proyecto ==="
+          aws rds describe-db-instances \
+            --query "DBInstances[?contains(DBInstanceIdentifier,'ml-training')].DBInstanceIdentifier" \
+            --output text || true
+          echo ""
+          echo "=== Fargate services activos ==="
+          aws ecs list-services --cluster ml-training-cluster \
+            --query 'serviceArns' --output text 2>/dev/null || echo "(cluster ya destruido o sin servicios)"
+          echo ""
+          echo "=== ALB del proyecto ==="
+          aws elbv2 describe-load-balancers \
+            --query "LoadBalancers[?contains(LoadBalancerName,'ml-training')].LoadBalancerName" \
+            --output text || true
+          echo ""
+          echo "=== ECR del proyecto ==="
+          aws ecr describe-repositories \
+            --query "repositories[?contains(repositoryName,'ml-training')].repositoryName" \
+            --output text 2>/dev/null || echo "(sin repos)"
+          echo ""
+          echo "=== S3 buckets del proyecto ==="
+          aws s3 ls | grep ml-training || echo "(sin buckets ml-training)"
+          echo ""
+          echo "=== OIDC provider ==="
+          aws iam list-open-id-connect-providers \
+            --query "OpenIDConnectProviderList[?contains(Arn, 'token.actions.githubusercontent.com')].Arn" \
+            --output text || echo "(sin OIDC provider)"
+```
+
+> **Nota de mantenimiento**: §6.5.5.2 (esqueleto) y §6.5.5.3 (archivo
+> completo) deben mantenerse en sync con `.github/workflows/destroy.yml`.
+> Las 7 env vars `TF_VAR_*` se repiten en cada uno de los 3 steps porque
+> GHA no comparte env entre steps con `if:` distintos.
 
 ## 6.6 Branch protection
 
@@ -9774,8 +10472,8 @@ Agregar `WORKDAYS_CRON` al bloque `environment.variables` del Lambda:
       ECS_SVC_MLFLOW     = var.ecs_service_name_mlflow
       ECS_SVC_REPORTS    = var.ecs_service_name_reports
       RDS_INSTANCE       = var.rds_instance_id
-      JOB_QUEUE_SPOT     = "${var.project}-job-queue-spot"
-      JOB_QUEUE_ONDEMAND = "${var.project}-job-queue-ondemand"
+      JOB_QUEUE_SPOT     = var.job_queue_spot_name
+      JOB_QUEUE_ONDEMAND = var.job_queue_ondemand_name
       WORKDAYS_CRON      = var.workdays_cron  # NUEVO: propagar al keepstop
       WORK_START_UTC     = tostring(local.start_hour_utc)  # NUEVO
       WORK_END_UTC       = tostring(local.stop_hour_utc)   # NUEVO
@@ -10434,28 +11132,24 @@ variable "consumer_repo" { type = string }
 
 **Archivo 2 — `infra/modules/consumer-iam/main.tf`:**
 
+> **Atencion**: en §13.5.2 el ejemplo original usaba `jsonencode` inline.
+> La version final (consistente con §3.11.5.2 y con el patron `_shared/`
+> de §3.4.5) usa `templatefile()`.
+
 ```hcl
 data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
 
 resource "aws_iam_role" "consumer" {
   name = "${var.project}-consumer"
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Federated = var.consumer_oidc_arn }
-      Action    = "sts:AssumeRoleWithWebIdentity"
-      Condition = {
-        StringEquals = {
-          "token.actions.githubusercontent.com:aud" = "sts.amazonaws.com"
-        }
-        StringLike = {
-          "token.actions.githubusercontent.com:sub" = "repo:${var.consumer_org}/${var.consumer_repo}:*"
-        }
-      }
-    }]
-  })
+  assume_role_policy = templatefile(
+    "${path.module}/../_shared/assume-github-oidc.json.tftpl",
+    {
+      provider_arn = var.consumer_oidc_arn
+      org          = var.consumer_org
+      repo         = var.consumer_repo
+    }
+  )
 }
 
 resource "aws_iam_role_policy" "consumer" {
@@ -10892,22 +11586,31 @@ RDS, mismo bucket de artifacts). Esquema:
 commitear, va en `.gitignore`) con el override de URI:
 
 ```yaml
-# docker-compose.override.yml (LOCAL, apuntando a prod)
-# Compose lo merge automaticamente con docker-compose.yml
+# Patch 13.8 — override del compose local para apuntar a MLflow productivo.
+#
+# Uso:
+#   1) Copiar este archivo a `docker-compose.override.yml` (NO se commitea,
+#      esta en .gitignore).
+#   2) Reemplazar <ALB-DNS> por el output `alb_dns` de Terraform:
+#        terraform -chdir=infra/envs/prod output -raw alb_dns
+#   3) Levantar el trainer normalmente:
+#        docker compose run --rm trainer --varieties POP --tuning smoke
+#      El trainer va a loguear runs en el MLflow productivo y sincronizar
+#      artifacts al S3 productivo.
+#
+# IMPORTANTE: con este override activo, los runs locales aparecen mezclados
+# con runs de prod en la misma UI. Recomendado: taggearlos como `env=local-dev`
+# para distinguirlos (ver guia §13.8.5).
+
 services:
   trainer:
     environment:
-      MLFLOW_TRACKING_URI: http://${MLFLOW_ALB_DNS}
-      # Bucket de prod — SOBREESCRIBE el S3_ARTIFACTS_BUCKET del .env local.
-      # Antes de correr, verificar que el bucket existe:
-      #   aws s3 ls s3://ml-training-artifacts-${ACCOUNT_SUFFIX}
-      S3_ARTIFACTS_BUCKET: ml-training-artifacts-${ACCOUNT_SUFFIX}
-
-  # Desactivar los servicios que ya no necesitas en local
-  mlflow:
-    profiles: ["disabled"]
-  postgres:
-    profiles: ["disabled"]
+      MLFLOW_TRACKING_URI: http://<ALB-DNS>
+      # Asegura que use el bucket productivo. Si lo queres en sandbox, cambialo.
+      # task local:bucket-name KIND=artifacts  imprime el nombre completo.
+      S3_ARTIFACTS_BUCKET: ml-training-artifacts-<SUFFIX>
+      # Tag opcional para identificar runs locales en la UI productiva.
+      MLFLOW_DEV_USER: ${USER:-unknown}
 ```
 
 Y en tu `.env` local agregar (sacando el ALB DNS de Terraform):
