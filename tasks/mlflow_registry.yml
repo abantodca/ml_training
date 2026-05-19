@@ -5,10 +5,10 @@
 # Separado del MLflow local (que vive en docker-compose).
 #
 # USO TIPICO:
-#   task mlflow-aws:list-versions VARIETY=POP                    ver versiones
-#   task mlflow-aws:current-prod  VARIETY=POP                    ver Production actual
-#   task mlflow-aws:promote VARIETY=POP VERSION=3                gate MAPE<=20 (default)
-#   task mlflow-aws:promote VARIETY=POP VERSION=3 MAX_MAPE=15    gate custom
+#   task mlflow-aws:list-versions MODEL_NAME=rnd-forest-POP                  ver versiones
+#   task mlflow-aws:current-prod  MODEL_NAME=rnd-forest-POP                  ver Production actual
+#   task mlflow-aws:promote MODEL_NAME=rnd-forest-POP VERSION=3              gate MAPE<=20 (default)
+#   task mlflow-aws:promote MODEL_NAME=rnd-forest-POP VERSION=3 MAX_MAPE=15  gate custom
 # =============================================================================
 
 version: "3"

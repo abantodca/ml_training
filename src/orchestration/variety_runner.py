@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Optional
 
 import mlflow
+from mlflow.exceptions import MlflowException
 
 from src.config import ARTIFACTS_DIR, CHAMPION_MAX_GAP, CHAMPION_MAX_MAPE, REPORTS_DIR
 from src.orchestration.cleanup import cleanup_residual_reports, cleanup_state
@@ -72,17 +73,13 @@ def train_variety(
     logger.info(f"[{variety}] MLflow experiment: '{experiment_name}'")
 
     t_var = time.perf_counter()
-    results: list[ModelResult] = []
-    failures: list[str] = []
-
-    for model_type in model_types:
-        try:
-            results.append(train_model(variety, model_type, args, settings, logger))
-        except Exception:
-            logger.exception(f"[{variety}/{model_type}] FALLO")
-            failures.append(model_type)
-        finally:
-            cleanup_state(logger, f"post {variety}/{model_type}")
+    results, failures = _run_model_loop(
+        variety=variety,
+        model_types=model_types,
+        args=args,
+        settings=settings,
+        logger=logger,
+    )
 
     champion_decision: Optional[dict] = None
     registered_name: Optional[str] = None
@@ -103,88 +100,17 @@ def train_variety(
             f"[{variety}] Decision: {champion_decision.get('justification', '')}"
         )
 
-        # --- Quality gate: rechazar campeon si supera umbrales minimos ---
-        # Gate sobre MAPE OOF (honesto: cada fila predicha por un modelo que
-        # no la vio en train), NO sobre full_mape (in-sample, optimista).
-        # full_mape se sigue exponiendo en el log como referencia del modelo
-        # de produccion, pero la decision de promover depende del OOF.
-        # Quality gate con separacion correcta de conceptos:
-        #   - MAPE_oof = calidad OPERATIVA real (lo que ve el negocio).
-        #     Si supera threshold -> BLOQUEA registro (modelo inutil).
-        #   - gap = sintoma DIAGNOSTICO de overfitting (diferencia train-test).
-        #     Si supera threshold -> WARNING pero NO bloquea registro:
-        #     un arbol boosted con gap alto puede igual generalizar bien
-        #     (memoriza train por diseno; lo importante es MAE_test honesto).
-        mape_ok = champion.oof_mape <= CHAMPION_MAX_MAPE
-        gap_ok = (champion.abs_gap * 100) <= CHAMPION_MAX_GAP
-
-        if not mape_ok:
-            logger.warning(
-                f"[{variety}] CAMPEON RECHAZADO por calidad operativa | "
-                f"MAPE_oof={champion.oof_mape:.2f}% supera threshold "
-                f"{CHAMPION_MAX_MAPE}%. El modelo NO se registra en Model Registry "
-                f"(predice mal en datos OOF -> inutilizable en produccion). "
-                f"El run SI esta en MLflow Experiments (run_id={champion.mlflow_run_id[:8]}...) "
-                f"con todos sus artifacts para diagnostico."
-            )
-            args_register = False
-        elif not gap_ok:
-            logger.warning(
-                f"[{variety}] CAMPEON registra con WARNING de overfitting | "
-                f"gap={champion.abs_gap * 100:.2f}pp supera threshold "
-                f"{CHAMPION_MAX_GAP}pp pero MAPE_oof={champion.oof_mape:.2f}% "
-                f"(<={CHAMPION_MAX_MAPE}%) confirma calidad operativa OK. "
-                f"El gap es diagnostico de memoria del train, NO afecta predicciones "
-                f"OOF/produccion. Modelo aprobado para Registry."
-            )
-            args_register = args.register_model
-        else:
-            logger.info(
-                f"[{variety}] CAMPEON pasa quality gate | "
-                f"MAPE_oof={champion.oof_mape:.2f}% (max={CHAMPION_MAX_MAPE}%) | "
-                f"gap={champion.abs_gap * 100:.2f}pp (max={CHAMPION_MAX_GAP}pp). "
-                f"Registra en MLflow Model Registry."
-            )
-            args_register = args.register_model
-
+        args_register = _apply_quality_gate(champion, args, variety, logger)
         emit_mape_metric(variety=variety, mape_value=champion.oof_mape)
 
-        # Eliminar runs de modelos NO campeon de MLflow Experiments. El usuario
-        # quiere ver UN solo run por training (el ganador), no los candidatos.
-        # Soft delete via API: MLflow marca lifecycle_stage='deleted' en
-        # Postgres (recuperable con client.restore_run). El ModelResult sigue
-        # vivo en memoria asi que el dashboard HTML/Excel comparativos NO se
-        # afectan.
-        # Limpiar mlflow_run_id="" en el ModelResult evita que _tag_champion
-        # intente operar sobre runs que ya no existen.
-        losers = [r for r in results if r is not champion]
-        if losers:
-            client = mlflow.tracking.MlflowClient()
-            deleted_count = 0
-            for loser in losers:
-                if not loser.mlflow_run_id:
-                    continue
-                try:
-                    client.delete_run(loser.mlflow_run_id)
-                    loser.mlflow_run_id = ""
-                    deleted_count += 1
-                except Exception:
-                    logger.exception(
-                        f"[{variety}] error eliminando run de {loser.model_type}"
-                    )
-            if deleted_count > 0:
-                logger.info(
-                    f"[{variety}] Eliminados {deleted_count}/{len(losers)} run(s) "
-                    f"no campeon de MLflow (en .trash, recuperables): "
-                    f"{[lo.model_type for lo in losers]}"
-                )
+        _delete_loser_runs(results, champion, variety, logger)
 
         # Cargar (X, y, business_cols) UNA sola vez. Antes se recargaba 2-3
         # veces (Excel + Dashboard + render). single_run las libera al
         # terminar; el costo aqui es leer 1 hoja del Excel (~10k filas).
         try:
             X_full, _, business_full = _load_variety_inputs(variety)
-        except Exception:
+        except Exception:  # defensive: pandas/openpyxl puede lanzar varios tipos en IO
             logger.exception(
                 f"[{variety}] no se pudo recargar data para outputs ejecutivos"
             )
@@ -208,31 +134,16 @@ def train_variety(
         )
 
         # ---- Dashboard ejecutivo por-run (Winner_{variety}_{run_label}.html) ----
-        if X_full is not None:
-            try:
-                winner_path = render_winner_dashboard(
-                    variety=variety,
-                    results=results,
-                    champion=champion,
-                    decision=champion_decision,
-                    excel_path=winner_excel_path,
-                    X_raw=X_full,
-                    run_label=run_label,
-                )
-                winner_report_path = str(winner_path)
-                logger.info(f"[{variety}] Winner dashboard: {winner_path}")
-                # Limpia obsoletos (reporte_*, business_export_*) pero mantiene
-                # Winners por-run y residuals: el index global los lista todos.
-                keep = [winner_path]
-                if winner_excel_path:
-                    keep.append(winner_excel_path)
-                deleted = cleanup_residual_reports(variety=variety, keep=keep)
-                if deleted:
-                    logger.info(
-                        f"[{variety}] Limpieza reports/: {len(deleted)} archivo(s) borrado(s)"
-                    )
-            except Exception:
-                logger.exception(f"[{variety}] no se pudo construir Winner dashboard")
+        winner_report_path = _render_winner_and_cleanup(
+            variety=variety,
+            results=results,
+            champion=champion,
+            champion_decision=champion_decision,
+            X_full=X_full,
+            winner_excel_path=winner_excel_path,
+            run_label=run_label,
+            logger=logger,
+        )
 
         _tag_champion(
             champion,
@@ -253,44 +164,255 @@ def train_variety(
                 winner_report_path=winner_report_path,
             )
 
-        # Regenera el dashboard global (`reports/index.html`) DESPUES del
-        # register MLflow para que el sidebar liste el Winner recien
-        # generado y la pill 'Latest' apunte a el. En modo paralelo (varias
-        # variedades simultaneas) hay race condition al reescribir el mismo
-        # archivo: aceptable porque ambos procesos escanean reports/ y el
-        # ultimo en escribir ve todos los archivos. Try/except para no
-        # abortar la variedad si write_dashboard falla.
-        try:
-            from src.diagnostics.dashboard_index import write_dashboard
-            write_dashboard(REPORTS_DIR)
-        except Exception:
-            logger.exception(f"[{variety}] no se pudo regenerar reports/index.html")
-
-        # Mensaje final UNICO con champion + registry + comando UI. Sale solo
-        # aqui (no por cada modelo en single_run) porque hasta ahora el champion
-        # ya esta seleccionado, registrado y los losers eliminados.
-        registry_line = (
-            f"version registrada: {registered_name}"
-            if registered_name
-            else "Model Registry no aplico (backend no SQL o gate falla)"
+        _write_global_dashboard_index(variety, logger)
+        _log_final_summary(
+            variety=variety,
+            champion=champion,
+            registered_name=registered_name,
+            logger=logger,
         )
-        logger.info("=" * 78)
-        logger.info(
-            f"[{variety}] CHAMPION FINAL: {champion.model_type} "
-            f"(run={champion.mlflow_run_id[:12]}) | "
-            f"MAE_test={champion.metrics.get('nested_cv_mae_mean', 0):.4f} | "
-            f"|gap|={champion.abs_gap:.4f} | "
-            f"MAPE_oof={champion.oof_mape:.2f}%"
-        )
-        logger.info(f"[{variety}] {registry_line}")
-        logger.info(
-            f"[{variety}] MLflow UI: http://localhost:5000 "
-            "(local: `task up`; AWS: ALB del modulo mlflow)"
-        )
-        logger.info("=" * 78)
 
     elapsed = time.perf_counter() - t_var
-    summary = {
+    summary = _build_summary(
+        variety=variety,
+        experiment_name=experiment_name,
+        model_types=model_types,
+        failures=failures,
+        registered_name=registered_name,
+        winner_report_path=winner_report_path,
+        winner_excel_path=winner_excel_path,
+        elapsed=elapsed,
+        champion_decision=champion_decision,
+        results=results,
+    )
+    dump_json_artifact(
+        ARTIFACTS_DIR / f"variety_summary_{variety}.json",
+        summary,
+    )
+    return summary
+
+
+def _run_model_loop(
+    variety: str,
+    model_types: list[str],
+    args: argparse.Namespace,
+    settings: dict,
+    logger,
+) -> tuple[list[ModelResult], list[str]]:
+    """Itera modelos, llama `train_model` y acumula resultados / fallos.
+
+    Cleanup post-modelo (memoria/MLflow run abierto) se hace en `finally`
+    para que un FALLO no deje runs colgados.
+    """
+    results: list[ModelResult] = []
+    failures: list[str] = []
+    for model_type in model_types:
+        try:
+            results.append(train_model(variety, model_type, args, settings, logger))
+        except Exception:  # defensive: train_model envuelve logica heterogenea (model fit, MLflow, IO)
+            logger.exception(f"[{variety}/{model_type}] FALLO")
+            failures.append(model_type)
+        finally:
+            cleanup_state(logger, f"post {variety}/{model_type}")
+    return results, failures
+
+
+def _apply_quality_gate(
+    champion: ModelResult,
+    args: argparse.Namespace,
+    variety: str,
+    logger,
+) -> bool:
+    """Decide si el campeon se registra segun MAPE_oof y |gap|.
+
+    - MAPE_oof = calidad OPERATIVA real (lo que ve el negocio).
+      Si supera threshold -> BLOQUEA registro (modelo inutil).
+    - gap = sintoma DIAGNOSTICO de overfitting (diferencia train-test).
+      Si supera threshold -> WARNING pero NO bloquea registro:
+      un arbol boosted con gap alto puede igual generalizar bien
+      (memoriza train por diseno; lo importante es MAE_test honesto).
+
+    Devuelve True si pasa el gate operativo (MAPE_oof OK) y respeta el
+    flag `--register-model`; False si MAPE_oof supera el threshold.
+    """
+    mape_ok = champion.oof_mape <= CHAMPION_MAX_MAPE
+    gap_ok = (champion.abs_gap * 100) <= CHAMPION_MAX_GAP
+
+    if not mape_ok:
+        logger.warning(
+            f"[{variety}] CAMPEON RECHAZADO por calidad operativa | "
+            f"MAPE_oof={champion.oof_mape:.2f}% supera threshold "
+            f"{CHAMPION_MAX_MAPE}%. El modelo NO se registra en Model Registry "
+            f"(predice mal en datos OOF -> inutilizable en produccion). "
+            f"El run SI esta en MLflow Experiments (run_id={champion.mlflow_run_id[:8]}...) "
+            f"con todos sus artifacts para diagnostico."
+        )
+        return False
+    if not gap_ok:
+        logger.warning(
+            f"[{variety}] CAMPEON registra con WARNING de overfitting | "
+            f"gap={champion.abs_gap * 100:.2f}pp supera threshold "
+            f"{CHAMPION_MAX_GAP}pp pero MAPE_oof={champion.oof_mape:.2f}% "
+            f"(<={CHAMPION_MAX_MAPE}%) confirma calidad operativa OK. "
+            f"El gap es diagnostico de memoria del train, NO afecta predicciones "
+            f"OOF/produccion. Modelo aprobado para Registry."
+        )
+        return args.register_model
+    logger.info(
+        f"[{variety}] CAMPEON pasa quality gate | "
+        f"MAPE_oof={champion.oof_mape:.2f}% (max={CHAMPION_MAX_MAPE}%) | "
+        f"gap={champion.abs_gap * 100:.2f}pp (max={CHAMPION_MAX_GAP}pp). "
+        f"Registra en MLflow Model Registry."
+    )
+    return args.register_model
+
+
+def _delete_loser_runs(
+    results: list[ModelResult],
+    champion: ModelResult,
+    variety: str,
+    logger,
+) -> None:
+    """Elimina runs de modelos NO campeon de MLflow Experiments.
+
+    Soft delete via API: MLflow marca lifecycle_stage='deleted' en
+    Postgres (recuperable con client.restore_run). El ModelResult sigue
+    vivo en memoria asi que el dashboard HTML/Excel comparativos NO se
+    afectan.
+    Limpiar mlflow_run_id="" en el ModelResult evita que _tag_champion
+    intente operar sobre runs que ya no existen.
+    """
+    losers = [r for r in results if r is not champion]
+    if not losers:
+        return
+    client = mlflow.tracking.MlflowClient()
+    deleted_count = 0
+    for loser in losers:
+        if not loser.mlflow_run_id:
+            continue
+        try:
+            client.delete_run(loser.mlflow_run_id)
+            loser.mlflow_run_id = ""
+            deleted_count += 1
+        except MlflowException:
+            logger.exception(
+                f"[{variety}] error eliminando run de {loser.model_type}"
+            )
+    if deleted_count > 0:
+        logger.info(
+            f"[{variety}] Eliminados {deleted_count}/{len(losers)} run(s) "
+            f"no campeon de MLflow (en .trash, recuperables): "
+            f"{[lo.model_type for lo in losers]}"
+        )
+
+
+def _render_winner_and_cleanup(
+    variety: str,
+    results: list[ModelResult],
+    champion: ModelResult,
+    champion_decision: dict,
+    X_full,
+    winner_excel_path: Optional[str],
+    run_label: str,
+    logger,
+) -> Optional[str]:
+    """Renderiza Winner_{variety}_{run_label}.html y limpia obsoletos.
+
+    Devuelve el path como string del dashboard generado, o None si X_full
+    no esta disponible o el render fallo.
+    """
+    if X_full is None:
+        return None
+    try:
+        winner_path = render_winner_dashboard(
+            variety=variety,
+            results=results,
+            champion=champion,
+            decision=champion_decision,
+            excel_path=winner_excel_path,
+            X_raw=X_full,
+            run_label=run_label,
+        )
+        logger.info(f"[{variety}] Winner dashboard: {winner_path}")
+        # Limpia obsoletos (reporte_*, business_export_*) pero mantiene
+        # Winners por-run y residuals: el index global los lista todos.
+        keep = [winner_path]
+        if winner_excel_path:
+            keep.append(winner_excel_path)
+        deleted = cleanup_residual_reports(variety=variety, keep=keep)
+        if deleted:
+            logger.info(
+                f"[{variety}] Limpieza reports/: {len(deleted)} archivo(s) borrado(s)"
+            )
+        return str(winner_path)
+    except Exception:  # defensive: render HTML mezcla plotly, jinja, IO; varios tipos posibles
+        logger.exception(f"[{variety}] no se pudo construir Winner dashboard")
+        return None
+
+
+def _write_global_dashboard_index(variety: str, logger) -> None:
+    """Regenera el dashboard global (`reports/index.html`).
+
+    Se llama DESPUES del register MLflow para que el sidebar liste el
+    Winner recien generado y la pill 'Latest' apunte a el. En modo
+    paralelo (varias variedades simultaneas) hay race condition al
+    reescribir el mismo archivo: aceptable porque ambos procesos
+    escanean reports/ y el ultimo en escribir ve todos los archivos.
+    Try/except para no abortar la variedad si write_dashboard falla.
+    """
+    try:
+        from src.diagnostics.dashboard_index import write_dashboard
+        write_dashboard(REPORTS_DIR)
+    except Exception:  # defensive: write_dashboard mezcla scan FS + jinja + IO
+        logger.exception(f"[{variety}] no se pudo regenerar reports/index.html")
+
+
+def _log_final_summary(
+    variety: str,
+    champion: ModelResult,
+    registered_name: Optional[str],
+    logger,
+) -> None:
+    """Mensaje final UNICO con champion + registry + comando UI.
+
+    Sale solo aqui (no por cada modelo en single_run) porque hasta ahora
+    el champion ya esta seleccionado, registrado y los losers eliminados.
+    """
+    registry_line = (
+        f"version registrada: {registered_name}"
+        if registered_name
+        else "Model Registry no aplico (backend no SQL o gate falla)"
+    )
+    logger.info("=" * 78)
+    logger.info(
+        f"[{variety}] CHAMPION FINAL: {champion.model_type} "
+        f"(run={champion.mlflow_run_id[:12]}) | "
+        f"MAE_test={champion.metrics.get('nested_cv_mae_mean', float('nan')):.4f} | "
+        f"|gap|={champion.abs_gap:.4f} | "
+        f"MAPE_oof={champion.oof_mape:.2f}%"
+    )
+    logger.info(f"[{variety}] {registry_line}")
+    logger.info(
+        f"[{variety}] MLflow UI: http://localhost:5000 "
+        "(local: `task up`; AWS: ALB del modulo mlflow)"
+    )
+    logger.info("=" * 78)
+
+
+def _build_summary(
+    variety: str,
+    experiment_name: str,
+    model_types: list[str],
+    failures: list[str],
+    registered_name: Optional[str],
+    winner_report_path: Optional[str],
+    winner_excel_path: Optional[str],
+    elapsed: float,
+    champion_decision: Optional[dict],
+    results: list[ModelResult],
+) -> dict:
+    """Construye el diccionario `variety_summary_<NAME>.json`."""
+    return {
         "variety": variety,
         "timestamp": datetime.now().isoformat(timespec="seconds"),
         "experiment": experiment_name,
@@ -316,11 +438,6 @@ def train_variety(
             for r in results
         ],
     }
-    dump_json_artifact(
-        ARTIFACTS_DIR / f"variety_summary_{variety}.json",
-        summary,
-    )
-    return summary
 
 
 def _load_variety_inputs(variety: str):
@@ -372,7 +489,7 @@ def _export_winner_excel(
 
     try:
         final_pipeline = joblib.load(champion.pipeline_path)
-    except Exception:
+    except OSError:
         logger.exception(f"[{variety}] no se pudo cargar pipeline del campeon")
         return None
 
@@ -422,7 +539,7 @@ def _tag_champion(
       en MLflow UI. Sin esto, abrir lgb_v20 en MLflow no muestra contra qué
       compitió ni por qué perdió.
     """
-    try:
+    try:  # defensive: MLflow + IO (set_tag/log_artifact + dump_json_artifact)
         client = mlflow.tracking.MlflowClient()
 
         client.set_tag(champion.mlflow_run_id, "is_champion", "true")
@@ -447,22 +564,7 @@ def _tag_champion(
             f"{champion.oof_mape:.4f}",
         )
 
-        # Tags de drift/EDA: si existe un EDA sidecar reciente, capturamos el
-        # peor PSI y count de severidad para que MLflow UI muestre cuando el
-        # data drift se vuelve critico run-tras-run sin abrir HTMLs manualmente.
-        try:
-            from src.diagnostics.eda import (
-                extract_drift_summary,
-                find_latest_eda_sidecar,
-            )
-            sidecar = find_latest_eda_sidecar(variety)
-            if sidecar is not None:
-                for k, v in extract_drift_summary(sidecar).items():
-                    if v:  # skip empty strings
-                        client.set_tag(champion.mlflow_run_id, k, v)
-                logger.info(f"[{variety}] Drift tags MLflow desde {sidecar.name}")
-        except Exception:
-            logger.exception(f"[{variety}] no se pudo taggear drift (no critico)")
+        _tag_drift_summary(client, champion, variety, logger)
 
         for r in results:
             # r.mlflow_run_id puede estar vacio si el run fue eliminado por
@@ -496,8 +598,30 @@ def _tag_champion(
                 continue
             for path, sub in artifacts:
                 client.log_artifact(r.mlflow_run_id, path, artifact_path=sub)
-    except Exception:
+    except Exception:  # defensive: MLflow + IO (set_tag/log_artifact + dump_json_artifact)
         logger.exception(f"[{variety}] no se pudo taggear campeon en MLflow")
+
+
+def _tag_drift_summary(client, champion: ModelResult, variety: str, logger) -> None:
+    """Capa de tags de drift/EDA sobre el run campeon.
+
+    Si existe un EDA sidecar reciente, captura el peor PSI y count de
+    severidad para que MLflow UI muestre cuando el data drift se vuelve
+    critico run-tras-run sin abrir HTMLs manualmente.
+    """
+    try:  # defensive: import dinamico + IO (sidecar) + MLflow set_tag
+        from src.diagnostics.eda import (
+            extract_drift_summary,
+            find_latest_eda_sidecar,
+        )
+        sidecar = find_latest_eda_sidecar(variety)
+        if sidecar is not None:
+            for k, v in extract_drift_summary(sidecar).items():
+                if v:  # skip empty strings
+                    client.set_tag(champion.mlflow_run_id, k, v)
+            logger.info(f"[{variety}] Drift tags MLflow desde {sidecar.name}")
+    except Exception:  # defensive: import dinamico + IO + MLflow
+        logger.exception(f"[{variety}] no se pudo taggear drift (no critico)")
 
 
 def _register_champion(
@@ -539,7 +663,7 @@ def _register_champion(
                 "composite_score": f"{champion.composite_score:.6f}",
             },
         )
-    except Exception:
+    except MlflowException:
         logger.exception(
             f"[{variety}] register_model FALLO (auth/red/schema). "
             "El run sigue logueado pero NO se registro version."

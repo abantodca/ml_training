@@ -7,9 +7,48 @@ from __future__ import annotations
 
 from html import escape
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional
 
 import numpy as np
+
+
+def plotly_div(fig, div_id: str = "") -> str:
+    """Devuelve <div> embebible (sin plotly.js) o "" si Plotly no esta.
+
+    Helper compartido entre `diagnostics.py` (charts globales del pipeline)
+    y `html/technical.py` (boxplots por subgrupo). El script `plotly.js`
+    se carga UNA sola vez desde el <head> via `html.styles._PLOTLY_JS_TAG`,
+    por eso aqui siempre se pasa `include_plotlyjs=False`.
+    """
+    try:
+        kwargs = {
+            "include_plotlyjs": False,
+            "full_html": False,
+            "config": {"displaylogo": False, "responsive": True},
+        }
+        if div_id:
+            kwargs["div_id"] = div_id
+        return fig.to_html(**kwargs)
+    except Exception:
+        return ""
+
+
+def compute_error_percentiles(abs_errors: np.ndarray) -> Dict[str, float]:
+    """Devuelve {p50, p90, p99} sobre `abs_errors`.
+
+    Si el array esta vacio retorna NaN en cada percentil (evita el warning
+    "percentile of empty array" y mantiene el contrato de un dict completo
+    para los renderers que indexan por clave).
+    """
+    arr = np.asarray(abs_errors)
+    if arr.size == 0:
+        nan = float("nan")
+        return {"p50": nan, "p90": nan, "p99": nan}
+    return {
+        "p50": float(np.percentile(arr, 50)),
+        "p90": float(np.percentile(arr, 90)),
+        "p99": float(np.percentile(arr, 99)),
+    }
 
 
 def fmt(value: Optional[float], digits: int = 4, suffix: str = "") -> str:

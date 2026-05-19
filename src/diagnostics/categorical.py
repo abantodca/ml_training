@@ -25,6 +25,13 @@ from typing import List, Optional
 import numpy as np
 import pandas as pd
 
+from src.config import (
+    CARDINALITY_HIGH,
+    CARDINALITY_WARN,
+    CRAMERS_V_STRONG,
+    CRAMERS_V_WEAK,
+)
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -144,7 +151,7 @@ def profile_categorical(
     chi2_dof_val = None
     cramers_v_val = None
     target_clean = target.dropna()
-    if len(target_clean) >= 30 and cardinality >= 2 and cardinality <= 200:
+    if len(target_clean) >= 30 and cardinality >= 2 and cardinality <= CARDINALITY_HIGH:
         try:
             median = float(target_clean.median())
             target_bin = (target >= median).astype(int)
@@ -186,11 +193,11 @@ def _target_encoding_rec(cardinality: int, n_valid: int, v: Optional[float]) -> 
         return "constante; eliminar columna"
     if cardinality == 2:
         return "binaria; OneHot directo"
-    if cardinality > 50 and n_valid / max(cardinality, 1) < 30:
+    if cardinality > CARDINALITY_WARN and n_valid / max(cardinality, 1) < 30:
         return f"alta cardinalidad ({cardinality}) con baja densidad; target-encoding con suavizado o agrupar 'Otros'"
-    if v is not None and v < 0.05:
+    if v is not None and v < CRAMERS_V_WEAK:
         return f"asociacion debil con target (V={v:.2f}); candidata a drop o agrupar"
-    if v is not None and v >= 0.3:
+    if v is not None and v >= CRAMERS_V_STRONG:
         return f"asociacion fuerte (V={v:.2f}); target-encoding o Embedding util"
     return "OneHot estandar (cardinalidad media, asociacion moderada)"
 

@@ -11,6 +11,7 @@ calculos pesados) y devuelve un fragmento HTML escapado.
 """
 from __future__ import annotations
 
+import math
 from html import escape
 from typing import List, Optional
 
@@ -34,7 +35,7 @@ from src.step_05_evaluate.explainability import (
     kpi_precision,
     kpi_vs_baseline,
 )
-from src.step_05_evaluate.html.helpers import download_button
+from src.step_05_evaluate.html.helpers import compute_error_percentiles, download_button
 
 
 def build_hero(
@@ -227,6 +228,40 @@ def build_bias_section(fundo_bias: List[GroupBias]) -> str:
     """
 
 
+def _backend_row_html(r: ModelResult, champion: ModelResult) -> str:
+    """Renderiza una fila <tr> de la tabla comparativa de backends."""
+    is_champ = r.model_type == champion.model_type
+    delta_gap = r.abs_gap - champion.abs_gap
+    delta_mape = (
+        r.full_mape - champion.full_mape
+        if r.full_mape != float("inf") and champion.full_mape != float("inf")
+        else float("nan")
+    )
+    delta_time = r.elapsed_seconds - champion.elapsed_seconds
+    crown = "👑 " if is_champ else ""
+    klass = "champ-row" if is_champ else ""
+    delta_gap_str = "—" if is_champ else f"{delta_gap:+.4f}"
+    delta_mape_str = (
+        "—" if is_champ
+        else (f"{delta_mape:+.2f} pp" if not np.isnan(delta_mape) else "—")
+    )
+    delta_time_str = "—" if is_champ else f"{delta_time:+.0f}s"
+    full_mape_str = (
+        f"{r.full_mape:.2f}%" if r.full_mape != float("inf") else "—"
+    )
+    return (
+        f'<tr class="{klass}">'
+        f'<td>{crown}{escape(r.model_type.upper())}</td>'
+        f'<td>{r.abs_gap:.4f}</td>'
+        f'<td>{delta_gap_str}</td>'
+        f'<td>{full_mape_str}</td>'
+        f'<td>{delta_mape_str}</td>'
+        f'<td>{r.elapsed_seconds:.0f}s</td>'
+        f'<td>{delta_time_str}</td>'
+        f'</tr>'
+    )
+
+
 def build_backends_comparison_section(
     results: List[ModelResult],
     champion: ModelResult,
@@ -239,38 +274,10 @@ def build_backends_comparison_section(
     """
     if len(results) < 2:
         return ""
-    rows_html = ""
-    for r in sorted(results, key=lambda x: x.abs_gap):
-        is_champ = r.model_type == champion.model_type
-        delta_gap = r.abs_gap - champion.abs_gap
-        delta_mape = (
-            r.full_mape - champion.full_mape
-            if r.full_mape != float("inf") and champion.full_mape != float("inf")
-            else float("nan")
-        )
-        delta_time = r.elapsed_seconds - champion.elapsed_seconds
-        crown = "👑 " if is_champ else ""
-        klass = "champ-row" if is_champ else ""
-        delta_gap_str = "—" if is_champ else f"{delta_gap:+.4f}"
-        delta_mape_str = (
-            "—" if is_champ
-            else (f"{delta_mape:+.2f} pp" if not np.isnan(delta_mape) else "—")
-        )
-        delta_time_str = "—" if is_champ else f"{delta_time:+.0f}s"
-        full_mape_str = (
-            f"{r.full_mape:.2f}%" if r.full_mape != float("inf") else "—"
-        )
-        rows_html += (
-            f'<tr class="{klass}">'
-            f'<td>{crown}{escape(r.model_type.upper())}</td>'
-            f'<td>{r.abs_gap:.4f}</td>'
-            f'<td>{delta_gap_str}</td>'
-            f'<td>{full_mape_str}</td>'
-            f'<td>{delta_mape_str}</td>'
-            f'<td>{r.elapsed_seconds:.0f}s</td>'
-            f'<td>{delta_time_str}</td>'
-            f'</tr>'
-        )
+    rows_html = "".join(
+        _backend_row_html(r, champion)
+        for r in sorted(results, key=lambda x: x.abs_gap)
+    )
     return f"""
     <section>
       <div class="eyebrow">Comparativo de modelos</div>
@@ -294,23 +301,8 @@ def build_backends_comparison_section(
     """
 
 
-def build_statistical_diagnostic_section(
-    *,
-    mae_ci,
-    mape_ci,
-    r2_ci,
-    heteroscedasticity,
-    calibration_df,
-) -> str:
-    """Diagnostico estadistico riguroso: IC bootstrap + heteroscedasticity + calibration.
-
-    Solo se renderiza si hay al menos UNA pieza disponible (todas pueden venir
-    None si la muestra fue insuficiente).
-    """
-    if all(x is None for x in [mae_ci, mape_ci, r2_ci, heteroscedasticity, calibration_df]):
-        return ""
-
-    # IC bootstrap
+def _ci_table_html(mae_ci, mape_ci, r2_ci) -> str:
+    """Tabla de intervalos de confianza bootstrap. Vacio si todas las CI son None."""
     ci_rows = ""
     if mae_ci is not None:
         ci_rows += (
@@ -330,40 +322,69 @@ def build_statistical_diagnostic_section(
             f"<td>{r2_ci.point:.4f}</td>"
             f"<td>[{r2_ci.ci_low:.4f}, {r2_ci.ci_high:.4f}]</td></tr>"
         )
-    ci_block = (
+    if not ci_rows:
+        return ""
+    return (
         f"<table class='backends-table'>"
         f"<thead><tr><th>Métrica</th><th>Valor</th><th>IC 95%</th></tr></thead>"
         f"<tbody>{ci_rows}</tbody></table>"
-        if ci_rows else ""
     )
 
-    # Heteroscedasticidad
-    hetero_block = ""
-    if heteroscedasticity is not None and not (heteroscedasticity.p_value != heteroscedasticity.p_value):
-        klass = "action warning" if heteroscedasticity.is_heteroscedastic else "action info"
-        icon = "⚠" if heteroscedasticity.is_heteroscedastic else "✅"
-        title = (
-            "Variabilidad del error NO uniforme"
-            if heteroscedasticity.is_heteroscedastic
-            else "Variabilidad del error uniforme"
-        )
-        hetero_block = (
-            f'<div class="{klass}" style="margin-top:12px;">'
-            f'<div class="icon">{icon}</div>'
-            f'<div class="body-wrap">'
-            f'<div class="title">{escape(title)}</div>'
-            f'<div class="body">{escape(heteroscedasticity.note)}</div>'
-            f'</div></div>'
-        )
 
-    # Calibration plot (Plotly)
-    calib_block = ""
-    if calibration_df is not None and len(calibration_df) > 0:
-        try:
-            from src.step_05_evaluate.diagnostics import plot_calibration_plotly
-            calib_block = plot_calibration_plotly(calibration_df)
-        except Exception:
-            calib_block = ""
+def _heteroscedasticity_block_html(heteroscedasticity) -> str:
+    """Bloque visual para el test de heteroscedasticidad.
+
+    Vacio si el objeto es None o si su p_value es NaN (test no aplicable).
+    """
+    if heteroscedasticity is None or math.isnan(heteroscedasticity.p_value):
+        return ""
+    klass = "action warning" if heteroscedasticity.is_heteroscedastic else "action info"
+    icon = "⚠" if heteroscedasticity.is_heteroscedastic else "✅"
+    title = (
+        "Variabilidad del error NO uniforme"
+        if heteroscedasticity.is_heteroscedastic
+        else "Variabilidad del error uniforme"
+    )
+    return (
+        f'<div class="{klass}" style="margin-top:12px;">'
+        f'<div class="icon">{icon}</div>'
+        f'<div class="body-wrap">'
+        f'<div class="title">{escape(title)}</div>'
+        f'<div class="body">{escape(heteroscedasticity.note)}</div>'
+        f'</div></div>'
+    )
+
+
+def _calibration_block_html(calibration_df) -> str:
+    """Renderiza el plot de calibracion (Plotly). Vacio si no aplica o falla."""
+    if calibration_df is None or len(calibration_df) == 0:
+        return ""
+    try:
+        from src.step_05_evaluate.diagnostics import plot_calibration_plotly
+        return plot_calibration_plotly(calibration_df)
+    except Exception:
+        return ""
+
+
+def build_statistical_diagnostic_section(
+    *,
+    mae_ci,
+    mape_ci,
+    r2_ci,
+    heteroscedasticity,
+    calibration_df,
+) -> str:
+    """Diagnostico estadistico riguroso: IC bootstrap + heteroscedasticity + calibration.
+
+    Solo se renderiza si hay al menos UNA pieza disponible (todas pueden venir
+    None si la muestra fue insuficiente).
+    """
+    if all(x is None for x in [mae_ci, mape_ci, r2_ci, heteroscedasticity, calibration_df]):
+        return ""
+
+    ci_block = _ci_table_html(mae_ci, mape_ci, r2_ci)
+    hetero_block = _heteroscedasticity_block_html(heteroscedasticity)
+    calib_block = _calibration_block_html(calibration_df)
 
     return f"""
     <section>
@@ -409,27 +430,17 @@ def build_pdp_section(pdp_html: str) -> str:
     """
 
 
-def build_errors_detail_section(
-    *,
-    business_validation,
-    X_aligned,
-    excel_path: Optional[str] = None,
-    top_n: int = 20,
-) -> str:
-    """Sección 'Errores detallados': MAE/MAPE OOF totales + top N peores +
-    histograma + residuos + serie temporal.
+def _compute_oof_error_arrays(business_validation):
+    """Extrae y prepara los arrays OOF (real, pred, abs_err, residuals, pct_err).
 
-    Sustenta visualmente "donde se equivoca el modelo" sin tener que abrir
-    el Excel. La hoja 'Predicciones_OOF' del Excel sigue siendo la fuente
-    autoritativa con todas las filas (filtrable, ordenable).
+    Devuelve None si no hay datos validos.
     """
     if business_validation is None or business_validation.is_empty():
-        return ""
-
+        return None
     real = getattr(business_validation, "kg_jr_real_oof", None)
     pred = getattr(business_validation, "kg_jr_pred_oof", None)
     if real is None or pred is None or len(real) == 0:
-        return ""
+        return None
 
     real_arr = np.asarray(real, dtype=float)
     pred_arr = np.asarray(pred, dtype=float)
@@ -437,16 +448,31 @@ def build_errors_detail_section(
     residuals = real_arr - pred_arr
     nz = real_arr != 0
     pct_err = np.where(nz, abs_err / np.abs(real_arr) * 100.0, np.nan)
+    return real_arr, pred_arr, abs_err, residuals, pct_err, nz
 
-    # KPIs globales (OOF, sobre TODA la data alineada)
-    n = abs_err.size
-    mae = float(abs_err.mean())
-    mape = float(np.nanmean(pct_err)) if np.any(nz) else float("nan")
-    p50 = float(np.percentile(abs_err, 50))
-    p90 = float(np.percentile(abs_err, 90))
-    p99 = float(np.percentile(abs_err, 99))
 
-    metrics_cards = (
+def _compute_oof_kpis(abs_err: np.ndarray, pct_err: np.ndarray, nz: np.ndarray) -> dict:
+    """Calcula KPIs globales OOF: n, mae, mape, p50, p90, p99."""
+    pcts = compute_error_percentiles(abs_err)
+    return {
+        "n": abs_err.size,
+        "mae": float(abs_err.mean()),
+        "mape": float(np.nanmean(pct_err)) if np.any(nz) else float("nan"),
+        "p50": pcts["p50"],
+        "p90": pcts["p90"],
+        "p99": pcts["p99"],
+    }
+
+
+def _metrics_cards_html(kpis: dict) -> str:
+    """Renderiza la grilla de KPI cards OOF."""
+    n = kpis["n"]
+    mae = kpis["mae"]
+    mape = kpis["mape"]
+    p50 = kpis["p50"]
+    p90 = kpis["p90"]
+    p99 = kpis["p99"]
+    return (
         '<div class="ctx-grid">'
         f'<div class="ctx-card"><div class="label">N filas evaluadas (OOF)</div>'
         f'<div class="value">{n:,}</div>'
@@ -469,28 +495,48 @@ def build_errors_detail_section(
         '</div>'
     )
 
-    # Top-N peores predicciones
-    order = np.argsort(abs_err)[::-1][:top_n]
-    has_X = (X_aligned is not None
-             and hasattr(X_aligned, "iloc")
-             and len(X_aligned) == n)
+
+def _extract_row_context(X_aligned, i: int, has_X: bool) -> tuple:
+    """Devuelve (fecha, fundo, formato) para la fila i de X_aligned.
+
+    Si X_aligned no esta alineado o falta una columna, retorna "—".
+    """
+    fecha = "—"
+    fundo = "—"
+    formato = "—"
+    if has_X:
+        try:
+            row = X_aligned.iloc[i]
+            if "FECHA" in row.index and pd.notna(row["FECHA"]):
+                fecha = pd.to_datetime(row["FECHA"]).strftime("%Y-%m-%d")
+            if "FUNDO" in row.index and pd.notna(row["FUNDO"]):
+                fundo = str(row["FUNDO"])
+            if "FORMATO" in row.index and pd.notna(row["FORMATO"]):
+                formato = str(row["FORMATO"])
+        except Exception:
+            pass
+    return fecha, fundo, formato
+
+
+def _compute_top_worst_errors(abs_err: np.ndarray, top_n: int) -> np.ndarray:
+    """Indices de las top_n filas con mayor error absoluto (desc)."""
+    return np.argsort(abs_err)[::-1][:top_n]
+
+
+def _top_errors_table_html(
+    order: np.ndarray,
+    real_arr: np.ndarray,
+    pred_arr: np.ndarray,
+    abs_err: np.ndarray,
+    pct_err: np.ndarray,
+    X_aligned,
+    has_X: bool,
+) -> str:
+    """Tabla de las top-N peores predicciones."""
     rows_html = ""
     for rank, i in enumerate(order, start=1):
         i = int(i)
-        fecha = "—"
-        fundo = "—"
-        formato = "—"
-        if has_X:
-            try:
-                row = X_aligned.iloc[i]
-                if "FECHA" in row.index and pd.notna(row["FECHA"]):
-                    fecha = pd.to_datetime(row["FECHA"]).strftime("%Y-%m-%d")
-                if "FUNDO" in row.index and pd.notna(row["FUNDO"]):
-                    fundo = str(row["FUNDO"])
-                if "FORMATO" in row.index and pd.notna(row["FORMATO"]):
-                    formato = str(row["FORMATO"])
-            except Exception:
-                pass
+        fecha, fundo, formato = _extract_row_context(X_aligned, i, has_X)
         signo = "↑ sobreestima" if pred_arr[i] > real_arr[i] else "↓ subestima"
         rows_html += (
             f'<tr>'
@@ -505,8 +551,7 @@ def build_errors_detail_section(
             f'<td>{signo}</td>'
             f'</tr>'
         )
-
-    table_html = f"""
+    return f"""
     <table class="backends-table" style="margin-top:8px">
       <thead><tr>
         <th>#</th><th>Fecha</th><th>FUNDO</th><th>FORMATO</th>
@@ -520,7 +565,21 @@ def build_errors_detail_section(
     </table>
     """
 
-    # Plots: histograma + residuos + serie temporal
+
+def _error_plots_html(
+    abs_err: np.ndarray,
+    pred_arr: np.ndarray,
+    residuals: np.ndarray,
+    p50: float,
+    p90: float,
+    p99: float,
+    X_aligned,
+    has_X: bool,
+) -> tuple:
+    """Genera los plots Plotly: histograma, residuos vs predicho, serie temporal.
+
+    Devuelve (hist_html, resid_html, time_html). Cualquiera puede ser "" si falla.
+    """
     from src.step_05_evaluate.diagnostics import (
         plot_error_histogram_plotly,
         plot_error_over_time_plotly,
@@ -537,19 +596,64 @@ def build_errors_detail_section(
             )
         except Exception:
             time_html = ""
+    return hist_html, resid_html, time_html
 
-    excel_link = ""
-    if excel_path:
-        from pathlib import Path as _P
-        fname = _P(excel_path).name
-        excel_link = (
-            f'<p style="margin-top:8px;font-size:12px;color:#475569">'
-            f'Para inspeccionar las {n:,} filas con sus errores fila por fila, '
-            f'abri la hoja <b>Predicciones_OOF</b> en el Excel adjunto: '
-            f'<a href="{escape(fname)}" download style="color:#1f4e8a;'
-            f'text-decoration:none;border-bottom:1px dashed #1f4e8a">'
-            f'{escape(fname)}</a>.</p>'
-        )
+
+def _excel_link_html(excel_path: Optional[str], n: int) -> str:
+    """Genera el link al Excel adjunto (vacio si no hay path)."""
+    if not excel_path:
+        return ""
+    from pathlib import Path as _P
+    fname = _P(excel_path).name
+    return (
+        f'<p style="margin-top:8px;font-size:12px;color:#475569">'
+        f'Para inspeccionar las {n:,} filas con sus errores fila por fila, '
+        f'abri la hoja <b>Predicciones_OOF</b> en el Excel adjunto: '
+        f'<a href="{escape(fname)}" download style="color:#1f4e8a;'
+        f'text-decoration:none;border-bottom:1px dashed #1f4e8a">'
+        f'{escape(fname)}</a>.</p>'
+    )
+
+
+def build_errors_detail_section(
+    *,
+    business_validation,
+    X_aligned,
+    excel_path: Optional[str] = None,
+    top_n: int = 20,
+) -> str:
+    """Sección 'Errores detallados': MAE/MAPE OOF totales + top N peores +
+    histograma + residuos + serie temporal.
+
+    Sustenta visualmente "donde se equivoca el modelo" sin tener que abrir
+    el Excel. La hoja 'Predicciones_OOF' del Excel sigue siendo la fuente
+    autoritativa con todas las filas (filtrable, ordenable).
+    """
+    arrays = _compute_oof_error_arrays(business_validation)
+    if arrays is None:
+        return ""
+    real_arr, pred_arr, abs_err, residuals, pct_err, nz = arrays
+
+    kpis = _compute_oof_kpis(abs_err, pct_err, nz)
+    n = kpis["n"]
+    p50, p90, p99 = kpis["p50"], kpis["p90"], kpis["p99"]
+
+    metrics_cards = _metrics_cards_html(kpis)
+
+    has_X = (X_aligned is not None
+             and hasattr(X_aligned, "iloc")
+             and len(X_aligned) == n)
+
+    order = _compute_top_worst_errors(abs_err, top_n)
+    table_html = _top_errors_table_html(
+        order, real_arr, pred_arr, abs_err, pct_err, X_aligned, has_X,
+    )
+
+    hist_html, resid_html, time_html = _error_plots_html(
+        abs_err, pred_arr, residuals, p50, p90, p99, X_aligned, has_X,
+    )
+
+    excel_link = _excel_link_html(excel_path, n)
 
     return f"""
     <section>

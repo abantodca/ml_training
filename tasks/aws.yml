@@ -18,6 +18,10 @@
 
 version: "3"
 
+vars:
+  SUFFIX:
+    sh: aws sts get-caller-identity --query Account --output text | tail -c 7
+
 tasks:
 
   # ═══ Deploy / smoke ═════════════════════════════════════════════════════════
@@ -48,12 +52,9 @@ tasks:
   # ═══ Lifecycle (atajos a cluster:) ══════════════════════════════════════════
 
   wake:
-    desc: "Encender stack (scale-up + sleep 5min + wait-healthy). Para lunes a la manana"
+    desc: "Encender stack (scale-up + wait-healthy). Para lunes a la manana"
     cmds:
       - task: ":cluster:scale-up"
-      - 'echo ""'
-      - 'echo "Esperando ~5 min a que RDS este Available..."'
-      - sleep 300
       - task: ":cluster:wait-healthy"
 
   sleep:
@@ -82,17 +83,17 @@ tasks:
       - 'echo ""'
       - 'echo ">>> Vaciando buckets S3 con versioning (data + artifacts)..."'
       - task: _empty-bucket
-        vars: { BUCKET: '{{.PROJECT | default "ml-training"}}-data' }
+        vars: { BUCKET: '{{.PROJECT}}-data-{{.SUFFIX}}' }
       - task: _empty-bucket
-        vars: { BUCKET: '{{.PROJECT | default "ml-training"}}-artifacts' }
+        vars: { BUCKET: '{{.PROJECT}}-artifacts-{{.SUFFIX}}' }
       - 'echo ""'
       - 'echo ">>> Borrando imagenes ECR..."'
       - task: _purge-ecr
-        vars: { REPO: '{{.PROJECT | default "ml-training"}}' }
+        vars: { REPO: '{{.PROJECT}}' }
       - task: _purge-ecr
-        vars: { REPO: '{{.PROJECT | default "ml-training"}}-mlflow' }
+        vars: { REPO: '{{.PROJECT}}-mlflow' }
       - task: _purge-ecr
-        vars: { REPO: '{{.PROJECT | default "ml-training"}}-reports' }
+        vars: { REPO: '{{.PROJECT}}-reports' }
       - 'echo ""'
       - 'echo ">>> terraform destroy total..."'
       - task: ":infra:destroy"
@@ -104,7 +105,8 @@ tasks:
       - task: destroy
       - 'echo ""'
       - 'echo ">>> Borrando bucket tfstate (backend Terraform)..."'
-      - task: _delete-tfstate-bucket
+      - task: _empty-bucket
+        vars: { BUCKET: '{{.PROJECT}}-tfstate-{{.SUFFIX}}', DELETE: "true" }
       - 'echo ">>> Borrando DynamoDB tflock..."'
       - task: _delete-tflock
       - 'echo ">>> Borrando OIDC provider de GitHub Actions..."'
@@ -119,19 +121,21 @@ tasks:
     requires:
       vars: [BUCKET]
     vars:
-      SUFFIX:
-        sh: aws sts get-caller-identity --query Account --output text | tail -c 7
+      DELETE: '{{.DELETE | default "false"}}'
     cmds:
       - |
-        FULL="{{.BUCKET}}-{{.SUFFIX}}"
-        if ! aws s3api head-bucket --bucket "$FULL" 2>/dev/null; then
-          echo "  $FULL no existe, skip"; exit 0
+        if ! aws s3api head-bucket --bucket "{{.BUCKET}}" 2>/dev/null; then
+          echo "  {{.BUCKET}} no existe, skip"; exit 0
         fi
-        echo "  Vaciando $FULL (versiones + delete markers)..."
-        aws s3api delete-objects --bucket "$FULL" \
-          --delete "$(aws s3api list-object-versions --bucket "$FULL" \
+        echo "  Vaciando {{.BUCKET}} (versiones + delete markers)..."
+        aws s3api delete-objects --bucket "{{.BUCKET}}" \
+          --delete "$(aws s3api list-object-versions --bucket "{{.BUCKET}}" \
             --query '{Objects: [Versions[].{Key:Key,VersionId:VersionId},DeleteMarkers[].{Key:Key,VersionId:VersionId}][]}' \
             --max-items 1000)" 2>/dev/null || echo "  (bucket ya vacio)"
+        if [ "{{.DELETE}}" = "true" ]; then
+          echo "  Borrando bucket {{.BUCKET}}..."
+          aws s3 rb "s3://{{.BUCKET}}"
+        fi
 
   _purge-ecr:
     internal: true
@@ -149,30 +153,10 @@ tasks:
         echo "  Borrando todas las imagenes de {{.REPO}}..."
         aws ecr batch-delete-image --repository-name "{{.REPO}}" --image-ids "$IDS" >/dev/null
 
-  _delete-tfstate-bucket:
-    internal: true
-    vars:
-      SUFFIX:
-        sh: aws sts get-caller-identity --query Account --output text | tail -c 7
-      BUCKET: '{{.PROJECT | default "ml-training"}}-tfstate'
-    cmds:
-      - |
-        FULL="{{.BUCKET}}-{{.SUFFIX}}"
-        if ! aws s3api head-bucket --bucket "$FULL" 2>/dev/null; then
-          echo "  $FULL no existe, skip"; exit 0
-        fi
-        echo "  Vaciando $FULL..."
-        aws s3api delete-objects --bucket "$FULL" \
-          --delete "$(aws s3api list-object-versions --bucket "$FULL" \
-            --query '{Objects: [Versions[].{Key:Key,VersionId:VersionId},DeleteMarkers[].{Key:Key,VersionId:VersionId}][]}' \
-            --max-items 1000)" 2>/dev/null || true
-        echo "  Borrando $FULL..."
-        aws s3 rb "s3://$FULL"
-
   _delete-tflock:
     internal: true
     vars:
-      TABLE: '{{.PROJECT | default "ml-training"}}-tflock'
+      TABLE: '{{.PROJECT}}-tflock'
     cmds:
       - |
         if aws dynamodb describe-table --table-name "{{.TABLE}}" >/dev/null 2>&1; then

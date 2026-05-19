@@ -1,7 +1,3 @@
-# Datos compartidos
-data "aws_caller_identity" "current" {}
-data "aws_region" "current" {}
-
 # OIDC provider de GitHub (creado en Parte 2.5, NO creado por Terraform).
 # Si saltaste 📖 2.5, este `data` falla con "no resource found" en plan.
 # Pre-check antes de `terraform plan`:
@@ -109,15 +105,18 @@ module "monitoring" {
 module "lambdas" {
   source = "../../modules/lambdas"
 
-  project                = var.project
-  job_queue_spot_arn     = module.batch.job_queue_spot_arn
-  job_queue_ondemand_arn = module.batch.job_queue_ondemand_arn
-  job_definition_name    = module.batch.job_definition_name
-  data_bucket            = module.storage.data_bucket
-  varieties_allowed      = var.varieties_allowed
-  sns_topic_arn          = module.monitoring.sns_topic_arn
-  log_retention_days     = var.log_retention_days
-  lambdas_src_dir        = "${path.module}/../../lambdas"
+  project                 = var.project
+  job_queue_spot_arn      = module.batch.job_queue_spot_arn
+  job_queue_ondemand_arn  = module.batch.job_queue_ondemand_arn
+  job_queue_spot_name     = module.batch.job_queue_spot
+  job_queue_ondemand_name = module.batch.job_queue_ondemand
+  job_definition_name     = module.batch.job_definition_name
+  data_bucket             = module.storage.data_bucket
+  varieties_allowed       = var.varieties_allowed
+  sns_topic_arn           = module.monitoring.sns_topic_arn
+  batch_log_group_name    = module.batch.log_group_name
+  log_retention_days      = var.log_retention_days
+  lambdas_src_dir         = "${path.module}/../../lambdas"
 }
 
 # -------------------------------------------------------------------------
@@ -131,6 +130,8 @@ module "scheduler" {
   ecs_service_name_mlflow  = module.mlflow.service_name
   ecs_service_name_reports = module.reports.service_name
   rds_instance_id          = module.mlflow.rds_instance_id
+  job_queue_spot_name      = module.batch.job_queue_spot
+  job_queue_ondemand_name  = module.batch.job_queue_ondemand
   work_start_hour_local    = var.work_start_hour_local
   work_end_hour_local      = var.work_end_hour_local
   log_retention_days       = var.log_retention_days

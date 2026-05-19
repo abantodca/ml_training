@@ -59,25 +59,49 @@ version: "3"
 # `.env` es opcional. Si no existe, los defaults sanos de config.py aplican.
 dotenv: [ ".env" ]
 
-# === ANADIR despues del bloque dotenv existente ===
 # Modulos AWS por dominio. Cada include prefija con su namespace, asi las
 # tasks locales (build, up, train, ...) no chocan con las AWS (infra:apply,
 # ecr:build, ...).
+#
+# Variables PROJECT y REGION se propagan explicitamente: en go-task los
+# includes tienen scope aislado, asi que sin `vars:` aqui los hijos no las
+# verian. Esto centraliza los defaults y elimina redeclaraciones por archivo.
 includes:
   infra:
     taskfile: ./tasks/infra.yml
+    vars:
+      PROJECT: '{{.PROJECT}}'
+      REGION: '{{.REGION}}'
   ecr:
     taskfile: ./tasks/ecr.yml
+    vars:
+      PROJECT: '{{.PROJECT}}'
+      REGION: '{{.REGION}}'
   batch:
     taskfile: ./tasks/batch.yml
+    vars:
+      PROJECT: '{{.PROJECT}}'
+      REGION: '{{.REGION}}'
   cluster:
     taskfile: ./tasks/cluster.yml
+    vars:
+      PROJECT: '{{.PROJECT}}'
+      REGION: '{{.REGION}}'
   mlflow-aws:
     taskfile: ./tasks/mlflow_registry.yml
+    vars:
+      PROJECT: '{{.PROJECT}}'
+      REGION: '{{.REGION}}'
   aws:
     taskfile: ./tasks/aws.yml
+    vars:
+      PROJECT: '{{.PROJECT}}'
+      REGION: '{{.REGION}}'
   local:
     taskfile: ./tasks/local.yml
+    vars:
+      PROJECT: '{{.PROJECT}}'
+      REGION: '{{.REGION}}'
 
 
 vars:
@@ -85,6 +109,7 @@ vars:
   VARIETIES: "{{.VARIETIES | default \"POP\"}}"
   PARALLEL: "{{.PARALLEL | default \"1\"}}"
   PROJECT: "{{.PROJECT | default \"ml-training\"}}"
+  REGION: "{{.AWS_DEFAULT_REGION | default \"us-east-1\"}}"
 
 tasks:
 
@@ -138,7 +163,7 @@ tasks:
         echo "   task aws:deploy                               stand-up completo del stack"
         echo "   task aws:wake  /  task aws:sleep              encender / apagar stack"
         echo "   task batch:train VARIETIES=POP TUNING=prod    entrenar en AWS Batch"
-        echo "   task mlflow-aws:promote VARIETY=POP VERSION=N promover modelo a Production"
+        echo "   task mlflow-aws:promote MODEL_NAME=rnd-forest-POP VERSION=N  promover modelo a Production"
         echo ""
         echo "   task help:aws                                 referencia AWS completa"
         echo ""
@@ -260,9 +285,9 @@ tasks:
         echo "   task cluster:teardown / rebuild             destroy / restore modulos volatiles"
         echo ""
         echo "MLFLOW REGISTRY (AWS):"
-        echo "   task mlflow-aws:list-versions VARIETY=POP   listar versiones del modelo"
-        echo "   task mlflow-aws:current-prod  VARIETY=POP   version Production actual"
-        echo "   task mlflow-aws:promote VARIETY=POP VERSION=N [MAX_MAPE=20]"
+        echo "   task mlflow-aws:list-versions MODEL_NAME=rnd-forest-POP   listar versiones del modelo"
+        echo "   task mlflow-aws:current-prod  MODEL_NAME=rnd-forest-POP   version Production actual"
+        echo "   task mlflow-aws:promote MODEL_NAME=rnd-forest-POP VERSION=N [MAX_MAPE=20]"
         echo "                                               promover a Production con gate MAPE"
         echo ""
         echo "DESTRUCTIVO AWS:"

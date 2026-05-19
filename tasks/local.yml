@@ -15,17 +15,14 @@
 version: "3"
 
 vars:
-  PROJECT: '{{.PROJECT | default "ml-training"}}'
-  REGION:  '{{.AWS_DEFAULT_REGION | default "us-east-1"}}'
+  SUFFIX:
+    sh: aws sts get-caller-identity --query Account --output text | tail -c 7
 
 tasks:
 
   ensure-buckets:
     desc: "Crea S3 buckets data + artifacts si no existen (idempotente). Misma cuenta+region que prod."
     silent: true
-    vars:
-      SUFFIX:
-        sh: aws sts get-caller-identity --query Account --output text | tail -c 7
     cmds:
       - task: _ensure-bucket
         vars: { NAME: '{{.PROJECT}}-data-{{.SUFFIX}}' }
@@ -41,9 +38,6 @@ tasks:
     silent: true
     requires:
       vars: [KIND]
-    vars:
-      SUFFIX:
-        sh: aws sts get-caller-identity --query Account --output text | tail -c 7
     cmds:
       - echo "{{.PROJECT}}-{{.KIND}}-{{.SUFFIX}}"
 

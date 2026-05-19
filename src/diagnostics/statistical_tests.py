@@ -40,6 +40,12 @@ class TestResult:
     is_finding: bool = False  # True si rechazar H0 = "problema a remediar"
     notes: str = ""
     extra: dict = field(default_factory=dict)
+    # Campos opcionales para compatibilidad con consumers que esperaban
+    # `HeteroscedasticityTest` (HTML report del step_05). `note` (sin 's')
+    # almacena la interpretacion en lenguaje natural; `is_heteroscedastic`
+    # es un alias semantico de `rejects_h0` para tests de heterocedasticidad.
+    note: Optional[str] = None
+    is_heteroscedastic: Optional[bool] = None
 
     def status_emoji(self) -> str:
         """Devuelve 🟢/🔴/⚪ segun el resultado del test.
@@ -195,6 +201,91 @@ def breusch_pagan(y: pd.Series, X: pd.DataFrame, alpha: float = 0.05) -> TestRes
     except Exception as e:
         out = _safe_test(name, h0, is_finding=True)
         out.notes = f"error: {e}"
+        return out
+
+
+def breusch_pagan_residuals(
+    residuals,
+    predictions,
+    alpha: float = 0.05,
+) -> TestResult:
+    """Variante de Breusch-Pagan que parte de residuos y predicciones ya calculadas.
+
+    Pensada para diagnostico post-hoc de un modelo arbitrario (no necesariamente
+    OLS): ajusta una OLS auxiliar `residuos ~ predictions` y aplica el test LM
+    de heterocedasticidad sobre los residuos de esa auxiliar.
+
+    H0: var(residual) constante (homoscedastico).
+    H1: var(residual) varia con la magnitud predicha.
+
+    Si p < alpha, los intervalos simetricos del modelo (mean +/- k*std) NO son
+    validos uniformemente; recomendado usar Conformal Prediction (que no asume
+    homoscedasticidad).
+
+    Devuelve `TestResult` con los campos extra `note` (interpretacion en
+    espanol) y `is_heteroscedastic` (alias de `rejects_h0`) para mantener
+    compatibilidad con consumers que originalmente esperaban
+    `HeteroscedasticityTest`.
+    """
+    import numpy as np
+
+    name = "Breusch-Pagan (residuals)"
+    h0 = "varianza de residuos es constante (homocedasticidad)"
+
+    residuals = np.asarray(residuals, dtype=float)
+    predictions = np.asarray(predictions, dtype=float)
+    n = len(residuals)
+    if n < 10:
+        out = _safe_test(name, h0, is_finding=True)
+        out.notes = f"n={n} insuficiente (n<10)"
+        out.note = "Muestra insuficiente para test BP (n<10)."
+        out.is_heteroscedastic = False
+        return out
+
+    try:
+        from statsmodels.regression.linear_model import OLS
+        from statsmodels.stats.diagnostic import het_breuschpagan
+        from statsmodels.tools.tools import add_constant
+    except ImportError:
+        out = _safe_test(name, h0, is_finding=True)
+        out.note = "statsmodels no disponible para BP test."
+        out.is_heteroscedastic = False
+        return out
+
+    try:
+        # OLS auxiliar: residuals ~ predictions (1 regresor)
+        exog = add_constant(predictions)
+        model = OLS(residuals, exog).fit()
+        lm_stat, p_val, _, _ = het_breuschpagan(model.resid, exog)
+        is_hetero = bool(p_val < alpha)
+        if is_hetero:
+            note = (
+                f"Heteroscedasticidad detectada (p={p_val:.4f} < {alpha}). "
+                "Los intervalos simetricos del modelo no son validos uniformemente. "
+                "Recomendado: Conformal Prediction para bandas garantizadas."
+            )
+        else:
+            note = (
+                f"Sin evidencia de heteroscedasticidad (p={p_val:.4f}). "
+                "Bandas simetricas (mean +/- 1.96*std) son razonables."
+            )
+        return TestResult(
+            name=name,
+            statistic=float(lm_stat),
+            p_value=float(p_val),
+            rejects_h0=is_hetero,
+            h0_meaning=h0,
+            is_finding=True,
+            notes=f"n={n}",
+            extra={"lm_statistic": float(lm_stat), "lm_pvalue": float(p_val)},
+            note=note,
+            is_heteroscedastic=is_hetero,
+        )
+    except Exception as e:
+        out = _safe_test(name, h0, is_finding=True)
+        out.notes = f"error: {e}"
+        out.note = f"Test fallido: {e}"
+        out.is_heteroscedastic = False
         return out
 
 

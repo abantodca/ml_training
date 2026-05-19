@@ -3,6 +3,8 @@ variable "ecs_cluster_name" { type = string }
 variable "ecs_service_name_mlflow" { type = string }
 variable "ecs_service_name_reports" { type = string }
 variable "rds_instance_id" { type = string }
+variable "job_queue_spot_name" { type = string }
+variable "job_queue_ondemand_name" { type = string }
 variable "work_start_hour_local" { type = number }
 variable "work_end_hour_local" { type = number }
 variable "tz_offset_hours" {

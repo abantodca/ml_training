@@ -109,10 +109,20 @@ def render_winner_dashboard(
             preprocessor = inner_pipe.named_steps["preprocessor"]
             X_sample = X_raw.head(min(500, len(X_raw)))
             X_transformed = preprocessor.transform(X_sample)
+            # `preprocessor.transform()` puede devolver ndarray (default
+            # sklearn) o DataFrame. Preferimos `get_feature_names_out()` y
+            # caemos a `.columns` o a nombres sinteticos si no esta disponible.
+            try:
+                feature_names = list(preprocessor.get_feature_names_out())
+            except (AttributeError, ValueError):
+                try:
+                    feature_names = list(X_transformed.columns)
+                except AttributeError:
+                    feature_names = [f"f{i}" for i in range(X_transformed.shape[1])]
             from src.step_05_evaluate.diagnostics import plot_partial_dependence_plotly
             pdp_html = plot_partial_dependence_plotly(
                 ensemble, X_transformed,
-                feature_names=list(X_transformed.columns),
+                feature_names=feature_names,
                 top_k=5,
             )
         except Exception:

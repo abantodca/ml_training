@@ -21,6 +21,7 @@ MLflow tags, pero el campeon NO lo usa para la decision.
 """
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Dict, List, Optional
 
@@ -33,6 +34,8 @@ from src.config import (
 
 if TYPE_CHECKING:
     from src.step_06_track.business_validation import BusinessValidation
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -91,7 +94,16 @@ class ModelResult:
         """
         if self.full_metrics and "mape" in self.full_metrics:
             return float(self.full_metrics["mape"])
+        # NOTA: este fallback OOF->full mezcla metricas heterogeneas (in-sample vs
+        # out-of-fold) dentro del lex-order de `_decision_key`. Esta decision esta
+        # BAJO REVISION; se conserva el comportamiento para no romper modelos
+        # antiguos sin `full_metrics`. Logueamos un WARNING para visibilidad.
         if self.business_metrics_oof and "mape" in self.business_metrics_oof:
+            logger.warning(
+                "champion: full_mape fallback to OOF for model=%s "
+                "(full_metrics missing)",
+                self.model_type,
+            )
             return float(self.business_metrics_oof["mape"])
         return float("inf")
 
@@ -146,8 +158,12 @@ def _decision_key(r: "ModelResult") -> tuple:
       2. Bucket de MAPE total (estabilidad; idem FULL_MAPE_TIE_TOLERANCE).
       3. Tiempo de entrenamiento (eficiencia).
     """
-    gap_bucket = round(r.abs_gap / GAP_TIE_TOLERANCE)
-    mape_bucket = round(r.full_mape / FULL_MAPE_TIE_TOLERANCE)
+    # Bucketing por floor (`int`) en vez de `round`: dos valores que difieren
+    # en exactamente `tol` deben considerarse empate (intencion documentada).
+    # `round` los separaba en buckets adyacentes en la frontera; `int` (floor)
+    # los agrupa de forma consistente con "diferencia < tol => empate".
+    gap_bucket = int(r.abs_gap / GAP_TIE_TOLERANCE)
+    mape_bucket = int(r.full_mape / FULL_MAPE_TIE_TOLERANCE)
     return (gap_bucket, mape_bucket, r.elapsed_seconds)
 
 

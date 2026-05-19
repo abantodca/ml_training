@@ -49,7 +49,7 @@ def run_sequential(
     for variety in varieties:
         logger.info(f"==> START variedad {variety}")
         try:
-            aggregate[variety] = train_variety(variety, models, args, settings)
+            aggregate[variety] = train_variety(variety, models, args, settings, logger=logger)
             logger.info(f"==> DONE  variedad {variety}")
         except Exception as exc:
             logger.exception(f"Variedad {variety} FALLO globalmente")

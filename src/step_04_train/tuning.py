@@ -43,6 +43,8 @@ from src.config import (  # noqa: E402  (filterwarnings debe ir antes)
     OOF_ENSEMBLE_K,
     OUTER_CV_FOLDS,
     RANDOM_STATE,
+    SAMPLE_WEIGHT_BINS,
+    SAMPLE_WEIGHT_CAP,
 )
 from src.step_04_train.oof_ensemble import OOFEnsembleRegressor  # noqa: E402
 from src.step_04_train.registry import get_backend  # noqa: E402
@@ -268,9 +270,14 @@ def _maybe_sample_weights(
     """Computa sample_weights por decil del target o devuelve None."""
     if not use_sample_weights:
         return None
-    sw = compute_sample_weights(y, n_bins=10)
+    # n_bins/weight_cap leidos de src.config para evitar override silencioso
+    # del default de compute_sample_weights (antes hardcoded n_bins=10 aqui).
+    sw = compute_sample_weights(
+        y, n_bins=SAMPLE_WEIGHT_BINS, weight_cap=SAMPLE_WEIGHT_CAP,
+    )
     logger.info(
-        f"Sample weights ON | n_bins=10 | "
+        f"Sample weights ON | n_bins={SAMPLE_WEIGHT_BINS} | "
+        f"cap={SAMPLE_WEIGHT_CAP} | "
         f"min={sw.min():.3f} max={sw.max():.3f} mean={sw.mean():.3f}"
     )
     return sw

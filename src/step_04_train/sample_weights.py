@@ -39,10 +39,19 @@ def compute_sample_weights(
     y_arr = np.asarray(y, dtype=float)
     n = len(y_arr)
 
+    # `pd.cut` puede devolver NaN cuando y contiene NaN o en casos borde
+    # (ej: valores fuera del rango de bins por float-precision). Mapear NaN
+    # a un bin sentinel -1 antes de indexar evita ValueError al hacer
+    # int(NaN). Las filas con bin=-1 reciben weight neutral (1.0) y por
+    # tanto no contribuyen al re-balanceo.
     bins = pd.cut(y_arr, bins=n_bins, labels=False, include_lowest=True)
+    bins = pd.Series(bins).fillna(-1).astype(int).to_numpy()
     counts = pd.Series(bins).value_counts().to_dict()
 
-    weights = np.array([1.0 / max(counts[int(b)], 1) for b in bins], dtype=float)
+    weights = np.array(
+        [1.0 if b == -1 else 1.0 / max(counts.get(int(b), 1), 1) for b in bins],
+        dtype=float,
+    )
     weights = np.minimum(weights, weight_cap * weights.mean())
     weights = np.sqrt(weights)
     weights = weights * (n / weights.sum())

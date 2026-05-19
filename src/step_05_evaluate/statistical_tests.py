@@ -7,8 +7,16 @@ de confianza (MAE = 0.683 [0.671, 0.695]).
 
 Funciones:
   - bootstrap_metric_ci    : IC 95% de cualquier metrica via bootstrap percentile.
-  - breusch_pagan_test     : test de heteroscedasticidad sobre residuos.
-  - paired_bootstrap_diff  : IC para diferencia entre dos modelos (modelo A mejor que B?).
+  - conformal_intervals    : bandas de prediccion con garantia estadistica.
+  - calibration_bins       : agregacion por bin para calibration plot.
+
+DEPRECATED:
+  - `breusch_pagan_test`        -> usar `src.diagnostics.statistical_tests.breusch_pagan_residuals`
+  - `HeteroscedasticityTest`    -> usar `src.diagnostics.statistical_tests.TestResult`
+
+Se mantienen como alias para no romper consumidores externos durante la
+transicion. Devuelven los mismos numeros que la implementacion original
+(la logica fue movida tal cual a `diagnostics`).
 """
 from __future__ import annotations
 
@@ -17,6 +25,15 @@ from typing import Callable, Optional
 
 import numpy as np
 import pandas as pd
+
+# Alias deprecados: re-export desde la implementacion canonica en diagnostics.
+# `HeteroscedasticityTest` ahora es `TestResult` (superset compatible: expone
+# .p_value, .is_heteroscedastic y .note, ademas del resto de campos del
+# diagnostico estadistico generico).
+from src.diagnostics.statistical_tests import (  # noqa: F401
+    TestResult as HeteroscedasticityTest,
+    breusch_pagan_residuals as breusch_pagan_test,
+)
 
 
 @dataclass(frozen=True)
@@ -70,76 +87,6 @@ def bootstrap_metric_ci(
     ci_high = float(np.percentile(resampled, 100 * (1 - alpha / 2)))
     return MetricCI(point=point, ci_low=ci_low, ci_high=ci_high,
                     n_resamples=n_resamples, alpha=alpha)
-
-
-@dataclass(frozen=True)
-class HeteroscedasticityTest:
-    """Resultado de Breusch-Pagan."""
-
-    lm_stat: float          # estadistico de Lagrange Multiplier
-    p_value: float          # p-value (H0: homoscedasticidad)
-    is_heteroscedastic: bool  # True si p < 0.05
-    note: str               # interpretacion en lenguaje natural
-
-
-def breusch_pagan_test(
-    residuals: np.ndarray,
-    predictions: np.ndarray,
-    alpha: float = 0.05,
-) -> HeteroscedasticityTest:
-    """Test de Breusch-Pagan: regresa residuos^2 contra predictions.
-
-    H0: var(residual) constante (homoscedastico).
-    H1: var(residual) varia con la magnitud predicha.
-
-    Si p < alpha, rechazamos H0 -> intervalos simetricos del modelo
-    (`mean +/- 1.96*std`) NO son validos en todos los rangos. Es la
-    senal estadistica para usar Conformal Prediction (que NO asume
-    homoscedasticidad).
-
-    Implementacion: regresion OLS de residuos^2 ~ predictions, test LM.
-    """
-    residuals = np.asarray(residuals, dtype=float)
-    predictions = np.asarray(predictions, dtype=float)
-    n = len(residuals)
-    if n < 10:
-        return HeteroscedasticityTest(
-            lm_stat=float("nan"), p_value=float("nan"),
-            is_heteroscedastic=False,
-            note="Muestra insuficiente para test BP (n<10).",
-        )
-
-    try:
-        from statsmodels.stats.diagnostic import het_breuschpagan
-        from statsmodels.regression.linear_model import OLS
-        from statsmodels.tools.tools import add_constant
-    except ImportError:
-        return HeteroscedasticityTest(
-            lm_stat=float("nan"), p_value=float("nan"),
-            is_heteroscedastic=False,
-            note="statsmodels no disponible para BP test.",
-        )
-
-    # OLS auxiliar: residuals ~ predictions (1 regresor)
-    exog = add_constant(predictions)
-    model = OLS(residuals, exog).fit()
-    lm_stat, p_val, _, _ = het_breuschpagan(model.resid, exog)
-    is_hetero = bool(p_val < alpha)
-    if is_hetero:
-        note = (
-            f"Heteroscedasticidad detectada (p={p_val:.4f} < {alpha}). "
-            "Los intervalos simetricos del modelo no son validos uniformemente. "
-            "Recomendado: Conformal Prediction para bandas garantizadas."
-        )
-    else:
-        note = (
-            f"Sin evidencia de heteroscedasticidad (p={p_val:.4f}). "
-            "Bandas simetricas (mean +/- 1.96*std) son razonables."
-        )
-    return HeteroscedasticityTest(
-        lm_stat=float(lm_stat), p_value=float(p_val),
-        is_heteroscedastic=is_hetero, note=note,
-    )
 
 
 def conformal_intervals(

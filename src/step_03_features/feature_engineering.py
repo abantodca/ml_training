@@ -38,6 +38,7 @@ from src.config import (
     SKEW_KURT_THRESHOLD,
     SKEW_THRESHOLD,
 )
+from src.step_03_features._helpers import safe_ratio
 
 
 class FeatureGenerator(BaseEstimator, TransformerMixin):
@@ -181,12 +182,6 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
         return out
 
     @staticmethod
-    def _safe_ratio(num: np.ndarray, den: np.ndarray) -> np.ndarray:
-        """num/den con den<=0 -> NaN. Suprime warnings de divide-by-zero."""
-        with np.errstate(divide="ignore", invalid="ignore"):
-            return np.where(den > 0, num / den, np.nan)
-
-    @staticmethod
     def _structural_ratios(X: pd.DataFrame, names: List[str]) -> pd.DataFrame:
         out = pd.DataFrame(index=X.index)
         if "KG_TOTAL" in names:
@@ -196,11 +191,11 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
         if "KG_PER_BAYA" in names:
             num = X["KG/HA"].astype(float).to_numpy()
             den = X["P/BAYA"].astype(float).to_numpy()
-            out["KG_PER_BAYA"] = FeatureGenerator._safe_ratio(num, den)
+            out["KG_PER_BAYA"] = safe_ratio(num, den)
         if "KG_HA_PER_DPC" in names:
             num = X["KG/HA"].astype(float).to_numpy()
             den = X["DPC"].astype(float).to_numpy()
-            out["KG_HA_PER_DPC"] = FeatureGenerator._safe_ratio(num, den)
+            out["KG_HA_PER_DPC"] = safe_ratio(num, den)
         return out
 
     @staticmethod
@@ -219,7 +214,13 @@ class FeatureGenerator(BaseEstimator, TransformerMixin):
         """
         s = pd.to_datetime(series, errors="coerce")
         if s.isna().any():
-            s = s.fillna(s.dropna().median())
+            if s.dropna().empty:
+                raise ValueError(
+                    f"columna {series.name} de fechas totalmente vacia; "
+                    "no se puede extraer features de fecha"
+                )
+            anchor = s.dropna().median()
+            s = s.fillna(anchor)
 
         out = pd.DataFrame(index=series.index)
         month = s.dt.month.astype(int)

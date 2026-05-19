@@ -61,6 +61,7 @@ import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin
 
 from src.config import DATE_COLUMN, ENABLE_SIMPLE_LAGS, TARGET
+from src.step_03_features._helpers import safe_ratio
 
 logger = logging.getLogger(__name__)
 
@@ -108,12 +109,6 @@ def _rolling_lag(df_sorted: pd.DataFrame, value_col: str, group_cols: list[str],
         df_sorted.groupby(group_cols, sort=False)[value_col]
         .transform(lambda s: s.shift(1).rolling(window, min_periods=MIN_PERIODS).median())
     )
-
-
-def _safe_ratio(num: pd.Series, den: pd.Series) -> pd.Series:
-    """num/den evitando div por cero o por sentinel (-1)."""
-    den_safe = den.where((den > 0), other=np.nan)
-    return num / den_safe
 
 
 def _seasonal_lag_for_group(dates_d: np.ndarray, values: np.ndarray) -> np.ndarray:
@@ -236,11 +231,14 @@ def _compute_volatility_and_momentum_lags(df_work: pd.DataFrame) -> list[str]:
     #    a uno con anos de historia. Independiente de days_since_last_FF
     #    (que es gap entre cosechas consecutivas dentro de un FF).
     #
-    #    CV-safe: en LagFeatureTransformer.transform, el min(FECHA) por
-    #    FUNDO se calcula sobre el dataframe COMBINED (history + new). El
-    #    history ya tiene las fechas mas antiguas del train, asi que el
-    #    min coincide con el visto en fit -> tenure de filas nuevas usa
-    #    el origen del FUNDO en el train, no en el test.
+    #    LEAK NOTE: el min(FECHA) por FUNDO se calcula aqui sobre `df_work`
+    #    (combined = history + new en transform). Si llega una fila con
+    #    fecha anterior al min visto en fit (backfill), el origen se redefine
+    #    y tenure cambia retroactivamente. LagFeatureTransformer.transform
+    #    sobrescribe esta columna usando `self.fundo_first_seen_` memoizado
+    #    en fit; el calculo aqui es solo el fallback para `fit_transform`
+    #    y `add_lag_features` standalone (donde leak no aplica porque solo
+    #    se ve el train).
     tenure_name = "tenure_FUNDO_days"
     fechas_full = pd.to_datetime(df_work[DATE_COLUMN])
     first_per_fundo = fechas_full.groupby(df_work["FUNDO"]).transform("min")
@@ -355,10 +353,10 @@ def _compute_ratios(df_work: pd.DataFrame) -> list[str]:
     new_cols: list[str] = []
 
     # Locales (KG_HA actual vs su lag FF)
-    df_work["KG_HA_ratio_FF_30"] = _safe_ratio(
+    df_work["KG_HA_ratio_FF_30"] = safe_ratio(
         df_work[KG_HA_COL], df_work["KG_HA_lag_FF_30"]
     )
-    df_work["KG_HA_ratio_FF_90"] = _safe_ratio(
+    df_work["KG_HA_ratio_FF_90"] = safe_ratio(
         df_work[KG_HA_COL], df_work["KG_HA_lag_FF_90"]
     )
     new_cols += ["KG_HA_ratio_FF_30", "KG_HA_ratio_FF_90"]
@@ -372,14 +370,14 @@ def _compute_ratios(df_work: pd.DataFrame) -> list[str]:
         .median()
     )
     df_work.loc[df_sorted_date.index, "_KG_HA_lag_GLOBAL_30"] = rolling_global_30
-    df_work["KG_HA_REL_GLOBAL_30"] = _safe_ratio(
+    df_work["KG_HA_REL_GLOBAL_30"] = safe_ratio(
         df_work[KG_HA_COL], df_work["_KG_HA_lag_GLOBAL_30"]
     )
     df_work.drop(columns=["_KG_HA_lag_GLOBAL_30"], inplace=True)
     new_cols.append("KG_HA_REL_GLOBAL_30")
 
     # Delta short/long del target (entre lags, no leakage)
-    df_work["delta_KG_JR_H_30_90"] = _safe_ratio(
+    df_work["delta_KG_JR_H_30_90"] = safe_ratio(
         df_work["KG_JR_H_lag_FF_30"], df_work["KG_JR_H_lag_FF_90"]
     )
     new_cols.append("delta_KG_JR_H_30_90")
@@ -388,7 +386,7 @@ def _compute_ratios(df_work: pd.DataFrame) -> list[str]:
     # KG_HA_lag_F_30 / KG_HA_lag_FMT_30 -> >1 si el fundo rinde por encima
     # del promedio de su formato en ese horizonte, <1 si por debajo. Auditado
     # vs los lag base: corr <0.5 -> senal independiente.
-    df_work["KG_HA_REL_FORMATO_30"] = _safe_ratio(
+    df_work["KG_HA_REL_FORMATO_30"] = safe_ratio(
         df_work["KG_HA_lag_F_30"], df_work["KG_HA_lag_FMT_30"]
     )
     new_cols.append("KG_HA_REL_FORMATO_30")
@@ -494,9 +492,10 @@ class LagFeatureTransformer(BaseEstimator, TransformerMixin):
     ------
     - `fit(X, y)`        : guarda `self.history_` con (FUNDO, FORMATO,
       FECHA, KG/HA, target) extraido de los datos de entrenamiento.
-    - `fit_transform(X, y)` : ademas devuelve X con las 31 columnas de
-      lag agregadas, calculadas sobre el propio train (esto es lo que
-      ven los siguientes pasos del pipeline durante fit).
+    - `fit_transform(X, y)` : ademas devuelve X con las columnas de lag
+      agregadas (segun `LAG_OUTPUT_COLUMNS`), calculadas sobre el propio
+      train (esto es lo que ven los siguientes pasos del pipeline durante
+      fit).
     - `transform(X_new)` : combina history + filas nuevas (con TARGET=NaN
       para las nuevas), llama a `add_lag_features` y devuelve solo las
       filas nuevas con lags. Para inferencia el caller no necesita
@@ -545,6 +544,15 @@ class LagFeatureTransformer(BaseEstimator, TransformerMixin):
             )
         self._validate_input(X)
         self.history_ = self._build_history(X, y)
+        # Memoiza la fecha mas temprana vista por FUNDO durante el fit. Se usa
+        # en `transform` para evitar leak temporal en tenure_FUNDO_days: sin
+        # esto, si una fila nueva llega con fecha anterior al min visto en fit
+        # (backfill), `transform("min")` sobre el dataframe combinado redefine
+        # el origen del fundo -> tenure de filas historicas y nuevas inconsistente.
+        fechas_fit = pd.to_datetime(X[DATE_COLUMN], errors="coerce")
+        self.fundo_first_seen_: dict = (
+            fechas_fit.groupby(X["FUNDO"]).min().dropna().to_dict()
+        )
         return self
 
     def fit_transform(self, X: pd.DataFrame, y=None, **fit_params) -> pd.DataFrame:
@@ -623,6 +631,19 @@ class LagFeatureTransformer(BaseEstimator, TransformerMixin):
             .sort_values("__row_id")
             .reset_index(drop=True)
         )
+
+        # Override tenure_FUNDO_days usando el origen memoizado en fit.
+        # add_lag_features lo recalculo sobre el combined (history + new) lo
+        # cual reintroduce leak si llegan filas con fechas anteriores al
+        # min(FUNDO) del fit (backfill). Aqui reescribimos con el dict del fit.
+        # Fundo no visto en fit -> tenure=0 (cold-start: primera vez que se ve).
+        if hasattr(self, "fundo_first_seen_") and "tenure_FUNDO_days" in new_only.columns:
+            fechas_new = pd.to_datetime(new_only[DATE_COLUMN], errors="coerce")
+            first_seen_series = new_only["FUNDO"].map(self.fundo_first_seen_)
+            tenure_override = (fechas_new - first_seen_series).dt.days.astype(float)
+            # Fundos no vistos en fit (NaN first_seen) -> tenure = 0
+            new_only["tenure_FUNDO_days"] = tenure_override.fillna(0.0)
+
         # Limpiar helpers y el placeholder de TARGET.
         drop_cols = ["__row_id", "__is_new"]
         if TARGET in new_only.columns and TARGET not in X.columns:

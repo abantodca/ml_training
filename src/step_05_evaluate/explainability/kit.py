@@ -20,11 +20,14 @@ from src.step_05_evaluate.explainability.context import (
     build_context,
 )
 from src.step_05_evaluate.explainability.verdict import Verdict, compute_verdict
+from src.step_05_evaluate.metrics import mape_safe
+from src.diagnostics.statistical_tests import (
+    TestResult,
+    breusch_pagan_residuals,
+)
 from src.step_05_evaluate.statistical_tests import (
-    HeteroscedasticityTest,
     MetricCI,
     bootstrap_metric_ci,
-    breusch_pagan_test,
     calibration_bins,
 )
 
@@ -66,7 +69,7 @@ class WinnerKit:
     mae_oof_ci: Optional[MetricCI] = None
     mape_oof_ci: Optional[MetricCI] = None
     r2_oof_ci: Optional[MetricCI] = None
-    heteroscedasticity: Optional[HeteroscedasticityTest] = None
+    heteroscedasticity: Optional[TestResult] = None
     calibration: Optional[pd.DataFrame] = None
 
 
@@ -136,18 +139,10 @@ def build_winner_kit(
         try:
             from sklearn.metrics import mean_absolute_error, r2_score
 
-            def _mape_safe(yt, yp):
-                yt = np.asarray(yt, dtype=float)
-                yp = np.asarray(yp, dtype=float)
-                nz = yt != 0
-                if nz.sum() == 0:
-                    return float("nan")
-                return float(np.mean(np.abs((yt[nz] - yp[nz]) / yt[nz])) * 100)
-
             mae_ci = bootstrap_metric_ci(real, pred, mean_absolute_error)
-            mape_ci = bootstrap_metric_ci(real, pred, _mape_safe)
+            mape_ci = bootstrap_metric_ci(real, pred, mape_safe)
             r2_ci = bootstrap_metric_ci(real, pred, r2_score)
-            hetero = breusch_pagan_test(residuals=(pred - real), predictions=pred)
+            hetero = breusch_pagan_residuals(residuals=(pred - real), predictions=pred)
             calib = calibration_bins(real, pred, n_bins=10)
         except Exception:
             # Falla de algun calculo no debe tumbar el dashboard.

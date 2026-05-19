@@ -1,36 +1,18 @@
 """Recursos compartidos del dashboard HTML: CSS + plotly.js bundle.
 
-`_PLOTLY_JS_TAG` decide entre embeber plotly.js (offline, autocontenido)
-o cargarlo desde CDN segun `REPORT_PLOTLY_OFFLINE`. `DASHBOARD_CSS` es
-la hoja de estilos completa del dashboard ejecutivo (hero, secciones,
+El tag canonico de plotly.js (offline vs CDN) vive en
+`src.utils.html_assets` para evitar acoplamiento cross-package entre
+`diagnostics/` y `step_05_evaluate/`. Aqui solo se re-exporta como
+`_PLOTLY_JS_TAG` para callers internos del paquete html. `DASHBOARD_CSS`
+es la hoja de estilos completa del dashboard ejecutivo (hero, secciones,
 KPIs, charts, technical details).
 """
 from __future__ import annotations
 
-from src.config import REPORT_PLOTLY_OFFLINE
-
-
-def _build_plotly_js_tag() -> str:
-    """Tag <script> con plotly.js. Offline (default, ~4.5 MB embebido) o CDN.
-
-    Modo controlado por `REPORT_PLOTLY_OFFLINE` en config:
-      True  -> plotly.js inline (HTML autocontenido, funciona sin internet)
-      False -> CDN (HTML mas liviano pero requiere internet)
-    """
-    cdn_tag = (
-        '<script charset="utf-8" '
-        'src="https://cdn.plot.ly/plotly-3.1.0.min.js"></script>'
-    )
-    if not REPORT_PLOTLY_OFFLINE:
-        return cdn_tag
-    try:
-        from plotly.offline import get_plotlyjs
-        return f'<script charset="utf-8">{get_plotlyjs()}</script>'
-    except Exception:
-        return cdn_tag
-
-
-_PLOTLY_JS_TAG = _build_plotly_js_tag()
+# Re-export interno del paquete html. Los consumidores externos
+# (diagnostics, etc.) deben importar directamente desde
+# `src.utils.html_assets` para no depender de simbolos privados.
+from src.utils.html_assets import PLOTLY_JS_TAG as _PLOTLY_JS_TAG
 
 
 DASHBOARD_CSS = """
@@ -382,7 +364,7 @@ footer { text-align:center; color: var(--gray-500); font-size: 12px;
   padding: 14px 16px; border: 1px solid var(--gray-200); border-radius: 10px;
   text-decoration: none; color: var(--navy); background: white;
   transition: transform .12s ease, box-shadow .12s ease, border-color .12s ease; }
-.diag-link:hover { transform: translateY(-1px); border-color: var(--blue-500);
+.diag-link:hover { transform: translateY(-1px); border-color: var(--navy);
   box-shadow: 0 4px 12px rgba(37,99,235,.12); }
 .diag-icon { font-size: 24px; line-height: 1; }
 .diag-meta { flex: 1; min-width: 0; }
@@ -398,8 +380,12 @@ footer { text-align:center; color: var(--gray-500); font-size: 12px;
   .diag-grid { page-break-inside: avoid; }
   * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   .modebar { display: none !important; }
-  details { open: ""; }
-  details summary { display: none; }
+  /* Intencion: forzar que los <details> colapsables aparezcan abiertos al
+     imprimir/exportar a PDF. No se puede modificar el atributo `open` desde
+     CSS, pero podemos forzar el render del contenido (cualquier hijo que no
+     sea <summary>) tanto si el details esta abierto como cerrado. */
+  details[open] > * { display: block; }
+  details:not([open]) > *:not(summary) { display: block !important; }
 }
 """
 

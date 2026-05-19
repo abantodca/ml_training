@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -31,9 +32,15 @@ import pandas as pd
 
 from src.config import (
     CATEGORICAL_FEATURES,
+    CORRELATION_HIGH_THRESHOLD,
     DATE_COLUMN,
+    EDA_KURT_HIGH,
+    EDA_KURT_WARN,
+    EDA_SKEW_HIGH,
     NUMERIC_FEATURES,
+    OUTLIER_FRACTION_WARN,
     REPORTS_DIR,
+    SKEW_THRESHOLD,
     TARGET,
     init_dirs,
 )
@@ -188,7 +195,11 @@ def extract_drift_summary(sidecar_path: Path) -> dict:
 
     drift = data.get("drift", []) or []
     severe = [d for d in drift if d.get("drift_severity") == "severo"]
-    max_psi = max((d.get("max_psi", 0) or 0) for d in drift) if drift else 0.0
+    psi_vals = [
+        v for v in (d.get("max_psi") for d in drift)
+        if v is not None and not (isinstance(v, float) and math.isnan(v))
+    ]
+    max_psi = max(psi_vals, default=0.0)
 
     findings = data.get("findings", []) or []
     n_high = sum(1 for f in findings if f.get("severity") == "high")
@@ -235,8 +246,12 @@ def _synthesize_findings(
 
     # Heteroscedasticidad latente: variables muy skewed o con kurt alta
     for p in var_profiles:
-        if abs(p.skew) > 1.5 or abs(p.kurtosis) > 5:
-            sev = "high" if abs(p.skew) > 3 or abs(p.kurtosis) > 10 else "medium"
+        if abs(p.skew) > SKEW_THRESHOLD or abs(p.kurtosis) > EDA_KURT_WARN:
+            sev = (
+                "high"
+                if abs(p.skew) > EDA_SKEW_HIGH or abs(p.kurtosis) > EDA_KURT_HIGH
+                else "medium"
+            )
             findings.append((
                 sev,
                 f"{p.name} muestra distribucion fuertemente sesgada "
@@ -246,7 +261,7 @@ def _synthesize_findings(
 
     # Outliers altos
     for p in var_profiles:
-        if p.n > 0 and p.n_outliers_iqr / max(p.n, 1) > 0.05:
+        if p.n > 0 and p.n_outliers_iqr / max(p.n, 1) > OUTLIER_FRACTION_WARN:
             findings.append((
                 "medium",
                 f"{p.name} tiene {p.n_outliers_iqr} outliers IQR "
@@ -384,7 +399,9 @@ def run_eda(variety: str, out_dir: Path | None = None,
     # ---- 5. Multivariado ----
     logger.info(f"[EDA/{variety}] multivariado...")
     numeric_only = df[[c for c in numeric_cols if c != TARGET]]
-    corr = correlation_matrix(numeric_only, method="spearman", high_threshold=0.85)
+    corr = correlation_matrix(
+        numeric_only, method="spearman", high_threshold=CORRELATION_HIGH_THRESHOLD,
+    )
     vif_results = compute_vif(numeric_only)
     mi_results = compute_mutual_information(numeric_only, df[TARGET])
 

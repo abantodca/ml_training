@@ -1,17 +1,7 @@
 # Role asumido por la EC2 que lanza Batch (instance profile)
-data "aws_iam_policy_document" "ec2_assume" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["ec2.amazonaws.com"]
-    }
-  }
-}
-
 resource "aws_iam_role" "batch_instance" {
   name               = "${var.project}-batch-instance"
-  assume_role_policy = data.aws_iam_policy_document.ec2_assume.json
+  assume_role_policy = file("${path.module}/../_shared/assume-ec2.json")
 }
 
 resource "aws_iam_role_policy_attachment" "batch_instance" {
@@ -25,19 +15,9 @@ resource "aws_iam_instance_profile" "batch" {
 }
 
 # Role asumido por el container (task) durante el job
-data "aws_iam_policy_document" "ecs_tasks_assume" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["ecs-tasks.amazonaws.com"]
-    }
-  }
-}
-
 resource "aws_iam_role" "job" {
   name               = "${var.project}-job-role"
-  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+  assume_role_policy = file("${path.module}/../_shared/assume-ecs-tasks.json")
 }
 
 # S3: el trainer necesita:
@@ -81,7 +61,7 @@ resource "aws_iam_role_policy" "job_cloudwatch" {
 # Execution role (pull image, write logs) — usado por Batch para arrancar
 resource "aws_iam_role" "exec" {
   name               = "${var.project}-job-exec"
-  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+  assume_role_policy = file("${path.module}/../_shared/assume-ecs-tasks.json")
 }
 
 resource "aws_iam_role_policy_attachment" "exec" {
@@ -91,15 +71,8 @@ resource "aws_iam_role_policy_attachment" "exec" {
 
 # Service role de Batch (gestion de CE)
 resource "aws_iam_role" "batch_service" {
-  name = "${var.project}-batch-service"
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "batch.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-    }]
-  })
+  name               = "${var.project}-batch-service"
+  assume_role_policy = file("${path.module}/../_shared/assume-batch-service.json")
 }
 
 resource "aws_iam_role_policy_attachment" "batch_service" {

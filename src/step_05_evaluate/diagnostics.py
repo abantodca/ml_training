@@ -1,18 +1,27 @@
 """Diagnosticos y graficos del pipeline final (Plotly).
 
-Solo conserva el chart vivo: scatter Predicho vs Real (OOF / refit). El
-resto de visualizaciones legacy (gauges, residuales, importancias, boxplots)
-fue removido cuando el dashboard ejecutivo paso a renderizarlas inline en
-`html/winner_dashboard.py`. Si vuelven a hacer falta, recuperar desde git
-historico antes que reescribir.
+Funciones vivas (todas devuelven un <div> HTML listo para embeber):
+    - plot_pred_vs_actual_plotly      : scatter Predicho vs Real (OOF / refit).
+    - plot_calibration_plotly         : curva de calibracion por bins.
+    - plot_error_histogram_plotly     : histograma de errores absolutos / signados.
+    - plot_residuals_vs_predicted_plotly : residuales vs prediccion (patrones
+      de sesgo, heteroscedasticidad).
+    - plot_error_over_time_plotly     : error a lo largo del tiempo (drift).
+    - plot_partial_dependence_plotly  : PDP/ICE-style para una feature.
+
+Gauges, importancias y boxplots se removieron cuando el dashboard ejecutivo
+paso a renderizarlos inline en `html/winner_dashboard.py`. Si vuelven a
+hacer falta, recuperar desde git historico antes que reescribir.
 
 El script plotly.js se carga UNA sola vez desde el <head> del HTML (ver
-`html.styles._PLOTLY_JS_TAG`); por eso `_plotly_div` siempre pasa
-`include_plotlyjs=False`.
+`html.styles._PLOTLY_JS_TAG`); por eso `plotly_div` (importado de
+`html.helpers`) siempre pasa `include_plotlyjs=False`.
 """
 from __future__ import annotations
 
 import numpy as np
+
+from src.step_05_evaluate.html.helpers import plotly_div
 
 # Paleta corporativa
 _PRIMARY = "#1f4e8a"
@@ -26,17 +35,9 @@ _PLOTLY_LAYOUT_DEFAULTS = dict(
     hoverlabel=dict(bgcolor="white", font_size=12, bordercolor=_PRIMARY),
 )
 
-
-def _plotly_div(fig, div_id: str = "") -> str:
-    """Devuelve <div> embebible (sin plotly.js) o "" si plotly no esta."""
-    try:
-        kwargs = {"include_plotlyjs": False, "full_html": False,
-                  "config": {"displaylogo": False, "responsive": True}}
-        if div_id:
-            kwargs["div_id"] = div_id
-        return fig.to_html(**kwargs)
-    except Exception:
-        return ""
+# Alias retro-compatible para callers internos de este modulo. La fuente
+# de verdad es `html.helpers.plotly_div`.
+_plotly_div = plotly_div
 
 
 def plot_pred_vs_actual_plotly(

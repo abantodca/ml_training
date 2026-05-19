@@ -16,7 +16,13 @@ import pandas as pd
 from src.config import DATE_COLUMN
 from src.step_05_evaluate.champion import ModelResult
 from src.step_05_evaluate.diagnostics import plot_pred_vs_actual_plotly
-from src.step_05_evaluate.html.helpers import fmt, kpi_card
+from src.step_05_evaluate.html.helpers import (
+    compute_error_percentiles,
+    fmt,
+    kpi_card,
+    plotly_div,
+)
+from src.step_05_evaluate.metrics import mape_safe
 
 
 def _kpi_panel_for_model(r: ModelResult, *, is_winner: bool, rank: int) -> str:
@@ -159,11 +165,7 @@ def _build_boxplot(
         )],
     )
     fig.update_yaxes(gridcolor="#e7eaf0", zerolinecolor="#cbd5e0")
-    try:
-        return fig.to_html(include_plotlyjs=False, full_html=False,
-                           config={"displaylogo": False, "responsive": True})
-    except Exception:
-        return ""
+    return plotly_div(fig)
 
 
 def _build_grouping_options(
@@ -243,9 +245,12 @@ def _build_subgroup_table(
     p50_g = float(np.percentile(abs_err, 50))
     p90_g = float(np.percentile(abs_err, 90))
     mae_g = float(np.mean(abs_err))
-    nz_g = real != 0
-    mape_g = (float(np.mean(abs_err[nz_g] / np.abs(real[nz_g])) * 100)
-              if nz_g.any() else float("nan"))
+    # Defensivo: si `real` y `abs_err` tienen tamaños distintos (p.ej. pickle
+    # antiguo con shape desalineado), no podemos reconstruir un `pred` valido.
+    # Misma validacion que en `_build_subgroup_block` (l.348). `mape_safe`
+    # recibe `(real, real - abs_err)` porque solo usa |yt-yp| (== abs_err).
+    mape_g = (mape_safe(real, real - abs_err)
+              if real.size == abs_err.size else float("nan"))
 
     rows: List[dict] = [{
         "label": "GLOBAL", "is_global": True, "n": int(abs_err.size),
@@ -341,9 +346,8 @@ def _build_subgroup_block(
     if abs_errors.size == 0:
         return '<div class="legend">No hay datos OOF para análisis de subgrupos.</div>'
 
-    p50 = float(np.percentile(abs_errors, 50))
-    p90 = float(np.percentile(abs_errors, 90))
-    p99 = float(np.percentile(abs_errors, 99))
+    pcts = compute_error_percentiles(abs_errors)
+    p50, p90, p99 = pcts["p50"], pcts["p90"], pcts["p99"]
     mae = float(np.mean(abs_errors))
     nz = real != 0 if real.size == abs_errors.size else np.array([], dtype=bool)
     mape_g = (float(np.mean(abs_errors[nz] / np.abs(real[nz])) * 100)

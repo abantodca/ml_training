@@ -2,33 +2,19 @@ data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
 
 locals {
-  repo_subject = "repo:${var.github_org}/${var.github_repo}:*"
+  # Trust policy GHA-OIDC compartido entre gha-deploy y gha-train.
+  # Mismo template usado por modules/consumer-iam (otro repo, mismo shape).
+  gha_oidc_trust = templatefile("${path.module}/../_shared/assume-github-oidc.json.tftpl", {
+    provider_arn = var.oidc_provider_arn
+    org          = var.github_org
+    repo         = var.github_repo
+  })
 }
 
 # ----- Role 1: gha-deploy (CI workflows que aplican terraform + push ECR)
-data "aws_iam_policy_document" "deploy_assume" {
-  statement {
-    actions = ["sts:AssumeRoleWithWebIdentity"]
-    principals {
-      type        = "Federated"
-      identifiers = [var.oidc_provider_arn]
-    }
-    condition {
-      test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:aud"
-      values   = ["sts.amazonaws.com"]
-    }
-    condition {
-      test     = "StringLike"
-      variable = "token.actions.githubusercontent.com:sub"
-      values   = [local.repo_subject]
-    }
-  }
-}
-
 resource "aws_iam_role" "deploy" {
   name               = "${var.project}-gha-deploy"
-  assume_role_policy = data.aws_iam_policy_document.deploy_assume.json
+  assume_role_policy = local.gha_oidc_trust
 }
 
 resource "aws_iam_role_policy" "deploy" {
@@ -101,7 +87,7 @@ resource "aws_iam_role_policy" "deploy" {
 # ----- Role 2: gha-train (solo invocar Lambda dispatcher) -------------
 resource "aws_iam_role" "train" {
   name               = "${var.project}-gha-train"
-  assume_role_policy = data.aws_iam_policy_document.deploy_assume.json
+  assume_role_policy = local.gha_oidc_trust
 }
 
 resource "aws_iam_role_policy" "train" {

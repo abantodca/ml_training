@@ -32,7 +32,7 @@ from src.diagnostics.html_renderer import (
     format_pvalue,
     render_test_row,
 )
-from src.diagnostics.plots import _style
+from src.diagnostics.plots import style_fig
 from src.diagnostics.statistical_tests import (
     anderson_darling,
     breusch_pagan,
@@ -55,7 +55,7 @@ def _residuals_vs_pred_fig(y_true: np.ndarray, y_pred: np.ndarray) -> go.Figure:
     fig.add_hline(y=0, line=dict(color="#dc2626", dash="dash", width=1))
     fig.update_xaxes(title="prediccion (y_pred)")
     fig.update_yaxes(title="residual (y_true - y_pred)")
-    return _style(fig, title="Residuos vs prediccion (banda horizontal => homocedasticidad)")
+    return style_fig(fig, title="Residuos vs prediccion (banda horizontal => homocedasticidad)")
 
 
 def _abs_res_vs_pred_fig(y_true: np.ndarray, y_pred: np.ndarray) -> go.Figure:
@@ -79,7 +79,7 @@ def _abs_res_vs_pred_fig(y_true: np.ndarray, y_pred: np.ndarray) -> go.Figure:
         pass
     fig.update_xaxes(title="prediccion (y_pred)")
     fig.update_yaxes(title="|residual|")
-    return _style(fig, title="|Residuos| vs prediccion (cono ascendente => heteroscedasticidad)")
+    return style_fig(fig, title="|Residuos| vs prediccion (cono ascendente => heteroscedasticidad)")
 
 
 def _residuals_hist_fig(residuals: np.ndarray) -> go.Figure:
@@ -92,7 +92,7 @@ def _residuals_hist_fig(residuals: np.ndarray) -> go.Figure:
     fig.add_vline(x=0, line=dict(color="#dc2626", dash="dash"))
     fig.update_xaxes(title="residual")
     fig.update_yaxes(title="frecuencia")
-    return _style(fig, title="Distribucion de residuos")
+    return style_fig(fig, title="Distribucion de residuos")
 
 
 def _residuals_qq_fig(residuals: np.ndarray) -> go.Figure:
@@ -100,7 +100,7 @@ def _residuals_qq_fig(residuals: np.ndarray) -> go.Figure:
     fig = go.Figure()
     if len(residuals) < 10:
         fig.add_annotation(text="n insuficiente", showarrow=False, x=0.5, y=0.5)
-        return _style(fig, title="Q-Q plot residuos")
+        return style_fig(fig, title="Q-Q plot residuos")
     (osm, osr), _ = probplot(residuals, dist="norm")
     fig.add_trace(go.Scatter(
         x=osm, y=osr, mode="markers",
@@ -115,28 +115,18 @@ def _residuals_qq_fig(residuals: np.ndarray) -> go.Figure:
     ))
     fig.update_xaxes(title="cuantiles teoricos (normal)")
     fig.update_yaxes(title="cuantiles residuos")
-    return _style(fig, title="Q-Q plot residuos vs normal")
+    return style_fig(fig, title="Q-Q plot residuos vs normal")
 
 
-def render_residual_report(
-    *,
-    variety: str,
-    model_type: str,
-    y_true: np.ndarray,
-    y_pred: np.ndarray,
-    run_id: Optional[str] = None,
-) -> str:
-    """Construye el HTML del residual diagnostic report.
+def _run_residual_tests(residuals: np.ndarray, y_pred: np.ndarray) -> dict:
+    """Ejecuta la bateria de tests estadisticos sobre los residuos.
 
-    `run_id`: si se provee, agrega un link al run de MLflow en el header.
-    Trazabilidad cuando el HTML se comparte fuera del filesystem (S3, mail).
+    Devuelve un dict con keys: dw, lb, sw, ad, jb, bp, wt.
+    Los except defensivos en los tests subyacentes son intencionales: muestras
+    pequeñas pueden hacer fallar Shapiro/Anderson/etc.
     """
-    y_true = np.asarray(y_true, dtype=float)
-    y_pred = np.asarray(y_pred, dtype=float)
-    residuals = y_true - y_pred
     res_series = pd.Series(residuals)
 
-    # Tests
     dw = durbin_watson(res_series)
     lb = ljung_box(res_series, lags=10)
     sw = shapiro_wilk(res_series)
@@ -149,32 +139,18 @@ def render_residual_report(
     bp = breusch_pagan(resid_sq, pd.DataFrame({"y_pred": pred_series}))
     wt = white_test(resid_sq, pd.DataFrame({"y_pred": pred_series}))
 
-    tests = [
-        ("Autocorrelacion temporal", [dw, lb]),
-        ("Heteroscedasticidad", [bp, wt]),
-        ("Normalidad", [sw, ad, jb]),
-    ]
+    return {"dw": dw, "lb": lb, "sw": sw, "ad": ad, "jb": jb, "bp": bp, "wt": wt}
 
-    # Plots
-    fig_rvp = _residuals_vs_pred_fig(y_true, y_pred)
-    fig_arvp = _abs_res_vs_pred_fig(y_true, y_pred)
-    fig_hist = _residuals_hist_fig(residuals)
-    fig_qq = _residuals_qq_fig(residuals)
 
-    # Render
-    test_blocks = []
-    for group_title, tests_in_group in tests:
-        rows = "".join(render_test_row(t) for t in tests_in_group)
-        test_blocks.append(f"""
-        <h3>{escape(group_title)}</h3>
-        <table class="summary">
-          <thead><tr><th>Test</th><th class='num'>Statistic</th><th class='num'>p-value</th><th>Notas</th></tr></thead>
-          <tbody>{rows}</tbody>
-        </table>
-        """)
+def _build_residual_findings(test_results: dict) -> list[tuple[str, str]]:
+    """Interpreta los resultados de los tests y produce findings (severity, msg)."""
+    dw = test_results["dw"]
+    lb = test_results["lb"]
+    bp = test_results["bp"]
+    wt = test_results["wt"]
+    jb = test_results["jb"]
 
-    # Resumen verdict
-    summary_findings = []
+    summary_findings: list[tuple[str, str]] = []
     if dw.rejects_h0:
         summary_findings.append(("severity-high",
             f"Autocorrelacion residual detectada (DW={dw.statistic:.2f}). "
@@ -194,7 +170,61 @@ def render_residual_report(
         summary_findings.append(("severity-good",
             "Sin hallazgos diagnosticos sobre residuos: autocorrelacion ausente, "
             "varianza homogenea, distribucion razonablemente normal."))
+    return summary_findings
 
+
+def _render_test_blocks(test_results: dict) -> str:
+    """Renderiza los bloques HTML de tabla de tests agrupados por categoria."""
+    tests = [
+        ("Autocorrelacion temporal", [test_results["dw"], test_results["lb"]]),
+        ("Heteroscedasticidad", [test_results["bp"], test_results["wt"]]),
+        ("Normalidad", [test_results["sw"], test_results["ad"], test_results["jb"]]),
+    ]
+
+    test_blocks = []
+    for group_title, tests_in_group in tests:
+        rows = "".join(render_test_row(t) for t in tests_in_group)
+        test_blocks.append(f"""
+        <h3>{escape(group_title)}</h3>
+        <table class="summary">
+          <thead><tr><th>Test</th><th class='num'>Statistic</th><th class='num'>p-value</th><th>Notas</th></tr></thead>
+          <tbody>{rows}</tbody>
+        </table>
+        """)
+    return "".join(test_blocks)
+
+
+def render_residual_report(
+    *,
+    variety: str,
+    model_type: str,
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    run_id: Optional[str] = None,
+) -> str:
+    """Construye el HTML del residual diagnostic report.
+
+    `run_id`: si se provee, agrega un link al run de MLflow en el header.
+    Trazabilidad cuando el HTML se comparte fuera del filesystem (S3, mail).
+    """
+    y_true = np.asarray(y_true, dtype=float)
+    y_pred = np.asarray(y_pred, dtype=float)
+    residuals = y_true - y_pred
+
+    # Tests estadisticos
+    test_results = _run_residual_tests(residuals, y_pred)
+
+    # Plots
+    fig_rvp = _residuals_vs_pred_fig(y_true, y_pred)
+    fig_arvp = _abs_res_vs_pred_fig(y_true, y_pred)
+    fig_hist = _residuals_hist_fig(residuals)
+    fig_qq = _residuals_qq_fig(residuals)
+
+    # Bloques HTML de tests
+    test_blocks_html = _render_test_blocks(test_results)
+
+    # Findings / verdict
+    summary_findings = _build_residual_findings(test_results)
     findings_html = "".join(
         f'<li class="{cls}">{escape(msg)}</li>'
         for cls, msg in summary_findings
@@ -206,7 +236,7 @@ def render_residual_report(
     bias = float(np.mean(residuals))
 
     # Reusa el tag canonico del proyecto (offline vs CDN segun config).
-    from src.step_05_evaluate.html.styles import _PLOTLY_JS_TAG as plotly_cdn
+    from src.utils.html_assets import PLOTLY_JS_TAG as plotly_cdn
 
     # Run identification para trazabilidad MLflow.
     run_meta = ""
@@ -243,7 +273,7 @@ def render_residual_report(
 
       <section class="card">
         <h2>Tests estadisticos</h2>
-        {''.join(test_blocks)}
+        {test_blocks_html}
       </section>
 
       <footer class="fineprint">

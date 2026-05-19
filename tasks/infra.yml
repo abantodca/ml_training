@@ -17,7 +17,11 @@
 version: "3"
 
 vars:
-  TF_DIR: '{{.TF_DIR | default "infra/envs/prod"}}'
+  TF_DIR:  '{{.TF_DIR | default "infra/envs/prod"}}'
+  # Ultimos 6 chars del account ID (sufijo de buckets para evitar colisiones).
+  # Resuelto una vez por invocacion del include.
+  SUFFIX:
+    sh: aws sts get-caller-identity --query Account --output text | tail -c 7
 
 tasks:
 
@@ -37,13 +41,6 @@ tasks:
 
   _init:
     internal: true
-    # SUFFIX se resuelve dinamicamente: cambia entre cuentas (sandbox vs prod)
-    # y queremos el backend correcto sin setearlo en .env.
-    vars:
-      SUFFIX:
-        sh: aws sts get-caller-identity --query Account --output text | tail -c 7
-      PROJECT: '{{.PROJECT | default "ml-training"}}'
-      REGION:  '{{.AWS_DEFAULT_REGION | default "us-east-1"}}'
     cmds:
       - terraform -chdir={{.TF_DIR}} init
         -backend-config=bucket={{.PROJECT}}-tfstate-{{.SUFFIX}}

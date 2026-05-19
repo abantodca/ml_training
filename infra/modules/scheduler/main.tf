@@ -9,19 +9,9 @@ data "archive_file" "scheduler" {
   output_path = "${path.module}/scheduler.zip"
 }
 
-data "aws_iam_policy_document" "lambda_assume" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["lambda.amazonaws.com"]
-    }
-  }
-}
-
 resource "aws_iam_role" "scheduler" {
   name               = "${var.project}-scheduler"
-  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+  assume_role_policy = file("${path.module}/../_shared/assume-lambda.json")
 }
 
 resource "aws_iam_role_policy" "scheduler" {
@@ -77,8 +67,8 @@ resource "aws_lambda_function" "scheduler" {
       ECS_SVC_MLFLOW     = var.ecs_service_name_mlflow
       ECS_SVC_REPORTS    = var.ecs_service_name_reports
       RDS_INSTANCE       = var.rds_instance_id
-      JOB_QUEUE_SPOT     = "${var.project}-job-queue-spot"
-      JOB_QUEUE_ONDEMAND = "${var.project}-job-queue-ondemand"
+      JOB_QUEUE_SPOT     = var.job_queue_spot_name
+      JOB_QUEUE_ONDEMAND = var.job_queue_ondemand_name
       # Patch 13.1: propagar workdays + ventana al _keepstop (sino el
       # martes/jueves queda "dentro de ventana" y nunca re-para el RDS).
       WORKDAYS_CRON  = var.workdays_cron

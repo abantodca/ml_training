@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -676,7 +677,13 @@ def write_dashboard(reports_dir: Path,
     scan = scan_reports(reports_dir)
     html = render_dashboard(scan)
     out = reports_dir / filename
-    out.write_text(html, encoding="utf-8")
+    # Atomic write-then-rename para evitar race condition cuando multiples
+    # procesos paralelos (variety_runner) regeneran el mismo index.html. El
+    # tmp es per-PID para que escrituras concurrentes no se pisen entre si;
+    # os.replace es atomico en POSIX y Windows.
+    tmp = reports_dir / f"{filename}.tmp.{os.getpid()}"
+    tmp.write_text(html, encoding="utf-8")
+    os.replace(tmp, out)
     logger.info(f"Dashboard regenerado: {out} ({scan.total} reportes indexados)")
     return out
 

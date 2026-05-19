@@ -9,19 +9,9 @@ data "archive_file" "dispatcher" {
 }
 
 # IAM
-data "aws_iam_policy_document" "lambda_assume" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["lambda.amazonaws.com"]
-    }
-  }
-}
-
 resource "aws_iam_role" "dispatcher" {
   name               = "${var.project}-dispatcher"
-  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+  assume_role_policy = file("${path.module}/../_shared/assume-lambda.json")
 }
 
 resource "aws_iam_role_policy" "dispatcher" {
@@ -65,13 +55,9 @@ resource "aws_lambda_function" "dispatcher" {
 
   environment {
     variables = {
-      PROJECT = var.project
-      # AWS Batch SubmitJob/ListJobs aceptan ARN o name; usamos NAME
-      # para mantener consistencia con scheduler/main.tf (que tambien
-      # pasa name). Si se quisiera pinear a un ARN historico (rare),
-      # cambiar a var.job_queue_spot_arn (ambas son output de batch/).
-      JOB_QUEUE_SPOT     = "${var.project}-job-queue-spot"
-      JOB_QUEUE_ONDEMAND = "${var.project}-job-queue-ondemand"
+      PROJECT            = var.project
+      JOB_QUEUE_SPOT     = var.job_queue_spot_name
+      JOB_QUEUE_ONDEMAND = var.job_queue_ondemand_name
       JOB_DEFINITION     = var.job_definition_name
       DATA_BUCKET        = var.data_bucket
       VARIETIES_ALLOWED  = join(",", var.varieties_allowed)

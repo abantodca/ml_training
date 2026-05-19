@@ -16,7 +16,6 @@
 version: "3"
 
 vars:
-  PROJECT:    '{{.PROJECT    | default "ml-training"}}'
   JOB_DEF:    '{{.JOB_DEF    | default (printf "%s-trainer"  .PROJECT)}}'
   QUEUE_SPOT: '{{.QUEUE_SPOT | default (printf "%s-job-queue-spot"     .PROJECT)}}'
   QUEUE_OD:   '{{.QUEUE_OD   | default (printf "%s-job-queue-ondemand" .PROJECT)}}'
@@ -38,27 +37,20 @@ tasks:
     cmds:
       - |
         set -e
+        source tasks/lib/batch_wait.sh
         for v in $(echo "{{.VARIETIES}}" | tr ',' ' '); do
+          OVERRIDES=$(jq -nc \
+            --arg v "$v" --arg t "{{.TUNING}}" --arg p "{{.PARALLEL}}" \
+            '{command: ["--varieties", $v, "--tuning", $t, "--parallel-varieties", $p]}')
           JOB_ID=$(aws batch submit-job \
             --job-name       "train-$v-{{.TUNING}}-$(date +%Y%m%d-%H%M%S)" \
             --job-queue      "{{.QUEUE}}" \
             --job-definition "{{.JOB_DEF}}" \
-            --container-overrides "{\"command\":[\"--varieties\",\"$v\",\"--tuning\",\"{{.TUNING}}\",\"--parallel-varieties\",\"{{.PARALLEL}}\"]}" \
+            --container-overrides "$OVERRIDES" \
             --query jobId --output text)
           echo ">>> $v  job=$JOB_ID  queue={{.QUEUE}}"
-
           [ "{{.WAIT}}" != "true" ] && continue
-
-          while :; do
-            STATUS=$(aws batch describe-jobs --jobs "$JOB_ID" --query 'jobs[0].status' --output text)
-            echo "  $(date +%H:%M:%S)  $v  $STATUS"
-            case "$STATUS" in
-              SUCCEEDED) break ;;
-              FAILED)    REASON=$(aws batch describe-jobs --jobs "$JOB_ID" --query 'jobs[0].statusReason' --output text)
-                         echo "FAIL $v  reason=$REASON"; exit 1 ;;
-              *)         sleep 30 ;;
-            esac
-          done
+          wait_job "$JOB_ID" "$v"
         done
 
   # ═══ Entrenar via Lambda dispatcher (path usado por train.yml) ═════════════
@@ -72,6 +64,7 @@ tasks:
     cmds:
       - |
         set -e
+        source tasks/lib/batch_wait.sh
         PAYLOAD=$(jq -nc --arg v "{{.VARIETIES}}" --arg t "{{.TUNING}}" \
           '{varieties: $v, tuning: $t}')
         aws lambda invoke \
@@ -84,16 +77,7 @@ tasks:
         JOB_ID=$(jq -r '.body.jobId // (.body|fromjson|.jobId)' /tmp/dispatcher-out.json 2>/dev/null || jq -r '.jobId' /tmp/dispatcher-out.json)
         echo ">>> Submitted via dispatcher  job=$JOB_ID"
         [ "{{.WAIT}}" != "true" ] && exit 0
-        while :; do
-          STATUS=$(aws batch describe-jobs --jobs "$JOB_ID" --query 'jobs[0].status' --output text)
-          echo "  $(date +%H:%M:%S)  $STATUS"
-          case "$STATUS" in
-            SUCCEEDED) break ;;
-            FAILED)    REASON=$(aws batch describe-jobs --jobs "$JOB_ID" --query 'jobs[0].statusReason' --output text)
-                       echo "FAIL  reason=$REASON"; exit 1 ;;
-            *)         sleep 30 ;;
-          esac
-        done
+        wait_job "$JOB_ID" "dispatcher"
 
   # ═══ Smoke test ═════════════════════════════════════════════════════════════
 

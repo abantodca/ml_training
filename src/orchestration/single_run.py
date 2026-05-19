@@ -14,6 +14,7 @@ poder elegir entre todos los modelos al final.
 from __future__ import annotations
 
 import argparse
+import math
 import time
 from datetime import datetime
 from typing import Dict, Optional
@@ -70,6 +71,10 @@ def _full_dataset_metrics(
     try:
         pred_h_full = np.asarray(final_pipeline.predict(X), dtype=float)
     except Exception:
+        # Predict puede fallar por dtype mismatch (sklearn), feature-name
+        # mismatch (xgboost/lightgbm), o ValueError numerico. La jerarquia
+        # exacta varia por libreria; mantenemos Exception y logueamos
+        # traceback para diagnostico.
         if logger is not None:
             logger.warning(
                 "full_metrics: final_pipeline.predict(X) fallo; "
@@ -172,6 +177,174 @@ def _build_run_summary(
     }
 
 
+def _log_run_metadata_and_params(
+    *,
+    variety: str,
+    model_type: str,
+    args: argparse.Namespace,
+    settings: dict,
+    X,
+    log,
+) -> None:
+    """Run metadata (git/dataset hash) + params iniciales a MLflow.
+
+    Side effects: set_tags(metadata) y log_params(...). Fallos de
+    `collect_run_metadata` no abortan training (trazabilidad rota es un
+    finding de auditoria, no bloqueante).
+    """
+    try:
+        metadata_tags = collect_run_metadata(
+            training_file=TRAINING_FILE,
+            n_rows=int(X.shape[0]),
+            n_cols=int(X.shape[1]),
+        )
+        set_tags(metadata_tags)
+    except (OSError, ValueError):
+        # OSError: training file / git dir inaccesible.
+        # ValueError: hash o parsing fallido.
+        # Otros errores (e.g. ImportError) deberian propagar -> NO los
+        # tragamos. Trazabilidad rota es un finding de auditoria; loggear
+        # con traceback para que el siguiente sysadmin sepa que arreglar.
+        log.warning("collect_run_metadata fallo (no aborta training)",
+                    exc_info=True)
+    log_params({
+        "variety": variety,
+        "tuning": args.tuning,
+        "model_type": model_type,
+        "n_trials": settings["n_trials"],
+        "final_trials": settings["final_trials"],
+        "outer_folds": settings["outer_folds"],
+        "inner_folds": settings["inner_folds"],
+        "skip_final_tuning": settings["skip_final_tuning"],
+        "n_rows": int(X.shape[0]),
+        "n_features_input": int(X.shape[1]),
+    })
+
+
+def _persist_pipeline_and_oof_locally(
+    *,
+    final_pipeline,
+    oof: dict,
+    variety: str,
+    run_name: str,
+    log,
+):
+    """Persiste pipeline (.joblib) y OOF (.npz) a disco ANTES de tocar MLflow.
+
+    Devuelve (local_pipeline_path, oof_arr_path).
+
+    Si MLflow falla a mitad del logging (e.g. run marcado deleted
+    externamente), el modelo entrenado ya esta a salvo en disco -- 1+h de
+    tuning no se pierden por un fallo de tracking. OOF arrays se preservan
+    para GAMM Phase 0 (corrector de residuos) y post-mortems sin
+    re-entrenamiento.
+    """
+    local_pipeline = ARTIFACTS_DIR / f"final_pipeline_{variety}_{run_name}.joblib"
+    joblib.dump(final_pipeline, local_pipeline)
+    log.info(f"Pipeline persistido localmente: {local_pipeline.name}")
+
+    oof_arr_path = ARTIFACTS_DIR / f"oof_{variety}_{run_name}.npz"
+    np.savez(oof_arr_path, y_true=oof["y_true"], y_pred=oof["y_pred"])
+    log.info(f"OOF persistido localmente: {oof_arr_path.name}")
+
+    return local_pipeline, oof_arr_path
+
+
+def _log_nested_cv_summary(nested_metrics: Dict[str, float]) -> None:
+    """Loguea nested CV metrics + tags resumen filtrables en MLflow UI."""
+    log_metrics(nested_metrics)
+    set_tags({
+        "r2_mean": f"{nested_metrics['nested_cv_r2_mean']:.4f}",
+        "mae_test_mean": f"{nested_metrics['nested_cv_mae_mean']:.4f}",
+        "mae_train_mean": f"{nested_metrics.get('nested_cv_mae_train_mean', 0):.4f}",
+        "overfit_gap": f"{nested_metrics.get('nested_cv_gap_mean', 0):+.4f}",
+    })
+
+
+def _run_business_validation(
+    *,
+    oof: dict,
+    final_pipeline,
+    X,
+    business_cols,
+    variety: str,
+    model_type: str,
+    args: argparse.Namespace,
+    nested_metrics: Dict[str, float],
+    best_params: Dict[str, object],
+    run_id: str,
+    logger,
+    log,
+) -> BusinessValidation:
+    """Valida en unidad de negocio (KG/JR = KG/JR_H * H-EF), loguea y audita.
+
+    Devuelve el `BusinessValidation` para reuso aguas abajo (full metrics +
+    summary + ModelResult).
+    """
+    log.info("Validando en unidad de negocio (KG/JR)...")
+    business_validation = validate_against_business_unit(
+        oof=oof, final_pipeline=final_pipeline,
+        X_full=X, business_cols=business_cols,
+    )
+    log_business_metrics(business_validation)
+    log_business_audit(
+        logger,
+        variety=variety, model_type=model_type, tuning=args.tuning,
+        business_validation=business_validation,
+        nested_metrics=nested_metrics, best_params=best_params,
+        mlflow_run_id=run_id,
+    )
+    return business_validation
+
+
+def _write_residual_diagnostics(
+    *,
+    variety: str,
+    model_type: str,
+    run_name: str,
+    run_id: str,
+    oof: dict,
+    log,
+) -> None:
+    """Residual diagnostics post-fit: DW + Ljung-Box, BP + White, Shapiro/AD/JB + plots.
+
+    Si rechaza autocorrelacion residual -> el modelo dejo patron temporal ->
+    revisar lag features. Si rechaza heteroscedasticidad -> considerar
+    log-target o regresion Gamma. Fallo aqui NO aborta training.
+    """
+    try:
+        residual_html = REPORTS_DIR / f"residuals_{variety}_{run_name}.html"
+        write_residual_report(
+            variety=variety, model_type=model_type,
+            y_true=oof["y_true"], y_pred=oof["y_pred"],
+            out_path=residual_html,
+            run_id=run_id,
+        )
+        log_artifact(str(residual_html), artifact_path="residuals")
+        log.info(f"Residual diagnostics: {residual_html.name}")
+    except Exception:
+        # write_residual_report engloba IO (HTML), statsmodels (tests
+        # estadisticos) y matplotlib (plots). Cualquier libreria puede
+        # lanzar errores propios (LinAlgError, ConvergenceWarning como
+        # error, etc.). Mantenemos Exception broad: el diagnostico es
+        # opcional y nunca debe bloquear el modelo de produccion.
+        log.warning("Residual diagnostics fallo (no aborta training)", exc_info=True)
+
+
+def _build_bv_oof_dump(business_validation: BusinessValidation) -> Dict[str, float]:
+    """Filtra metrics_oof a floats finitos serializables en JSON.
+
+    `math.isfinite` excluye NaN/Inf que romperian `json.dump` (default
+    `allow_nan=False` en utils) y dashboards downstream.
+    """
+    if business_validation and not business_validation.is_empty():
+        return {
+            k: float(v) for k, v in business_validation.metrics_oof.items()
+            if isinstance(v, (int, float)) and math.isfinite(v)
+        }
+    return {}
+
+
 def train_model(
     variety: str,
     model_type: str,
@@ -207,30 +380,10 @@ def train_model(
         # Trazabilidad: git commit + dataset hash + n_rows. Hace cada run
         # reproducible y permite detectar drift automaticamente cuando
         # dataset_sha256 cambia.
-        try:
-            metadata_tags = collect_run_metadata(
-                training_file=TRAINING_FILE,
-                n_rows=int(X.shape[0]),
-                n_cols=int(X.shape[1]),
-            )
-            set_tags(metadata_tags)
-        except Exception:
-            # Trazabilidad rota es un finding de auditoria; loggear con
-            # traceback para que el siguiente sysadmin sepa que arreglar.
-            log.warning("collect_run_metadata fallo (no aborta training)",
-                        exc_info=True)
-        log_params({
-            "variety": variety,
-            "tuning": args.tuning,
-            "model_type": model_type,
-            "n_trials": settings["n_trials"],
-            "final_trials": settings["final_trials"],
-            "outer_folds": settings["outer_folds"],
-            "inner_folds": settings["inner_folds"],
-            "skip_final_tuning": settings["skip_final_tuning"],
-            "n_rows": int(X.shape[0]),
-            "n_features_input": int(X.shape[1]),
-        })
+        _log_run_metadata_and_params(
+            variety=variety, model_type=model_type, args=args,
+            settings=settings, X=X, log=log,
+        )
 
         log.info("[3/6] Nested CV con Optuna...")
         final_pipeline, best_params, nested_metrics, oof = perform_nested_cv(
@@ -245,45 +398,22 @@ def train_model(
             logger=logger,
         )
 
-        # Persistir el pipeline ANTES de tocar MLflow. Si MLflow falla a
-        # mitad del logging (e.g. run marcado deleted externamente), el
-        # modelo entrenado ya esta a salvo en disco -- 1+h de tuning no
-        # se pierden por un fallo de tracking.
-        local_pipeline = ARTIFACTS_DIR / f"final_pipeline_{variety}_{run_name}.joblib"
-        joblib.dump(final_pipeline, local_pipeline)
-        log.info(f"Pipeline persistido localmente: {local_pipeline.name}")
-
-        # OOF arrays a disco para que GAMM Phase 0 (corrector de residuos)
-        # y post-mortems puedan operar sin re-entrenamiento (1.5h por
-        # modelo). Reservado: variety_runner descarta ModelResult al
-        # terminar la variedad y los arrays se perderian sin esto.
-        oof_arr_path = ARTIFACTS_DIR / f"oof_{variety}_{run_name}.npz"
-        np.savez(oof_arr_path, y_true=oof["y_true"], y_pred=oof["y_pred"])
-        log.info(f"OOF persistido localmente: {oof_arr_path.name}")
+        local_pipeline, oof_arr_path = _persist_pipeline_and_oof_locally(
+            final_pipeline=final_pipeline, oof=oof,
+            variety=variety, run_name=run_name, log=log,
+        )
 
         log.info("[4/6] MLflow logging...")
-        log_metrics(nested_metrics)
+        _log_nested_cv_summary(nested_metrics)
         log_params(best_params)
-        set_tags({
-            "r2_mean": f"{nested_metrics['nested_cv_r2_mean']:.4f}",
-            "mae_test_mean": f"{nested_metrics['nested_cv_mae_mean']:.4f}",
-            "mae_train_mean": f"{nested_metrics.get('nested_cv_mae_train_mean', 0):.4f}",
-            "overfit_gap": f"{nested_metrics.get('nested_cv_gap_mean', 0):+.4f}",
-        })
 
         # ---- Validacion en unidad de negocio (KG/JR = KG/JR_H * H-EF) ----
-        log.info("Validando en unidad de negocio (KG/JR)...")
-        business_validation = validate_against_business_unit(
+        business_validation = _run_business_validation(
             oof=oof, final_pipeline=final_pipeline,
-            X_full=X, business_cols=business_cols,
-        )
-        log_business_metrics(business_validation)
-        log_business_audit(
-            logger,
-            variety=variety, model_type=model_type, tuning=args.tuning,
-            business_validation=business_validation,
+            X=X, business_cols=business_cols,
+            variety=variety, model_type=model_type, args=args,
             nested_metrics=nested_metrics, best_params=best_params,
-            mlflow_run_id=run.info.run_id,
+            run_id=run.info.run_id, logger=logger, log=log,
         )
 
         # ---- Metricas en DATASET COMPLETO (refit + predict all) ----
@@ -320,31 +450,13 @@ def train_model(
         log_artifact(str(local_pipeline), artifact_path="pipeline")
         log_artifact(str(oof_arr_path), artifact_path="oof")
 
-        # Residual diagnostics post-fit: DW + Ljung-Box (autocorrelacion),
-        # BP + White (heteroscedasticidad), Shapiro/AD/JB (normalidad), plus
-        # 4 plots. Si rechaza autocorrelacion residual -> el modelo dejo
-        # patron temporal -> revisar lag features. Si rechaza
-        # heteroscedasticidad -> considerar log-target o regresion Gamma.
-        try:
-            residual_html = REPORTS_DIR / f"residuals_{variety}_{run_name}.html"
-            write_residual_report(
-                variety=variety, model_type=model_type,
-                y_true=oof["y_true"], y_pred=oof["y_pred"],
-                out_path=residual_html,
-                run_id=run.info.run_id,
-            )
-            log_artifact(str(residual_html), artifact_path="residuals")
-            log.info(f"Residual diagnostics: {residual_html.name}")
-        except Exception:
-            log.warning("Residual diagnostics fallo (no aborta training)", exc_info=True)
+        _write_residual_diagnostics(
+            variety=variety, model_type=model_type, run_name=run_name,
+            run_id=run.info.run_id, oof=oof, log=log,
+        )
 
         elapsed = time.perf_counter() - t0
-        bv_oof_dump: Dict[str, float] = {}
-        if business_validation and not business_validation.is_empty():
-            bv_oof_dump = {
-                k: float(v) for k, v in business_validation.metrics_oof.items()
-                if isinstance(v, (int, float))
-            }
+        bv_oof_dump = _build_bv_oof_dump(business_validation)
         # Summary local versionado por run_name. Cada run histórico (xgb_v19,
         # xgb_v20, ...) conserva su propio JSON sin sobrescribirse.
         summary = _build_run_summary(

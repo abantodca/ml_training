@@ -12,6 +12,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from collections.abc import Callable
 
 import boto3
 
@@ -45,13 +46,30 @@ def _parse_workdays(cron_token: str) -> set[int]:
 
 
 def _running_jobs() -> list[str]:
-    """IDs de jobs en estado RUNNING o RUNNABLE en cualquiera de las queues."""
+    """IDs de jobs en estado RUNNING/RUNNABLE/STARTING en cualquiera de las queues."""
     ids: list[str] = []
     for queue in (JOB_QUEUE_SPOT, JOB_QUEUE_ONDEMAND):
         for status in ("RUNNING", "RUNNABLE", "STARTING"):
             resp = batch.list_jobs(jobQueue=queue, jobStatus=status)
             ids.extend(j["jobId"] for j in resp.get("jobSummaryList", []))
     return ids
+
+
+def _rds_state() -> str:
+    return rds.describe_db_instances(DBInstanceIdentifier=RDS_INSTANCE)["DBInstances"][0]["DBInstanceStatus"]
+
+
+def _wait_until(check: Callable[[int], bool], *, label: str, max_iters: int, sleep_s: int = 10) -> bool:
+    """Polling generico. `check(i)` retorna True cuando el recurso esta listo.
+
+    Devuelve True si la condicion se cumplio, False si se agoto el timeout.
+    """
+    for i in range(max_iters):
+        if check(i):
+            return True
+        log.info("%s[%d] no listo, sleep %ds", label, i, sleep_s)
+        time.sleep(sleep_s)
+    return False
 
 
 def _start():
@@ -64,22 +82,19 @@ def _start():
     """
     log.info("=== START (secuencial: RDS -> MLflow -> Reports) ===")
 
-    # Etapa 1: RDS
-    db = rds.describe_db_instances(DBInstanceIdentifier=RDS_INSTANCE)["DBInstances"][0]
-    if db["DBInstanceStatus"] == "stopped":
+    # Etapa 1: RDS. start_db_instance solo es valido desde 'stopped'; otros
+    # estados (starting/available/...) significan que ya esta arrancando o lo esta.
+    if _rds_state() == "stopped":
         rds.start_db_instance(DBInstanceIdentifier=RDS_INSTANCE)
         log.info("rds start_db_instance ack")
 
-    state = db["DBInstanceStatus"]
-    for i in range(48):  # max ~8 min (48 * 10s)
-        db = rds.describe_db_instances(DBInstanceIdentifier=RDS_INSTANCE)["DBInstances"][0]
-        state = db["DBInstanceStatus"]
-        log.info("rds[%d]=%s", i, state)
-        if state == "available":
-            break
-        time.sleep(10)
-    else:
-        raise RuntimeError(f"RDS no available tras 8 min (estado={state})")
+    def rds_available(_i: int) -> bool:
+        state = _rds_state()
+        log.info("rds=%s", state)
+        return state == "available"
+
+    if not _wait_until(rds_available, label="rds", max_iters=48):  # max ~8 min
+        raise RuntimeError(f"RDS no available tras 8 min (estado={_rds_state()})")
 
     log.info("rds OK -> arrancando MLflow")
 
@@ -87,14 +102,13 @@ def _start():
     ecs.update_service(cluster=ECS_CLUSTER, service=ECS_SVC_MLFLOW, desiredCount=1)
     log.info("ecs %s -> desiredCount=1", ECS_SVC_MLFLOW)
 
-    for i in range(30):  # max ~5 min
+    def mlflow_running(_i: int) -> bool:
         svc = ecs.describe_services(cluster=ECS_CLUSTER, services=[ECS_SVC_MLFLOW])["services"][0]
         running = svc.get("runningCount", 0)
-        log.info("mlflow[%d]: running=%d desired=%d", i, running, svc.get("desiredCount", 0))
-        if running >= 1:
-            break
-        time.sleep(10)
-    else:
+        log.info("mlflow: running=%d desired=%d", running, svc.get("desiredCount", 0))
+        return running >= 1
+
+    if not _wait_until(mlflow_running, label="mlflow", max_iters=30):  # max ~5 min
         log.warning("MLflow no esta running tras 5 min, arrancamos reports igual")
 
     # Etapa 3: Reports Fargate (no-bloqueante: no depende de RDS ni MLflow)
@@ -118,8 +132,7 @@ def _stop():
         ecs.update_service(cluster=ECS_CLUSTER, service=svc, desiredCount=0)
         log.info("ecs %s -> desiredCount=0", svc)
 
-    db = rds.describe_db_instances(DBInstanceIdentifier=RDS_INSTANCE)["DBInstances"][0]
-    state = db["DBInstanceStatus"]
+    state = _rds_state()
     if state == "available":
         rds.stop_db_instance(DBInstanceIdentifier=RDS_INSTANCE)
         log.info("rds stop_db_instance ack")
@@ -138,37 +151,35 @@ def _keepstop():
     start_utc = int(os.environ.get("WORK_START_UTC", "13"))
     end_utc = int(os.environ.get("WORK_END_UTC", "17"))
 
-    utc_hour = time.gmtime().tm_hour
-    weekday = time.gmtime().tm_wday
-    in_window = (weekday in workdays) and (start_utc <= utc_hour < end_utc)
+    now = time.gmtime()
+    in_window = (now.tm_wday in workdays) and (start_utc <= now.tm_hour < end_utc)
     if in_window:
         log.info(
             "dentro de ventana (UTC=%02d:00, weekday=%d, workdays=%s), skip",
-            utc_hour, weekday, sorted(workdays),
+            now.tm_hour, now.tm_wday, sorted(workdays),
         )
         return
 
-    db = rds.describe_db_instances(DBInstanceIdentifier=RDS_INSTANCE)["DBInstances"][0]
-    state = db["DBInstanceStatus"]
-    if state == "available":
-        running = _running_jobs()
-        if running:
-            log.warning("Batch jobs activos, skip keepstop")
-            return
-        rds.stop_db_instance(DBInstanceIdentifier=RDS_INSTANCE)
-        log.info("rds re-stopped por keepstop")
-    else:
+    state = _rds_state()
+    if state != "available":
         log.info("rds en estado %s (skip)", state)
+        return
+
+    if _running_jobs():
+        log.warning("Batch jobs activos, skip keepstop")
+        return
+
+    rds.stop_db_instance(DBInstanceIdentifier=RDS_INSTANCE)
+    log.info("rds re-stopped por keepstop")
+
+
+_ACTIONS = {"start": _start, "stop": _stop, "keepstop": _keepstop}
 
 
 def handler(event, _context):
     action = (event or {}).get("action", "stop")
-    if action == "start":
-        _start()
-    elif action == "stop":
-        _stop()
-    elif action == "keepstop":
-        _keepstop()
-    else:
-        raise ValueError(f"action desconocida: {action}")
+    handler_fn = _ACTIONS.get(action)
+    if handler_fn is None:
+        raise ValueError(f"action desconocida: {action}. Validas: {sorted(_ACTIONS)}")
+    handler_fn()
     return {"statusCode": 200, "body": action}

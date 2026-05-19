@@ -20,6 +20,7 @@ from src.config import (
     REPORT_SUBGROUP_MIN_N,
     REPORT_SUBGROUP_WARN_RATIO,
 )
+from src.step_05_evaluate.metrics import mape_safe
 
 
 @dataclass(frozen=True)
@@ -88,7 +89,9 @@ def recommended_actions(
                 nonzero = cat_real != 0
                 if nonzero.sum() == 0:
                     continue
-                cat_mape = float(np.mean(cat_err[nonzero] / np.abs(cat_real[nonzero])) * 100)
+                # `cat_err = |pred - real|`, asi que `mape_safe(real, real - |err|)`
+                # reproduce el MAPE original sin necesidad de propagar `pred`.
+                cat_mape = mape_safe(cat_real, cat_real - cat_err)
                 if cat_mape >= warn_thr:
                     ratio = cat_mape / global_mape if global_mape > 0 else float("inf")
                     actions.append(Action(

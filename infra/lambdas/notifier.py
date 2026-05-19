@@ -15,10 +15,20 @@ sns   = boto3.client("sns")
 batch = boto3.client("batch")
 
 SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
-# AWS_REGION lo inyecta Lambda runtime automaticamente; PROJECT lo
-# pasa el .tf para que el URL del log no hardcodee "ml-training".
-AWS_REGION    = os.environ.get("AWS_REGION", "us-east-1")
-PROJECT       = os.environ.get("PROJECT", "ml-training")
+# AWS_REGION lo inyecta Lambda runtime automaticamente.
+AWS_REGION = os.environ["AWS_REGION"]
+# BATCH_LOG_GROUP es el name real (ej. "/aws/batch/ml-training"); el modulo
+# batch lo expone como output y se pasa via env var. Antes se construia con
+# f"/aws/batch/{PROJECT}" -> rompia silencioso si el log group cambiaba de patron.
+BATCH_LOG_GROUP = os.environ["BATCH_LOG_GROUP"]
+
+
+def _cw_url_encode(s: str) -> str:
+    """CloudWatch UI hace doble URL-decode del log group/stream name.
+
+    "/" se vuelve "$252F" (% URL-encoded a %25, luego %25 + 2F = $252F).
+    """
+    return s.replace("/", "$252F")
 
 
 def handler(event, _context):
@@ -38,14 +48,11 @@ def handler(event, _context):
 
     log_url = "(no log stream)"
     if log_stream:
-        # URL de CloudWatch logs en consola. $252F = "/" URL-encoded x2
-        # (CloudWatch UI hace doble-decode del log group name).
-        log_group_encoded = f"$252Faws$252Fbatch$252F{PROJECT}"
         log_url = (
             f"https://{AWS_REGION}.console.aws.amazon.com/cloudwatch/home"
             f"?region={AWS_REGION}#logsV2:log-groups/log-group/"
-            f"{log_group_encoded}/log-events/"
-            f"{log_stream.replace('/', '$252F')}"
+            f"{_cw_url_encode(BATCH_LOG_GROUP)}/log-events/"
+            f"{_cw_url_encode(log_stream)}"
         )
 
     subject = f"[ml-training] Job FAILED: {job_name}"

@@ -21,6 +21,8 @@ from typing import List
 import numpy as np
 import pandas as pd
 
+from src.config import CORRELATION_HIGH_THRESHOLD
+
 
 @dataclass
 class VIFResult:
@@ -41,7 +43,7 @@ class CorrelationMatrix:
     method: str  # "pearson" o "spearman"
     columns: List[str]
     matrix: List[List[float]]  # row-major
-    high_pairs: List[tuple]    # (col_a, col_b, corr) con |corr| > 0.85
+    high_pairs: List[tuple]    # (col_a, col_b, corr) con |corr| > CORRELATION_HIGH_THRESHOLD
 
 
 def compute_vif(X: pd.DataFrame, threshold_high: float = 10.0,
@@ -131,7 +133,7 @@ def compute_mutual_information(
 def correlation_matrix(
     X: pd.DataFrame,
     method: str = "spearman",
-    high_threshold: float = 0.85,
+    high_threshold: float = CORRELATION_HIGH_THRESHOLD,
 ) -> CorrelationMatrix:
     """Matriz de correlacion + lista de pares con |r| > threshold."""
     numeric = X.select_dtypes(include=[np.number])

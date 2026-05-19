@@ -15,6 +15,7 @@ ese es el contrato del proyecto (la maquina elige, no el operador).
 from __future__ import annotations
 
 import argparse
+import sys
 
 from src.config import (
     DEFAULT_TUNING,
@@ -23,6 +24,21 @@ from src.config import (
     TUNING_PROFILES,
 )
 from src.step_01_load.data_loader import list_varieties
+
+
+def _positive_int(value: str) -> int:
+    """argparse type para enteros >= 1 con mensaje accionable."""
+    try:
+        ivalue = int(value)
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(
+            f"valor invalido: {value!r}; se esperaba un entero >= 1",
+        ) from exc
+    if ivalue < 1:
+        raise argparse.ArgumentTypeError(
+            f"valor invalido: {ivalue}; debe ser >= 1",
+        )
+    return ivalue
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -41,10 +57,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=DEFAULT_VARIETIES,
         help='Lista CSV de variedades (= hojas) o "all" para todas.',
     )
-    parser.add_argument("--n-trials", type=int, default=None)
-    parser.add_argument("--final-trials", type=int, default=None)
-    parser.add_argument("--outer-folds", type=int, default=None)
-    parser.add_argument("--inner-folds", type=int, default=None)
+    parser.add_argument("--n-trials", type=_positive_int, default=None)
+    parser.add_argument("--final-trials", type=_positive_int, default=None)
+    parser.add_argument("--outer-folds", type=_positive_int, default=None)
+    parser.add_argument("--inner-folds", type=_positive_int, default=None)
     parser.add_argument("--skip-final-tuning", action="store_true")
     parser.add_argument(
         "--experiment-prefix",
@@ -74,7 +90,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--parallel-varieties",
-        type=int,
+        type=_positive_int,
         default=1,
         help=(
             "Variedades a entrenar en PARALELO (procesos independientes). "
@@ -112,6 +128,28 @@ def resolve_settings(args: argparse.Namespace) -> dict[str, int | bool | str]:
 
 
 def resolve_varieties(arg: str) -> list[str]:
+    """Resuelve la lista de variedades validando contra el catalogo del Excel.
+
+    Cualquier variedad desconocida aborta con `sys.exit(2)` y lista las
+    validas, para que el error se vea en la CLI antes de gastar workers
+    en jobs que de todos modos fallarian al cargar la hoja del Excel.
+    """
     if arg.strip().lower() == "all":
         return list_varieties()
-    return [v.strip() for v in arg.split(",") if v.strip()]
+    requested = [v.strip() for v in arg.split(",") if v.strip()]
+    try:
+        available = list_varieties()
+    except FileNotFoundError:
+        # Sin Excel no podemos validar; dejamos pasar y que el worker
+        # reporte el error de I/O con su contexto.
+        return requested
+    available_set = set(available)
+    unknown = [v for v in requested if v not in available_set]
+    if unknown:
+        print(
+            f"error: variedades desconocidas: {unknown}. "
+            f"Validas: {available}",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+    return requested

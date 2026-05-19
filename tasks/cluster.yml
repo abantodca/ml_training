@@ -20,9 +20,10 @@
 version: "3"
 
 vars:
-  PROJECT:       '{{.PROJECT       | default "ml-training"}}'
-  DISPATCHER_FN: '{{.DISPATCHER_FN | default (printf "%s-dispatcher" .PROJECT)}}'
-  TF_DIR:        '{{.TF_DIR        | default "infra/envs/prod"}}'
+  SCHEDULER_FN: '{{.SCHEDULER_FN | default (printf "%s-scheduler" .PROJECT)}}'
+  TF_DIR:       '{{.TF_DIR       | default "infra/envs/prod"}}'
+  QUEUE_SPOT:   '{{.QUEUE_SPOT   | default (printf "%s-job-queue-spot"     .PROJECT)}}'
+  QUEUE_OD:     '{{.QUEUE_OD     | default (printf "%s-job-queue-ondemand" .PROJECT)}}'
   # Orden reverso de apply (importante para destroy con dependencias)
   VOLATILE_MODULES: "module.scheduler module.lambdas module.monitoring module.batch module.reports module.mlflow"
 
@@ -54,13 +55,30 @@ tasks:
     cmds:
       - |
         total=0
-        for q in {{.PROJECT}}-spot {{.PROJECT}}-ondemand; do
+        for q in {{.QUEUE_SPOT}} {{.QUEUE_OD}}; do
           for s in SUBMITTED PENDING RUNNABLE STARTING RUNNING; do
             n=$(aws batch list-jobs --job-queue "$q" --job-status $s --query 'length(jobSummaryList)' --output text 2>/dev/null || echo 0)
             [ "$n" -gt 0 ] && { echo "  queue=$q  status=$s  count=$n"; total=$((total + n)); }
           done
         done
         echo "  TOTAL activos $total"
+
+  _assert-no-running:
+    internal: true
+    silent: true
+    cmds:
+      - |
+        running=0
+        for q in {{.QUEUE_SPOT}} {{.QUEUE_OD}}; do
+          n=$(aws batch list-jobs --job-queue "$q" --job-status RUNNING --query 'length(jobSummaryList)' --output text 2>/dev/null || echo 0)
+          running=$((running + n))
+        done
+        if [ "$running" -gt 0 ]; then
+          echo "ERROR $running job(s) RUNNING. Cancelar primero:"
+          echo "       task batch:status              (ver detalle)"
+          echo "       task batch:cancel JOB_ID=<id>  (cancelar)"
+          exit 1
+        fi
 
   # ═══ Scale (encender / apagar) ══════════════════════════════════════════════
 
@@ -69,30 +87,23 @@ tasks:
     cmds:
       - 'echo ">>> Pre-check Batch jobs activos"'
       - task: _batch-jobs-active
-      - |
-        running=$(aws batch list-jobs --job-queue "{{.PROJECT}}-spot" --job-status RUNNING --query 'length(jobSummaryList)' --output text 2>/dev/null || echo 0)
-        if [ "$running" -gt 0 ]; then
-          echo "ERROR $running job(s) RUNNING. Cancelar primero:"
-          echo "       task batch:status              (ver detalle)"
-          echo "       task batch:cancel JOB_ID=<id>  (cancelar)"
-          exit 1
-        fi
-      - 'echo ">>> Invocando dispatcher Lambda (action=stop)..."'
-      - aws lambda invoke --function-name {{.DISPATCHER_FN}}
+      - task: _assert-no-running
+      - 'echo ">>> Invocando scheduler Lambda (action=stop)..."'
+      - aws lambda invoke --function-name {{.SCHEDULER_FN}}
         --payload '{"action":"stop"}'
         --cli-binary-format raw-in-base64-out
-        /tmp/dispatcher-stop.json
-      - cat /tmp/dispatcher-stop.json && echo ""
+        /tmp/scheduler-stop.json
+      - cat /tmp/scheduler-stop.json && echo ""
 
   scale-up:
     desc: "Encender (RDS start + ECS desired=1). RDS tarda ~5 min en estar Available"
     cmds:
-      - 'echo ">>> Invocando dispatcher Lambda (action=start)..."'
-      - aws lambda invoke --function-name {{.DISPATCHER_FN}}
+      - 'echo ">>> Invocando scheduler Lambda (action=start)..."'
+      - aws lambda invoke --function-name {{.SCHEDULER_FN}}
         --payload '{"action":"start"}'
         --cli-binary-format raw-in-base64-out
-        /tmp/dispatcher-start.json
-      - cat /tmp/dispatcher-start.json && echo ""
+        /tmp/scheduler-start.json
+      - cat /tmp/scheduler-start.json && echo ""
       - 'echo ""'
       - 'echo "RDS tarda ~5 min. Despues: task cluster:wait-healthy"'
 

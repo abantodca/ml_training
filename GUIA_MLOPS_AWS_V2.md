@@ -914,15 +914,23 @@ ml_training/
 │   │       ├── main.tf                     # 3.2.5
 │   │       └── outputs.tf                  # 3.2.6
 │   ├── modules/
-│   │   ├── network/                        # 3.3
+│   │   ├── _shared/                        # 3.4.5 (trust policies JSON compartidos)
+│   │   │   ├── README.md
+│   │   │   ├── assume-ecs-tasks.json
+│   │   │   ├── assume-lambda.json
+│   │   │   ├── assume-ec2.json
+│   │   │   ├── assume-batch-service.json
+│   │   │   └── assume-github-oidc.json.tftpl
+│   │   ├── network/                        # 3.3 (split: main.tf + security_groups.tf)
 │   │   ├── storage/                        # 3.4
-│   │   ├── mlflow/                         # 3.5
+│   │   ├── mlflow/                         # 3.5 (split: main.tf + alb.tf + ecs.tf + iam.tf + rds.tf)
 │   │   ├── reports/                        # 3.6
 │   │   ├── batch/                          # 3.7
 │   │   ├── monitoring/                     # 3.8
 │   │   ├── lambdas/                        # 3.9
 │   │   ├── scheduler/                      # 3.10
-│   │   └── cicd/                           # 3.11
+│   │   ├── cicd/                           # 3.11
+│   │   └── consumer-iam/                   # 3.11.5 (Patch 13.5 — rol OIDC repo consumer)
 │   └── lambdas/                            # Codigo Python de las Lambdas
 │       ├── dispatcher.py                   # 3.9.5
 │       ├── notifier.py                     # 3.9.6
@@ -940,6 +948,7 @@ Crear el esqueleto vacio:
 # Desde la raiz del repo
 dirs=(
     "infra/envs/prod"
+    "infra/modules/_shared"
     "infra/modules/network"
     "infra/modules/storage"
     "infra/modules/mlflow"
@@ -949,6 +958,7 @@ dirs=(
     "infra/modules/lambdas"
     "infra/modules/scheduler"
     "infra/modules/cicd"
+    "infra/modules/consumer-iam"
     "infra/lambdas"
     "docker/reports"
 )
@@ -1287,6 +1297,12 @@ output "gha_deploy_role_arn" {
 output "gha_train_role_arn" {
   description = "Role que asume GitHub Actions para invocar Lambda dispatcher."
   value       = module.cicd.gha_train_role_arn
+}
+
+# Patch 13.5
+output "consumer_role_arn" {
+  description = "Role que asume el repo consumer (ml-serving) via OIDC para descargar artifacts."
+  value       = module.consumer_iam.consumer_role_arn
 }
 ```
 
@@ -1932,6 +1948,143 @@ module "storage" {
 
 ---
 
+## 3.4.5 `modules/_shared/` — Trust policies compartidos
+
+Documentos de assume-role JSON que varios modulos repetian. Cada modulo los
+carga con `file()` o `templatefile()` en vez de redeclarar el mismo `data
+"aws_iam_policy_document"`. Cambio puramente de organizacion: AWS provider
+normaliza JSON, asi que `terraform plan` queda no-op.
+
+Archivos:
+- `assume-ecs-tasks.json`      — Fargate / ECS task roles (mlflow, reports, batch job role)
+- `assume-lambda.json`         — Lambda execution roles (dispatcher, notifier, scheduler)
+- `assume-ec2.json`            — EC2 instance profile (batch compute env)
+- `assume-batch-service.json`  — AWS Batch service role
+- `assume-github-oidc.json.tftpl` — GHA OIDC trust (cicd + consumer-iam), parametriza provider_arn/org/repo
+- `README.md`                  — documentacion inline del directorio
+
+Patron de uso desde un modulo:
+
+```hcl
+resource "aws_iam_role" "ejemplo" {
+  name               = "${var.project}-ejemplo"
+  assume_role_policy = file("${path.module}/../_shared/assume-ecs-tasks.json")
+}
+```
+
+Para el trust GHA-OIDC (con variables interpoladas):
+
+```hcl
+locals {
+  gha_oidc_trust = templatefile("${path.module}/../_shared/assume-github-oidc.json.tftpl", {
+    provider_arn = var.oidc_provider_arn
+    org          = var.github_org
+    repo         = var.github_repo
+  })
+}
+```
+
+Si necesitas un nuevo trust (ej. RDS, EventBridge), agregarlo aqui en vez de
+inlinearlo en el modulo.
+
+### 3.4.5.1 Contenido de los archivos
+
+`modules/_shared/assume-ecs-tasks.json`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Principal": {
+        "Service": "ecs-tasks.amazonaws.com"
+      }
+    }
+  ]
+}
+```
+
+`modules/_shared/assume-lambda.json`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Principal": {
+        "Service": "lambda.amazonaws.com"
+      }
+    }
+  ]
+}
+```
+
+`modules/_shared/assume-ec2.json`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Principal": {
+        "Service": "ec2.amazonaws.com"
+      }
+    }
+  ]
+}
+```
+
+`modules/_shared/assume-batch-service.json`:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Principal": {
+        "Service": "batch.amazonaws.com"
+      }
+    }
+  ]
+}
+```
+
+`modules/_shared/assume-github-oidc.json.tftpl` (template — `${provider_arn}`,
+`${org}` y `${repo}` se interpolan via `templatefile()`):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Principal": {
+        "Federated": "${provider_arn}"
+      },
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:${org}/${repo}:*"
+        }
+      }
+    }
+  ]
+}
+```
+
+---
+
 ## 3.5 `modules/mlflow/` — RDS + ECS Fargate + ALB
 
 Este modulo es el mas pesado: arma el backend de tracking (RDS Postgres),
@@ -2188,19 +2341,10 @@ ECS Fargate distingue dos roles:
 > - **Trust policy con `ecs-tasks.amazonaws.com`**: dice "solo el servicio ECS Fargate puede asumir este rol" (no usuarios IAM, no otras services). Otro tipo de defensa.
 
 ```hcl
-data "aws_iam_policy_document" "ecs_tasks_assume" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["ecs-tasks.amazonaws.com"]
-    }
-  }
-}
-
+# modules/mlflow/iam.tf
 resource "aws_iam_role" "mlflow_exec" {
   name               = "${var.project}-mlflow-exec"
-  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+  assume_role_policy = file("${path.module}/../_shared/assume-ecs-tasks.json")
 }
 
 resource "aws_iam_role_policy_attachment" "mlflow_exec" {
@@ -2221,10 +2365,9 @@ resource "aws_iam_role_policy" "mlflow_exec_secret" {
   })
 }
 
-# IAM: task role (S3 artifacts read/write)
 resource "aws_iam_role" "mlflow_task" {
   name               = "${var.project}-mlflow-task"
-  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+  assume_role_policy = file("${path.module}/../_shared/assume-ecs-tasks.json")
 }
 
 resource "aws_iam_role_policy" "mlflow_task_s3" {
@@ -2245,6 +2388,13 @@ resource "aws_iam_role_policy" "mlflow_task_s3" {
   })
 }
 ```
+
+> **Nota — assume policy centralizada**: los trust policies (`ecs-tasks`,
+> `ec2`, `lambda`, `batch-service`, GHA-OIDC) viven como JSON estatico en
+> `infra/modules/_shared/`. Cada modulo solo hace `file("${path.module}/../_shared/<archivo>.json")`.
+> Antes el mismo `data "aws_iam_policy_document" "ecs_tasks_assume"` se
+> redeclaraba copy-paste en mlflow, reports y batch — ahora una sola
+> fuente, sin drift.
 
 #### 3.5.2.e — Log group + Task Definition + Service
 
@@ -2524,20 +2674,10 @@ resource "aws_lb_listener_rule" "reports_path" {
   }
 }
 
-# IAM
-data "aws_iam_policy_document" "ecs_tasks_assume" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["ecs-tasks.amazonaws.com"]
-    }
-  }
-}
-
+# IAM (assume policy compartida en infra/modules/_shared/)
 resource "aws_iam_role" "reports_exec" {
   name               = "${var.project}-reports-exec"
-  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+  assume_role_policy = file("${path.module}/../_shared/assume-ecs-tasks.json")
 }
 
 resource "aws_iam_role_policy_attachment" "reports_exec" {
@@ -2547,7 +2687,7 @@ resource "aws_iam_role_policy_attachment" "reports_exec" {
 
 resource "aws_iam_role" "reports_task" {
   name               = "${var.project}-reports-task"
-  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+  assume_role_policy = file("${path.module}/../_shared/assume-ecs-tasks.json")
 }
 
 resource "aws_iam_role_policy" "reports_task_s3" {
@@ -2802,20 +2942,14 @@ variable "log_retention_days" { type = number }
 > - **Por que tanta separacion**: cada rol tiene **el minimo permiso necesario**. Un atacante que comprometa el trainer (job role) NO puede destruir EC2s (eso es batch_service), NO puede modificar el cluster (eso es instance), y NO puede leer secrets (no estan en ningun rol del trainer). Es el principio "**least privilege**" llevado al extremo.
 
 ```hcl
-# Role asumido por la EC2 que lanza Batch (instance profile)
-data "aws_iam_policy_document" "ec2_assume" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["ec2.amazonaws.com"]
-    }
-  }
-}
+# modules/batch/iam.tf
+# Trust policies viven como JSON estatico en infra/modules/_shared/
+# (assume-ec2.json, assume-ecs-tasks.json, assume-batch-service.json).
 
+# Role asumido por la EC2 que lanza Batch (instance profile)
 resource "aws_iam_role" "batch_instance" {
   name               = "${var.project}-batch-instance"
-  assume_role_policy = data.aws_iam_policy_document.ec2_assume.json
+  assume_role_policy = file("${path.module}/../_shared/assume-ec2.json")
 }
 
 resource "aws_iam_role_policy_attachment" "batch_instance" {
@@ -2829,19 +2963,9 @@ resource "aws_iam_instance_profile" "batch" {
 }
 
 # Role asumido por el container (task) durante el job
-data "aws_iam_policy_document" "ecs_tasks_assume" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["ecs-tasks.amazonaws.com"]
-    }
-  }
-}
-
 resource "aws_iam_role" "job" {
   name               = "${var.project}-job-role"
-  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+  assume_role_policy = file("${path.module}/../_shared/assume-ecs-tasks.json")
 }
 
 # S3: el trainer necesita:
@@ -2885,7 +3009,7 @@ resource "aws_iam_role_policy" "job_cloudwatch" {
 # Execution role (pull image, write logs) — usado por Batch para arrancar
 resource "aws_iam_role" "exec" {
   name               = "${var.project}-job-exec"
-  assume_role_policy = data.aws_iam_policy_document.ecs_tasks_assume.json
+  assume_role_policy = file("${path.module}/../_shared/assume-ecs-tasks.json")
 }
 
 resource "aws_iam_role_policy_attachment" "exec" {
@@ -2893,17 +3017,11 @@ resource "aws_iam_role_policy_attachment" "exec" {
   policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy"
 }
 
-# Service role de Batch (gestion de CE)
+# Service role de Batch (gestion de CE).
+# Antes era inline `jsonencode({...})`; ahora consume el JSON shared.
 resource "aws_iam_role" "batch_service" {
-  name = "${var.project}-batch-service"
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Principal = { Service = "batch.amazonaws.com" }
-      Action    = "sts:AssumeRole"
-    }]
-  })
+  name               = "${var.project}-batch-service"
+  assume_role_policy = file("${path.module}/../_shared/assume-batch-service.json")
 }
 
 resource "aws_iam_role_policy_attachment" "batch_service" {
@@ -3399,10 +3517,17 @@ Dos Lambdas:
 variable "project" { type = string }
 variable "job_queue_spot_arn" { type = string }
 variable "job_queue_ondemand_arn" { type = string }
+# *_name vars: el dispatcher.py / notifier.py usan los NAMES (no ARNs)
+# para `batch.submit_job` / `batch.describe_jobs`. Antes el .tf construia
+# `"${var.project}-job-queue-spot"` inline; ahora se reciben como input
+# del envs/prod (wireado desde module.batch.job_queue_spot/ondemand).
+variable "job_queue_spot_name" { type = string }
+variable "job_queue_ondemand_name" { type = string }
 variable "job_definition_name" { type = string }
 variable "data_bucket" { type = string }
 variable "varieties_allowed" { type = list(string) }
 variable "sns_topic_arn" { type = string }
+variable "batch_log_group_name" { type = string }
 variable "log_retention_days" { type = number }
 variable "lambdas_src_dir" { type = string }
 ```
@@ -3437,20 +3562,10 @@ data "archive_file" "dispatcher" {
   output_path = "${path.module}/dispatcher.zip"
 }
 
-# IAM
-data "aws_iam_policy_document" "lambda_assume" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["lambda.amazonaws.com"]
-    }
-  }
-}
-
+# IAM (trust policy compartida en infra/modules/_shared/assume-lambda.json)
 resource "aws_iam_role" "dispatcher" {
   name               = "${var.project}-dispatcher"
-  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+  assume_role_policy = file("${path.module}/../_shared/assume-lambda.json")
 }
 
 resource "aws_iam_role_policy" "dispatcher" {
@@ -3495,12 +3610,12 @@ resource "aws_lambda_function" "dispatcher" {
   environment {
     variables = {
       PROJECT = var.project
-      # AWS Batch SubmitJob/ListJobs aceptan ARN o name; usamos NAME
-      # para mantener consistencia con scheduler/main.tf (que tambien
-      # pasa name). Si se quisiera pinear a un ARN historico (rare),
-      # cambiar a var.job_queue_spot_arn (ambas son output de batch/).
-      JOB_QUEUE_SPOT     = "${var.project}-job-queue-spot"
-      JOB_QUEUE_ONDEMAND = "${var.project}-job-queue-ondemand"
+      # AWS Batch SubmitJob/ListJobs aceptan ARN o name; usamos NAME.
+      # Antes el .tf construia `"${var.project}-job-queue-spot"` inline;
+      # ahora se recibe como input (var.job_queue_spot_name) wireado
+      # desde module.batch.job_queue_spot — single source of truth.
+      JOB_QUEUE_SPOT     = var.job_queue_spot_name
+      JOB_QUEUE_ONDEMAND = var.job_queue_ondemand_name
       JOB_DEFINITION     = var.job_definition_name
       DATA_BUCKET        = var.data_bucket
       VARIETIES_ALLOWED  = join(",", var.varieties_allowed)
@@ -3518,7 +3633,7 @@ resource "aws_lambda_function" "dispatcher" {
 > | Recurso Terraform | Servicio | Que harias click-a-click |
 > |---|---|---|
 > | `aws_iam_role.notifier` + inline policy | **🔐 IAM** | Wizard de Lambda role. **Permissions**: inline policy con `sns:Publish` (al topic), `batch:DescribeJobs`, `logs:*`. **Name**: `ml-training-notifier`. |
-> | `aws_lambda_function.notifier` | **λ Lambda** | Mismo wizard que dispatcher. **Name**: `ml-training-notifier`. **Timeout**: 30s. **Memory**: 128 MB. Env: `SNS_TOPIC_ARN` + `PROJECT`. |
+> | `aws_lambda_function.notifier` | **λ Lambda** | Mismo wizard que dispatcher. **Name**: `ml-training-notifier`. **Timeout**: 30s. **Memory**: 128 MB. Env: `SNS_TOPIC_ARN` + `BATCH_LOG_GROUP` (nombre real del log group, ej. `/aws/batch/ml-training`, propagado desde el output del modulo batch — antes era construido inline con `f"/aws/batch/{PROJECT}"`, frágil si cambia el patron). |
 > | `aws_cloudwatch_event_rule.batch_failed` | **🎯 EventBridge** | `EventBridge > Rules > Create rule`. **Name**: `ml-training-batch-failed`. **Event bus**: default. **Rule type**: Rule with an event pattern. **Event source**: AWS services > AWS Batch > Batch Job State Change. **Specific status(es)**: FAILED. La consola te muestra un preview del JSON pattern. |
 > | `aws_cloudwatch_event_target.notifier` | **🎯 EventBridge** | Dentro de la rule: `Add target > Lambda function > ml-training-notifier`. |
 > | `aws_lambda_permission.notifier_eventbridge` | **λ Lambda** | NO existe en Console como recurso aparte — la consola lo crea **automaticamente** al asociar el target (te pide "Add permission"). En Terraform es explicito. |
@@ -3542,7 +3657,7 @@ data "archive_file" "notifier" {
 
 resource "aws_iam_role" "notifier" {
   name               = "${var.project}-notifier"
-  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+  assume_role_policy = file("${path.module}/../_shared/assume-lambda.json")
 }
 
 resource "aws_iam_role_policy" "notifier" {
@@ -3586,8 +3701,8 @@ resource "aws_lambda_function" "notifier" {
 
   environment {
     variables = {
-      SNS_TOPIC_ARN = var.sns_topic_arn
-      PROJECT       = var.project # usado para construir el URL de CloudWatch
+      SNS_TOPIC_ARN   = var.sns_topic_arn
+      BATCH_LOG_GROUP = var.batch_log_group_name
     }
   }
 
@@ -3763,10 +3878,20 @@ sns   = boto3.client("sns")
 batch = boto3.client("batch")
 
 SNS_TOPIC_ARN = os.environ["SNS_TOPIC_ARN"]
-# AWS_REGION lo inyecta Lambda runtime automaticamente; PROJECT lo
-# pasa el .tf para que el URL del log no hardcodee "ml-training".
-AWS_REGION    = os.environ.get("AWS_REGION", "us-east-1")
-PROJECT       = os.environ.get("PROJECT", "ml-training")
+# AWS_REGION lo inyecta Lambda runtime automaticamente.
+AWS_REGION = os.environ["AWS_REGION"]
+# BATCH_LOG_GROUP es el name real (ej. "/aws/batch/ml-training"); el modulo
+# batch lo expone como output y se pasa via env var. Antes se construia con
+# f"/aws/batch/{PROJECT}" -> rompia silencioso si el log group cambiaba de patron.
+BATCH_LOG_GROUP = os.environ["BATCH_LOG_GROUP"]
+
+
+def _cw_url_encode(s: str) -> str:
+    """CloudWatch UI hace doble URL-decode del log group/stream name.
+
+    "/" se vuelve "$252F" (% URL-encoded a %25, luego %25 + 2F = $252F).
+    """
+    return s.replace("/", "$252F")
 
 
 def handler(event, _context):
@@ -3786,14 +3911,11 @@ def handler(event, _context):
 
     log_url = "(no log stream)"
     if log_stream:
-        # URL de CloudWatch logs en consola. $252F = "/" URL-encoded x2
-        # (CloudWatch UI hace doble-decode del log group name).
-        log_group_encoded = f"$252Faws$252Fbatch$252F{PROJECT}"
         log_url = (
             f"https://{AWS_REGION}.console.aws.amazon.com/cloudwatch/home"
             f"?region={AWS_REGION}#logsV2:log-groups/log-group/"
-            f"{log_group_encoded}/log-events/"
-            f"{log_stream.replace('/', '$252F')}"
+            f"{_cw_url_encode(BATCH_LOG_GROUP)}/log-events/"
+            f"{_cw_url_encode(log_stream)}"
         )
 
     subject = f"[ml-training] Job FAILED: {job_name}"
@@ -3823,15 +3945,18 @@ Pegar AL FINAL de `infra/envs/prod/main.tf` (despues de
 module "lambdas" {
   source = "../../modules/lambdas"
 
-  project                = var.project
-  job_queue_spot_arn     = module.batch.job_queue_spot_arn
-  job_queue_ondemand_arn = module.batch.job_queue_ondemand_arn
-  job_definition_name    = module.batch.job_definition_name
-  data_bucket            = module.storage.data_bucket
-  varieties_allowed      = var.varieties_allowed
-  sns_topic_arn          = module.monitoring.sns_topic_arn
-  log_retention_days     = var.log_retention_days
-  lambdas_src_dir        = "${path.module}/../../lambdas"
+  project                 = var.project
+  job_queue_spot_arn      = module.batch.job_queue_spot_arn
+  job_queue_ondemand_arn  = module.batch.job_queue_ondemand_arn
+  job_queue_spot_name     = module.batch.job_queue_spot
+  job_queue_ondemand_name = module.batch.job_queue_ondemand
+  job_definition_name     = module.batch.job_definition_name
+  data_bucket             = module.storage.data_bucket
+  varieties_allowed       = var.varieties_allowed
+  sns_topic_arn           = module.monitoring.sns_topic_arn
+  batch_log_group_name    = module.batch.log_group_name
+  log_retention_days      = var.log_retention_days
+  lambdas_src_dir         = "${path.module}/../../lambdas"
 }
 ```
 
@@ -3862,6 +3987,12 @@ variable "ecs_cluster_name" { type = string }
 variable "ecs_service_name_mlflow" { type = string }
 variable "ecs_service_name_reports" { type = string }
 variable "rds_instance_id" { type = string }
+# *_name vars: el scheduler.py llama batch.list_jobs(jobQueue=NAME)
+# para detectar jobs RUNNING antes de apagar RDS. Antes el .tf
+# construia los nombres inline; ahora se reciben como input desde
+# envs/prod (module.batch.job_queue_spot / job_queue_ondemand).
+variable "job_queue_spot_name" { type = string }
+variable "job_queue_ondemand_name" { type = string }
 variable "work_start_hour_local" { type = number }
 variable "work_end_hour_local" { type = number }
 variable "tz_offset_hours" {
@@ -3870,7 +4001,7 @@ variable "tz_offset_hours" {
 }
 variable "workdays_cron" {
   type    = string
-  default = "MON-FRI"
+  default = "MON,WED,FRI" # Patch 13.1: solo L/Mi/V (antes: "MON-FRI")
 }
 variable "log_retention_days" { type = number }
 variable "lambdas_src_dir" { type = string }
@@ -3913,19 +4044,10 @@ data "archive_file" "scheduler" {
   output_path = "${path.module}/scheduler.zip"
 }
 
-data "aws_iam_policy_document" "lambda_assume" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["lambda.amazonaws.com"]
-    }
-  }
-}
-
+# Trust policy compartida en infra/modules/_shared/assume-lambda.json
 resource "aws_iam_role" "scheduler" {
   name               = "${var.project}-scheduler"
-  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+  assume_role_policy = file("${path.module}/../_shared/assume-lambda.json")
 }
 
 resource "aws_iam_role_policy" "scheduler" {
@@ -3971,7 +4093,7 @@ resource "aws_lambda_function" "scheduler" {
   handler          = "scheduler.handler"
   filename         = data.archive_file.scheduler.output_path
   source_code_hash = data.archive_file.scheduler.output_base64sha256
-  timeout          = 300
+  timeout          = 900 # Patch 13.3: 15 min (antes 300). Cubre RDS cold start (~5-8 min) + wait MLflow.
   memory_size      = 256
 
   environment {
@@ -3981,8 +4103,15 @@ resource "aws_lambda_function" "scheduler" {
       ECS_SVC_MLFLOW     = var.ecs_service_name_mlflow
       ECS_SVC_REPORTS    = var.ecs_service_name_reports
       RDS_INSTANCE       = var.rds_instance_id
-      JOB_QUEUE_SPOT     = "${var.project}-job-queue-spot"
-      JOB_QUEUE_ONDEMAND = "${var.project}-job-queue-ondemand"
+      # Antes los names se construian inline (`"${var.project}-job-queue-spot"`);
+      # ahora vienen como input wireado desde module.batch en envs/prod.
+      JOB_QUEUE_SPOT     = var.job_queue_spot_name
+      JOB_QUEUE_ONDEMAND = var.job_queue_ondemand_name
+      # Patch 13.1: propagar workdays + ventana al _keepstop (sino el
+      # martes/jueves queda "dentro de ventana" y nunca re-para el RDS).
+      WORKDAYS_CRON  = var.workdays_cron
+      WORK_START_UTC = tostring(local.start_hour_utc)
+      WORK_END_UTC   = tostring(local.stop_hour_utc)
     }
   }
 
@@ -4258,6 +4387,8 @@ module "scheduler" {
   ecs_service_name_mlflow  = module.mlflow.service_name
   ecs_service_name_reports = module.reports.service_name
   rds_instance_id          = module.mlflow.rds_instance_id
+  job_queue_spot_name      = module.batch.job_queue_spot
+  job_queue_ondemand_name  = module.batch.job_queue_ondemand
   work_start_hour_local    = var.work_start_hour_local
   work_end_hour_local      = var.work_end_hour_local
   log_retention_days       = var.log_retention_days
@@ -4321,33 +4452,21 @@ data "aws_caller_identity" "current" {}
 data "aws_region" "current" {}
 
 locals {
-  repo_subject = "repo:${var.github_org}/${var.github_repo}:*"
+  # Trust policy GHA-OIDC compartido entre gha-deploy y gha-train.
+  # El template vive en infra/modules/_shared/assume-github-oidc.json.tftpl
+  # — provider_arn / org / repo se inyectan via templatefile().
+  # Mismo template usado por modules/consumer-iam (otro repo, mismo shape).
+  gha_oidc_trust = templatefile("${path.module}/../_shared/assume-github-oidc.json.tftpl", {
+    provider_arn = var.oidc_provider_arn
+    org          = var.github_org
+    repo         = var.github_repo
+  })
 }
 
 # ----- Role 1: gha-deploy (CI workflows que aplican terraform + push ECR)
-data "aws_iam_policy_document" "deploy_assume" {
-  statement {
-    actions = ["sts:AssumeRoleWithWebIdentity"]
-    principals {
-      type        = "Federated"
-      identifiers = [var.oidc_provider_arn]
-    }
-    condition {
-      test     = "StringEquals"
-      variable = "token.actions.githubusercontent.com:aud"
-      values   = ["sts.amazonaws.com"]
-    }
-    condition {
-      test     = "StringLike"
-      variable = "token.actions.githubusercontent.com:sub"
-      values   = [local.repo_subject]
-    }
-  }
-}
-
 resource "aws_iam_role" "deploy" {
   name               = "${var.project}-gha-deploy"
-  assume_role_policy = data.aws_iam_policy_document.deploy_assume.json
+  assume_role_policy = local.gha_oidc_trust
 }
 
 resource "aws_iam_role_policy" "deploy" {
@@ -4420,7 +4539,7 @@ resource "aws_iam_role_policy" "deploy" {
 # ----- Role 2: gha-train (solo invocar Lambda dispatcher) -------------
 resource "aws_iam_role" "train" {
   name               = "${var.project}-gha-train"
-  assume_role_policy = data.aws_iam_policy_document.deploy_assume.json
+  assume_role_policy = local.gha_oidc_trust
 }
 
 resource "aws_iam_role_policy" "train" {
@@ -4429,13 +4548,30 @@ resource "aws_iam_role_policy" "train" {
     Version = "2012-10-17"
     Statement = [
       {
-        Effect   = "Allow"
-        Action   = ["lambda:InvokeFunction"]
-        Resource = "arn:aws:lambda:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:function:${var.project}-dispatcher"
+        Effect = "Allow"
+        Action = ["lambda:InvokeFunction"]
+        # Patch 13.2: gha-train tambien invoca scheduler para wake/stop
+        # en el workflow auto-train-on-push.yml.
+        Resource = [
+          "arn:aws:lambda:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:function:${var.project}-dispatcher",
+          "arn:aws:lambda:${data.aws_region.current.name}:${data.aws_caller_identity.current.account_id}:function:${var.project}-scheduler"
+        ]
       },
       {
         Effect   = "Allow"
         Action   = ["batch:DescribeJobs", "batch:ListJobs"]
+        Resource = "*"
+      },
+      {
+        # Patch 13.2: chequear estado RDS antes de wake
+        Effect   = "Allow"
+        Action   = ["rds:DescribeDBInstances"]
+        Resource = "*"
+      },
+      {
+        # Patch 13.2: chequear estado de los services Fargate
+        Effect   = "Allow"
+        Action   = ["ecs:DescribeServices"]
         Resource = "*"
       },
       {
@@ -4501,6 +4637,97 @@ module "cicd" {
 > **completo** (los 9 modulos + los 3 `data` sources). En 📖 3.12 viene
 > la validacion sintactica integrada (`terraform fmt -recursive` y
 > `terraform validate`) antes de pasar a Parte 4 (apply real).
+
+---
+
+## 3.11.5 `modules/consumer-iam/` — Rol OIDC para repo consumer (Patch 13.5)
+
+Rol IAM que el repo consumer (FastAPI/Streamlit que sirve modelos) asume via
+GitHub OIDC para descargar artifacts de S3 read-only. Separado de `cicd/`
+porque vive con permisos distintos y trust hacia otro repo.
+
+Las vars `consumer_org` y `consumer_repo` ya estan declaradas en
+`envs/prod/variables.tf` (Patch 13.5), y el OIDC provider es el mismo
+`data "aws_iam_openid_connect_provider" "github"` que usa `cicd/` (📖 3.11),
+asi que no hay que crear nada nuevo a nivel envs.
+
+### 3.11.5.1 `modules/consumer-iam/variables.tf`
+
+```hcl
+variable "project" { type = string }
+variable "artifacts_bucket_arn" { type = string }
+variable "consumer_oidc_arn" { type = string }
+variable "consumer_org" { type = string }
+variable "consumer_repo" { type = string }
+```
+
+### 3.11.5.2 `modules/consumer-iam/main.tf`
+
+```hcl
+# Patch 13.5: rol que el repo consumer (FastAPI/Streamlit) asume via OIDC
+# para descargar artifacts (modelos) desde S3 read-only.
+
+resource "aws_iam_role" "consumer" {
+  name = "${var.project}-consumer"
+  assume_role_policy = templatefile("${path.module}/../_shared/assume-github-oidc.json.tftpl", {
+    provider_arn = var.consumer_oidc_arn
+    org          = var.consumer_org
+    repo         = var.consumer_repo
+  })
+}
+
+resource "aws_iam_role_policy" "consumer" {
+  role = aws_iam_role.consumer.id
+  policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Effect   = "Allow"
+        Action   = ["s3:GetObject", "s3:ListBucket"]
+        Resource = [var.artifacts_bucket_arn, "${var.artifacts_bucket_arn}/*"]
+      }
+    ]
+  })
+}
+```
+
+### 3.11.5.3 `modules/consumer-iam/outputs.tf`
+
+```hcl
+output "consumer_role_arn" { value = aws_iam_role.consumer.arn }
+```
+
+### 3.11.5.4 Apendear `module "consumer_iam"` en `infra/envs/prod/main.tf`
+
+Pegar AL FINAL de `infra/envs/prod/main.tf` (despues del `module "cicd"`
+de 📖 3.11.4):
+
+```hcl
+# -------------------------------------------------------------------------
+# Capa 10: Consumer IAM (Patch 13.5 — repo ml-serving consume artifacts read-only)
+# -------------------------------------------------------------------------
+module "consumer_iam" {
+  source = "../../modules/consumer-iam"
+
+  project              = var.project
+  artifacts_bucket_arn = module.storage.artifacts_bucket_arn
+  consumer_oidc_arn    = data.aws_iam_openid_connect_provider.github.arn
+  consumer_org         = var.consumer_org
+  consumer_repo        = var.consumer_repo
+}
+```
+
+> **En consola AWS veras**:
+> - IAM → Roles → `ml-training-consumer` con trust policy que confia en
+>   el OIDC provider de 📖 2.5 y limita el `sub` a
+>   `repo:<consumer_org>/<consumer_repo>:*` (repo distinto al de training).
+> - IAM → Roles → `ml-training-consumer` → Permissions: inline policy con
+>   `s3:GetObject` + `s3:ListBucket` sobre el bucket de artifacts (scope
+>   minimo: el repo consumer **solo lee** modelos, no entrena ni publica).
+> - El ARN se exporta como output `consumer_role_arn` (📖 3.2.6) — ese
+>   ARN va al repo consumer como `vars.AWS_CONSUMER_ROLE_ARN` para que
+>   su workflow GHA pueda hacer `aws-actions/configure-aws-credentials`
+>   contra este rol.
 
 ---
 
@@ -4643,7 +4870,9 @@ tasks/
 ├── cluster.yml                 # cluster:*     lifecycle scale up/down + teardown
 ├── mlflow_registry.yml         # mlflow-aws:*  promote con quality gate MAPE + A/B
 ├── aws.yml                     # aws:*         orquestadores high-level (deploy/wake/sleep/nuke)
-└── local.yml                   # local:*       helpers dev local (ensure-buckets, bucket-name)
+├── local.yml                   # local:*       helpers dev local (ensure-buckets, bucket-name)
+└── lib/
+    └── batch_wait.sh           # helper bash compartido (polling de Batch jobs)
 ```
 
 **Por que un Taskfile raiz + 7 archivos en `tasks/` y no uno solo**:
@@ -4666,20 +4895,26 @@ tasks/
 mkdir -p tasks
 ```
 
-Editar `Taskfile.yml` raiz para anadir `PROJECT` al bloque `vars:`
-existente (esto SI se hace ahora — los Taskfiles que vas a crear en
-📖 4.1.4-4.1.9 lo van a leer):
+Editar `Taskfile.yml` raiz para anadir `PROJECT` y `REGION` al bloque
+`vars:` existente (esto SI se hace ahora — los Taskfiles que vas a crear
+en 📖 4.1.4-4.1.9 los van a leer, propagados via `includes:.vars:` en
+📖 4.1.10):
 
 ```yaml
 vars:
   # ... vars existentes (TUNING, VARIETIES, PARALLEL) ...
-  PROJECT: "{{.PROJECT | default \"ml-training\"}}"   # NUEVO, usado por tasks AWS
+  PROJECT: "{{.PROJECT | default \"ml-training\"}}"           # NUEVO, usado por tasks AWS
+  REGION:  "{{.AWS_DEFAULT_REGION | default \"us-east-1\"}}"  # NUEVO, usado por tasks AWS
 ```
 
-**Por que `PROJECT` se agrega al root**: las tasks AWS lo usan como nombre
-base para todos los recursos (ECR repos, RDS instance, Batch queues, Lambda
-function names). Definirlo una sola vez en el root permite override via CLI
-(`task aws:deploy PROJECT=ml-training-staging`) sin tocar ningun archivo.
+**Por que `PROJECT` y `REGION` se centralizan en el root**: las tasks AWS
+los usan como nombre base de todos los recursos (ECR repos, RDS instance,
+Batch queues, Lambda function names) y para apuntar a la region correcta.
+Definirlos una sola vez en el root permite override via CLI
+(`task aws:deploy PROJECT=ml-training-staging`) sin tocar ningun archivo
+hijo. La propagacion via `includes:.vars:` (📖 4.1.10) los hace visibles
+en cada `tasks/*.yml` sin redeclaraciones — go-task aisla el scope de los
+includes, asi sin esto los hijos no verian las vars del root.
 
 ### 4.1.4 `tasks/infra.yml` (Terraform wrapper + bootstrap)
 
@@ -4705,7 +4940,11 @@ Crear el archivo con este contenido:
 version: "3"
 
 vars:
-  TF_DIR: '{{.TF_DIR | default "infra/envs/prod"}}'
+  TF_DIR:  '{{.TF_DIR | default "infra/envs/prod"}}'
+  # Ultimos 6 chars del account ID (sufijo de buckets para evitar colisiones).
+  # Resuelto una vez por invocacion del include.
+  SUFFIX:
+    sh: aws sts get-caller-identity --query Account --output text | tail -c 7
 
 tasks:
 
@@ -4725,13 +4964,6 @@ tasks:
 
   _init:
     internal: true
-    # SUFFIX se resuelve dinamicamente: cambia entre cuentas (sandbox vs prod)
-    # y queremos el backend correcto sin setearlo en .env.
-    vars:
-      SUFFIX:
-        sh: aws sts get-caller-identity --query Account --output text | tail -c 7
-      PROJECT: '{{.PROJECT | default "ml-training"}}'
-      REGION:  '{{.AWS_DEFAULT_REGION | default "us-east-1"}}'
     cmds:
       - terraform -chdir={{.TF_DIR}} init
         -backend-config=bucket={{.PROJECT}}-tfstate-{{.SUFFIX}}
@@ -4842,11 +5074,9 @@ en vez de `bash infra/bootstrap.sh`) sin re-implementar.
 version: "3"
 
 vars:
-  PROJECT:     '{{.PROJECT            | default "ml-training"}}'
-  REGION:      '{{.AWS_DEFAULT_REGION | default "us-east-1"}}'
-  TAG_TRAINER: '{{.TAG_TRAINER        | default "latest"}}'
-  TAG_MLFLOW:  '{{.TAG_MLFLOW         | default "v3.12.0"}}'
-  TAG_REPORTS: '{{.TAG_REPORTS        | default "stable"}}'
+  TAG_TRAINER: '{{.TAG_TRAINER | default "latest"}}'
+  TAG_MLFLOW:  '{{.TAG_MLFLOW  | default "v3.12.0"}}'
+  TAG_REPORTS: '{{.TAG_REPORTS | default "stable"}}'
 
 tasks:
 
@@ -4879,29 +5109,11 @@ tasks:
         sh: git rev-parse --short=12 HEAD 2>/dev/null || echo unknown
       BUILD_DATE:
         sh: date -u +%Y-%m-%dT%H:%M:%SZ
-      # Resolvemos image name, dockerfile y tag segun IMG
-      IMAGE_NAME:
-        sh: |
-          case "{{.IMG}}" in
-            trainer) echo "{{.PROJECT}}" ;;
-            mlflow)  echo "{{.PROJECT}}-mlflow" ;;
-            reports) echo "{{.PROJECT}}-reports" ;;
-            *)       echo "ERROR" ;;
-          esac
-      DOCKERFILE:
-        sh: |
-          case "{{.IMG}}" in
-            trainer) echo "Dockerfile" ;;
-            mlflow)  echo "docker/mlflow/Dockerfile" ;;
-            reports) echo "docker/reports/Dockerfile" ;;
-          esac
-      RESOLVED_TAG:
-        sh: |
-          case "{{.IMG}}" in
-            trainer) echo "{{.TAG | default .TAG_TRAINER}}" ;;
-            mlflow)  echo "{{.TAG | default .TAG_MLFLOW}}" ;;
-            reports) echo "{{.TAG | default .TAG_REPORTS}}" ;;
-          esac
+      # Tabla IMG -> (image_name, dockerfile, default_tag). Cualquier IMG fuera
+      # de trainer|mlflow|reports cae en el branch ERROR validado abajo.
+      IMAGE_NAME: '{{if eq .IMG "trainer"}}{{.PROJECT}}{{else if eq .IMG "mlflow"}}{{.PROJECT}}-mlflow{{else if eq .IMG "reports"}}{{.PROJECT}}-reports{{else}}ERROR{{end}}'
+      DOCKERFILE: '{{if eq .IMG "trainer"}}Dockerfile{{else if eq .IMG "mlflow"}}docker/mlflow/Dockerfile{{else if eq .IMG "reports"}}docker/reports/Dockerfile{{else}}ERROR{{end}}'
+      RESOLVED_TAG: '{{if eq .IMG "trainer"}}{{.TAG | default .TAG_TRAINER}}{{else if eq .IMG "mlflow"}}{{.TAG | default .TAG_MLFLOW}}{{else if eq .IMG "reports"}}{{.TAG | default .TAG_REPORTS}}{{else}}ERROR{{end}}'
     cmds:
       - 'test "{{.IMAGE_NAME}}" != "ERROR" || { echo "ERROR IMG debe ser trainer|mlflow|reports (recibido {{.IMG}})"; exit 1; }'
       - 'echo ">>> Build {{.IMAGE_NAME}}:{{.RESOLVED_TAG}}  (sha-{{.GIT_SHA}})"'
@@ -4956,11 +5168,14 @@ vez y las 3 builds reusan el token.
   falla, podes hacer `task ecr:build IMG=trainer TAG=sha-<commit-anterior>`
   para volver exacto.
 
-**Por que `case` con `sh:` para resolver IMG -> image_name/dockerfile/tag**:
-en Task, `vars` con `sh:` se ejecutan al cargar la task (no en cada
-comando). Permite parametrizar sin escribir 3 tasks separadas
-(`build:trainer`, `build:mlflow`, `build:reports`). La validacion `test
-... ERROR_IMG_DESCONOCIDO` falla rapido si IMG mal escrito.
+**Por que templating go-task con `{{if eq .IMG ...}}` y no `case` en bash**:
+en Task, `vars` se evaluan al cargar la task. Usar el motor de templates
+nativo (en vez de `sh: | case ...` por var) evita 3 fork de subshell, es
+mas portable (cero dependencias en bash POSIX) y deja la tabla
+IMG -> (image_name, dockerfile, default_tag) como un one-liner por var.
+La validacion `test "{{.IMAGE_NAME}}" != "ERROR"` falla rapido si IMG
+viene mal escrito y permite parametrizar sin escribir 3 tasks separadas
+(`build:trainer`, `build:mlflow`, `build:reports`).
 
 **Por que pasamos `BUILD_DATE` como build-arg**: el Dockerfile lo recibe
 y lo embebe como label (`org.opencontainers.image.created`). Util para
@@ -4989,7 +5204,6 @@ auditar "que imagen tengo desplegada y desde cuando" via
 version: "3"
 
 vars:
-  PROJECT:    '{{.PROJECT    | default "ml-training"}}'
   JOB_DEF:    '{{.JOB_DEF    | default (printf "%s-trainer"  .PROJECT)}}'
   QUEUE_SPOT: '{{.QUEUE_SPOT | default (printf "%s-job-queue-spot"     .PROJECT)}}'
   QUEUE_OD:   '{{.QUEUE_OD   | default (printf "%s-job-queue-ondemand" .PROJECT)}}'
@@ -5011,27 +5225,20 @@ tasks:
     cmds:
       - |
         set -e
+        source tasks/lib/batch_wait.sh
         for v in $(echo "{{.VARIETIES}}" | tr ',' ' '); do
+          OVERRIDES=$(jq -nc \
+            --arg v "$v" --arg t "{{.TUNING}}" --arg p "{{.PARALLEL}}" \
+            '{command: ["--varieties", $v, "--tuning", $t, "--parallel-varieties", $p]}')
           JOB_ID=$(aws batch submit-job \
             --job-name       "train-$v-{{.TUNING}}-$(date +%Y%m%d-%H%M%S)" \
             --job-queue      "{{.QUEUE}}" \
             --job-definition "{{.JOB_DEF}}" \
-            --container-overrides "{\"command\":[\"--varieties\",\"$v\",\"--tuning\",\"{{.TUNING}}\",\"--parallel-varieties\",\"{{.PARALLEL}}\"]}" \
+            --container-overrides "$OVERRIDES" \
             --query jobId --output text)
           echo ">>> $v  job=$JOB_ID  queue={{.QUEUE}}"
-
           [ "{{.WAIT}}" != "true" ] && continue
-
-          while :; do
-            STATUS=$(aws batch describe-jobs --jobs "$JOB_ID" --query 'jobs[0].status' --output text)
-            echo "  $(date +%H:%M:%S)  $v  $STATUS"
-            case "$STATUS" in
-              SUCCEEDED) break ;;
-              FAILED)    REASON=$(aws batch describe-jobs --jobs "$JOB_ID" --query 'jobs[0].statusReason' --output text)
-                         echo "FAIL $v  reason=$REASON"; exit 1 ;;
-              *)         sleep 30 ;;
-            esac
-          done
+          wait_job "$JOB_ID" "$v"
         done
 
   # ═══ Entrenar via Lambda dispatcher (path usado por train.yml) ═════════════
@@ -5045,6 +5252,7 @@ tasks:
     cmds:
       - |
         set -e
+        source tasks/lib/batch_wait.sh
         PAYLOAD=$(jq -nc --arg v "{{.VARIETIES}}" --arg t "{{.TUNING}}" \
           '{varieties: $v, tuning: $t}')
         aws lambda invoke \
@@ -5057,16 +5265,7 @@ tasks:
         JOB_ID=$(jq -r '.body.jobId // (.body|fromjson|.jobId)' /tmp/dispatcher-out.json 2>/dev/null || jq -r '.jobId' /tmp/dispatcher-out.json)
         echo ">>> Submitted via dispatcher  job=$JOB_ID"
         [ "{{.WAIT}}" != "true" ] && exit 0
-        while :; do
-          STATUS=$(aws batch describe-jobs --jobs "$JOB_ID" --query 'jobs[0].status' --output text)
-          echo "  $(date +%H:%M:%S)  $STATUS"
-          case "$STATUS" in
-            SUCCEEDED) break ;;
-            FAILED)    REASON=$(aws batch describe-jobs --jobs "$JOB_ID" --query 'jobs[0].statusReason' --output text)
-                       echo "FAIL  reason=$REASON"; exit 1 ;;
-            *)         sleep 30 ;;
-          esac
-        done
+        wait_job "$JOB_ID" "dispatcher"
 
   # ═══ Smoke test ═════════════════════════════════════════════════════════════
 
@@ -5128,6 +5327,41 @@ Batch ya corren en paralelo en infraestructura AWS. El loop local solo
 necesita lanzarlos secuencialmente para que el polling sea ordenado en
 la terminal. Si queres todo paralelo, `WAIT=false`.
 
+### 4.1.6.1 `tasks/lib/batch_wait.sh` — Helper compartido de polling
+
+El bloque de polling (`describe-jobs` cada 30s con `SUCCEEDED`/`FAILED`)
+se extrajo a un helper bash sourceado para evitar duplicacion entre
+`batch:train` y `batch:train-lambda`. Ambas tasks hacen
+`source tasks/lib/batch_wait.sh` al inicio del comando y luego invocan
+`wait_job <job_id> <label>` (donde `<label>` es la variedad o `dispatcher`,
+solo para prefijar el log).
+
+```bash
+# Helpers bash compartidos por tasks/batch.yml (train / train-lambda).
+# Sourceado, no ejecutado. Requiere awscli configurado.
+
+# wait_job <job_id> <label>
+# Polling cada 30s hasta SUCCEEDED (return 0) o FAILED (return 1).
+wait_job() {
+  local job_id="$1" label="$2"
+  while :; do
+    local status
+    status=$(aws batch describe-jobs --jobs "$job_id" --query 'jobs[0].status' --output text)
+    echo "  $(date +%H:%M:%S)  $label  $status"
+    case "$status" in
+      SUCCEEDED) return 0 ;;
+      FAILED)
+        local reason
+        reason=$(aws batch describe-jobs --jobs "$job_id" --query 'jobs[0].statusReason' --output text)
+        echo "FAIL $label  reason=$reason"
+        return 1
+        ;;
+      *) sleep 30 ;;
+    esac
+  done
+}
+```
+
 ### 4.1.7 `tasks/cluster.yml` (lifecycle scale up/down + teardown)
 
 ```yaml
@@ -5153,9 +5387,10 @@ la terminal. Si queres todo paralelo, `WAIT=false`.
 version: "3"
 
 vars:
-  PROJECT:       '{{.PROJECT       | default "ml-training"}}'
-  DISPATCHER_FN: '{{.DISPATCHER_FN | default (printf "%s-dispatcher" .PROJECT)}}'
-  TF_DIR:        '{{.TF_DIR        | default "infra/envs/prod"}}'
+  SCHEDULER_FN: '{{.SCHEDULER_FN | default (printf "%s-scheduler" .PROJECT)}}'
+  TF_DIR:       '{{.TF_DIR       | default "infra/envs/prod"}}'
+  QUEUE_SPOT:   '{{.QUEUE_SPOT   | default (printf "%s-job-queue-spot"     .PROJECT)}}'
+  QUEUE_OD:     '{{.QUEUE_OD     | default (printf "%s-job-queue-ondemand" .PROJECT)}}'
   # Orden reverso de apply (importante para destroy con dependencias)
   VOLATILE_MODULES: "module.scheduler module.lambdas module.monitoring module.batch module.reports module.mlflow"
 
@@ -5187,13 +5422,30 @@ tasks:
     cmds:
       - |
         total=0
-        for q in {{.PROJECT}}-spot {{.PROJECT}}-ondemand; do
+        for q in {{.QUEUE_SPOT}} {{.QUEUE_OD}}; do
           for s in SUBMITTED PENDING RUNNABLE STARTING RUNNING; do
             n=$(aws batch list-jobs --job-queue "$q" --job-status $s --query 'length(jobSummaryList)' --output text 2>/dev/null || echo 0)
             [ "$n" -gt 0 ] && { echo "  queue=$q  status=$s  count=$n"; total=$((total + n)); }
           done
         done
         echo "  TOTAL activos $total"
+
+  _assert-no-running:
+    internal: true
+    silent: true
+    cmds:
+      - |
+        running=0
+        for q in {{.QUEUE_SPOT}} {{.QUEUE_OD}}; do
+          n=$(aws batch list-jobs --job-queue "$q" --job-status RUNNING --query 'length(jobSummaryList)' --output text 2>/dev/null || echo 0)
+          running=$((running + n))
+        done
+        if [ "$running" -gt 0 ]; then
+          echo "ERROR $running job(s) RUNNING. Cancelar primero:"
+          echo "       task batch:status              (ver detalle)"
+          echo "       task batch:cancel JOB_ID=<id>  (cancelar)"
+          exit 1
+        fi
 
   # ═══ Scale (encender / apagar) ══════════════════════════════════════════════
 
@@ -5202,30 +5454,23 @@ tasks:
     cmds:
       - 'echo ">>> Pre-check Batch jobs activos"'
       - task: _batch-jobs-active
-      - |
-        running=$(aws batch list-jobs --job-queue "{{.PROJECT}}-spot" --job-status RUNNING --query 'length(jobSummaryList)' --output text 2>/dev/null || echo 0)
-        if [ "$running" -gt 0 ]; then
-          echo "ERROR $running job(s) RUNNING. Cancelar primero:"
-          echo "       task batch:status              (ver detalle)"
-          echo "       task batch:cancel JOB_ID=<id>  (cancelar)"
-          exit 1
-        fi
-      - 'echo ">>> Invocando dispatcher Lambda (action=stop)..."'
-      - aws lambda invoke --function-name {{.DISPATCHER_FN}}
+      - task: _assert-no-running
+      - 'echo ">>> Invocando scheduler Lambda (action=stop)..."'
+      - aws lambda invoke --function-name {{.SCHEDULER_FN}}
         --payload '{"action":"stop"}'
         --cli-binary-format raw-in-base64-out
-        /tmp/dispatcher-stop.json
-      - cat /tmp/dispatcher-stop.json && echo ""
+        /tmp/scheduler-stop.json
+      - cat /tmp/scheduler-stop.json && echo ""
 
   scale-up:
     desc: "Encender (RDS start + ECS desired=1). RDS tarda ~5 min en estar Available"
     cmds:
-      - 'echo ">>> Invocando dispatcher Lambda (action=start)..."'
-      - aws lambda invoke --function-name {{.DISPATCHER_FN}}
+      - 'echo ">>> Invocando scheduler Lambda (action=start)..."'
+      - aws lambda invoke --function-name {{.SCHEDULER_FN}}
         --payload '{"action":"start"}'
         --cli-binary-format raw-in-base64-out
-        /tmp/dispatcher-start.json
-      - cat /tmp/dispatcher-start.json && echo ""
+        /tmp/scheduler-start.json
+      - cat /tmp/scheduler-start.json && echo ""
       - 'echo ""'
       - 'echo "RDS tarda ~5 min. Despues: task cluster:wait-healthy"'
 
@@ -5285,17 +5530,18 @@ tasks:
       - 'echo "Listo. task cluster:wait-healthy para confirmar MLflow"'
 ```
 
-**Por que invocar el Lambda dispatcher y no `aws cli` directo desde la
+**Por que invocar el Lambda scheduler y no `aws cli` directo desde la
 task**: la logica (drenar Batch -> apagar Fargate -> stop RDS en orden,
-mas chequeos y notificaciones SNS) ya vive en `infra/lambdas/dispatcher.py`.
+mas chequeos y notificaciones SNS) ya vive en `infra/lambdas/scheduler.py`.
 Re-implementarla en bash duplicaria mantenimiento y deriva con el tiempo.
 
 **Por que el pre-check explicito de Batch jobs antes de scale-down (y no
-delegado al dispatcher)**: el dispatcher tambien chequea, pero la task
+delegado al scheduler)**: el scheduler tambien chequea, pero la task
 muestra el error en la terminal del operador con sugerencias accionables
-(`task batch:cancel JOB_ID=<id>`). Si solo confiaras en el Lambda, el
-operador veria un payload JSON con `error: jobs running` y tendria que
-buscar como cancelarlos.
+(`task batch:cancel JOB_ID=<id>`). El helper interno `_assert-no-running`
+itera ambas queues (Spot + OnDemand) y aborta con codigo 1; si solo
+confiaras en el Lambda, el operador veria un payload JSON con
+`error: jobs running` y tendria que buscar como cancelarlos.
 
 **Por que `teardown` preserva `module.network` y storage**: el NAT
 Gateway dentro de network cuesta $32/mes encendido pero su create
@@ -5498,6 +5744,10 @@ a `terraform output -raw alb_dns` sigue funcionando.
 
 version: "3"
 
+vars:
+  SUFFIX:
+    sh: aws sts get-caller-identity --query Account --output text | tail -c 7
+
 tasks:
 
   # ═══ Deploy / smoke ═════════════════════════════════════════════════════════
@@ -5528,12 +5778,9 @@ tasks:
   # ═══ Lifecycle (atajos a cluster:) ══════════════════════════════════════════
 
   wake:
-    desc: "Encender stack (scale-up + sleep 5min + wait-healthy). Para lunes a la manana"
+    desc: "Encender stack (scale-up + wait-healthy). Para lunes a la manana"
     cmds:
       - task: ":cluster:scale-up"
-      - 'echo ""'
-      - 'echo "Esperando ~5 min a que RDS este Available..."'
-      - sleep 300
       - task: ":cluster:wait-healthy"
 
   sleep:
@@ -5562,17 +5809,17 @@ tasks:
       - 'echo ""'
       - 'echo ">>> Vaciando buckets S3 con versioning (data + artifacts)..."'
       - task: _empty-bucket
-        vars: { BUCKET: '{{.PROJECT | default "ml-training"}}-data' }
+        vars: { BUCKET: '{{.PROJECT}}-data-{{.SUFFIX}}' }
       - task: _empty-bucket
-        vars: { BUCKET: '{{.PROJECT | default "ml-training"}}-artifacts' }
+        vars: { BUCKET: '{{.PROJECT}}-artifacts-{{.SUFFIX}}' }
       - 'echo ""'
       - 'echo ">>> Borrando imagenes ECR..."'
       - task: _purge-ecr
-        vars: { REPO: '{{.PROJECT | default "ml-training"}}' }
+        vars: { REPO: '{{.PROJECT}}' }
       - task: _purge-ecr
-        vars: { REPO: '{{.PROJECT | default "ml-training"}}-mlflow' }
+        vars: { REPO: '{{.PROJECT}}-mlflow' }
       - task: _purge-ecr
-        vars: { REPO: '{{.PROJECT | default "ml-training"}}-reports' }
+        vars: { REPO: '{{.PROJECT}}-reports' }
       - 'echo ""'
       - 'echo ">>> terraform destroy total..."'
       - task: ":infra:destroy"
@@ -5584,7 +5831,8 @@ tasks:
       - task: destroy
       - 'echo ""'
       - 'echo ">>> Borrando bucket tfstate (backend Terraform)..."'
-      - task: _delete-tfstate-bucket
+      - task: _empty-bucket
+        vars: { BUCKET: '{{.PROJECT}}-tfstate-{{.SUFFIX}}', DELETE: "true" }
       - 'echo ">>> Borrando DynamoDB tflock..."'
       - task: _delete-tflock
       - 'echo ">>> Borrando OIDC provider de GitHub Actions..."'
@@ -5599,19 +5847,21 @@ tasks:
     requires:
       vars: [BUCKET]
     vars:
-      SUFFIX:
-        sh: aws sts get-caller-identity --query Account --output text | tail -c 7
+      DELETE: '{{.DELETE | default "false"}}'
     cmds:
       - |
-        FULL="{{.BUCKET}}-{{.SUFFIX}}"
-        if ! aws s3api head-bucket --bucket "$FULL" 2>/dev/null; then
-          echo "  $FULL no existe, skip"; exit 0
+        if ! aws s3api head-bucket --bucket "{{.BUCKET}}" 2>/dev/null; then
+          echo "  {{.BUCKET}} no existe, skip"; exit 0
         fi
-        echo "  Vaciando $FULL (versiones + delete markers)..."
-        aws s3api delete-objects --bucket "$FULL" \
-          --delete "$(aws s3api list-object-versions --bucket "$FULL" \
+        echo "  Vaciando {{.BUCKET}} (versiones + delete markers)..."
+        aws s3api delete-objects --bucket "{{.BUCKET}}" \
+          --delete "$(aws s3api list-object-versions --bucket "{{.BUCKET}}" \
             --query '{Objects: [Versions[].{Key:Key,VersionId:VersionId},DeleteMarkers[].{Key:Key,VersionId:VersionId}][]}' \
             --max-items 1000)" 2>/dev/null || echo "  (bucket ya vacio)"
+        if [ "{{.DELETE}}" = "true" ]; then
+          echo "  Borrando bucket {{.BUCKET}}..."
+          aws s3 rb "s3://{{.BUCKET}}"
+        fi
 
   _purge-ecr:
     internal: true
@@ -5629,30 +5879,10 @@ tasks:
         echo "  Borrando todas las imagenes de {{.REPO}}..."
         aws ecr batch-delete-image --repository-name "{{.REPO}}" --image-ids "$IDS" >/dev/null
 
-  _delete-tfstate-bucket:
-    internal: true
-    vars:
-      SUFFIX:
-        sh: aws sts get-caller-identity --query Account --output text | tail -c 7
-      BUCKET: '{{.PROJECT | default "ml-training"}}-tfstate'
-    cmds:
-      - |
-        FULL="{{.BUCKET}}-{{.SUFFIX}}"
-        if ! aws s3api head-bucket --bucket "$FULL" 2>/dev/null; then
-          echo "  $FULL no existe, skip"; exit 0
-        fi
-        echo "  Vaciando $FULL..."
-        aws s3api delete-objects --bucket "$FULL" \
-          --delete "$(aws s3api list-object-versions --bucket "$FULL" \
-            --query '{Objects: [Versions[].{Key:Key,VersionId:VersionId},DeleteMarkers[].{Key:Key,VersionId:VersionId}][]}' \
-            --max-items 1000)" 2>/dev/null || true
-        echo "  Borrando $FULL..."
-        aws s3 rb "s3://$FULL"
-
   _delete-tflock:
     internal: true
     vars:
-      TABLE: '{{.PROJECT | default "ml-training"}}-tflock'
+      TABLE: '{{.PROJECT}}-tflock'
     cmds:
       - |
         if aws dynamodb describe-table --table-name "{{.TABLE}}" >/dev/null 2>&1; then
@@ -5701,10 +5931,13 @@ cada vez):
   Si manana cambia el orden de oleadas (ej. agregamos una nueva), solo
   se toca `aws:deploy` y todo lo que depende se beneficia.
 
-**Por que el `sleep 300` en `aws:wake`**: RDS tarda ~5 min en estar
-Available desde "stopped". `cluster:wait-healthy` chequea el ALB cada
-15s con timeout de 10 min; sin el sleep previo, los primeros 20 polls
-fallarian inutilmente (ALB no puede ser healthy sin backend RDS).
+**Por que `aws:wake` encadena `cluster:scale-up` + `cluster:wait-healthy`
+sin sleep intermedio**: RDS tarda ~5 min en estar Available desde
+"stopped", pero `cluster:wait-healthy` ya hace polling del ALB cada 15s
+con timeout de 10 min. Los primeros polls van a fallar mientras RDS
+arranca; eso es esperado. Agregar un `sleep 300` extra solo bloquea la
+terminal sin feedback. Si el deploy tarda mas que el timeout, el wait
+falla con instruccion clara para revisar `aws logs tail`.
 
 **Por que `aws:destroy` tiene doble confirmacion**: la primera viene de
 su propio `prompt:`, la segunda de `infra:destroy` que invoca por
@@ -5715,11 +5948,20 @@ peligrosa del runbook, vale la pena un segundo pulse.
 vez de delegar todo a Terraform): los buckets con versioning enabled y
 los repos ECR con imagenes adentro **NO se destruyen** con
 `terraform destroy` plain — Terraform marca el recurso para borrado pero
-AWS rechaza con `BucketNotEmpty`/`RepositoryNotEmpty`. Los helpers
+AWS rechaza con `BucketNotEmpty`/`RepositoryNotEmpty`. El helper
 `_empty-bucket` (borra todas las versiones + delete markers) y
 `_purge-ecr` (borra todas las imagenes) hacen el cleanup previo. El
 `cluster:scale-down` drena Batch jobs activos para evitar que el destroy
 del job-queue falle con "queue has running jobs".
+
+**Por que `_empty-bucket` toma el nombre completo del bucket + flag
+`DELETE`** (en vez de dos helpers separados `_empty-bucket` y
+`_delete-tfstate-bucket`): el truncamiento al sufijo de cuenta vive en
+el caller (cada `task: _empty-bucket` arma `{{.PROJECT}}-data-{{.SUFFIX}}`
+explicitamente). Un solo helper parametrizado con `DELETE=true` para el
+caso nuke (vaciar + `aws s3 rb`) y `DELETE=false` para `aws:destroy`
+(solo vaciar, Terraform se encarga del `rb`) elimina ~30 lineas de
+duplicacion entre los dos paths sin perder claridad.
 
 **Por que existe `aws:nuke` separado de `aws:destroy`** (y no un flag
 `--nuke` del destroy): son 2 niveles de blast radius muy distintos.
@@ -5742,21 +5984,46 @@ agregar el bloque `includes:` al `Taskfile.yml` raiz, **despues de
 # Modulos AWS por dominio. Cada include prefija con su namespace, asi las
 # tasks locales (build, up, train, ...) no chocan con las AWS (infra:apply,
 # ecr:build, ...).
+#
+# Variables PROJECT y REGION se propagan explicitamente: en go-task los
+# includes tienen scope aislado, asi que sin `vars:` aqui los hijos no las
+# verian. Esto centraliza los defaults y elimina redeclaraciones por archivo.
 includes:
   infra:
     taskfile: ./tasks/infra.yml
+    vars:
+      PROJECT: '{{.PROJECT}}'
+      REGION: '{{.REGION}}'
   ecr:
     taskfile: ./tasks/ecr.yml
+    vars:
+      PROJECT: '{{.PROJECT}}'
+      REGION: '{{.REGION}}'
   batch:
     taskfile: ./tasks/batch.yml
+    vars:
+      PROJECT: '{{.PROJECT}}'
+      REGION: '{{.REGION}}'
   cluster:
     taskfile: ./tasks/cluster.yml
+    vars:
+      PROJECT: '{{.PROJECT}}'
+      REGION: '{{.REGION}}'
   mlflow-aws:
     taskfile: ./tasks/mlflow_registry.yml
+    vars:
+      PROJECT: '{{.PROJECT}}'
+      REGION: '{{.REGION}}'
   aws:
     taskfile: ./tasks/aws.yml
+    vars:
+      PROJECT: '{{.PROJECT}}'
+      REGION: '{{.REGION}}'
   local:
     taskfile: ./tasks/local.yml
+    vars:
+      PROJECT: '{{.PROJECT}}'
+      REGION: '{{.REGION}}'
 ```
 
 Verificacion:
@@ -5809,17 +6076,14 @@ Crear el archivo con este contenido:
 version: "3"
 
 vars:
-  PROJECT: '{{.PROJECT | default "ml-training"}}'
-  REGION:  '{{.AWS_DEFAULT_REGION | default "us-east-1"}}'
+  SUFFIX:
+    sh: aws sts get-caller-identity --query Account --output text | tail -c 7
 
 tasks:
 
   ensure-buckets:
     desc: "Crea S3 buckets data + artifacts si no existen (idempotente). Misma cuenta+region que prod."
     silent: true
-    vars:
-      SUFFIX:
-        sh: aws sts get-caller-identity --query Account --output text | tail -c 7
     cmds:
       - task: _ensure-bucket
         vars: { NAME: '{{.PROJECT}}-data-{{.SUFFIX}}' }
@@ -5835,9 +6099,6 @@ tasks:
     silent: true
     requires:
       vars: [KIND]
-    vars:
-      SUFFIX:
-        sh: aws sts get-caller-identity --query Account --output text | tail -c 7
     cmds:
       - echo "{{.PROJECT}}-{{.KIND}}-{{.SUFFIX}}"
 
@@ -8316,6 +8577,52 @@ OIDC remplaza el caso comun de access keys de larga duracion:
 | `infra/bootstrap.sh` | `infra/bootstrap.sh` + `infra/bootstrap-oidc.sh` (separados) |
 | Comandos sin variables session | `$PROJECT`, `$ACCOUNT_SUFFIX`, etc. al inicio (0.4) |
 
+### Refactor post-V2 (limpieza Terraform + Task)
+
+Cambios aplicados despues de finalizar V2 para reducir duplicacion y
+acoplamiento. Todos preservan comportamiento (cero diff en `terraform plan`,
+mismo grafo de tasks). Solo cambia organizacion del codigo.
+
+**Infra / Terraform:**
+- NUEVO: `infra/modules/_shared/` con trust policies JSON + .tftpl compartidos.
+  Cada modulo carga la trust policy con `file()` o `templatefile()` en vez de
+  redeclarar `data "aws_iam_policy_document"` (5 copias eliminadas: 3x
+  `ecs_tasks_assume`, 2x `lambda_assume`) o `jsonencode({...})` inline (3x
+  para `batch.service`, `consumer.role`, `gha-deploy`).
+- NUEVO: modulo `consumer-iam/` (Patch 13.5) — rol OIDC para repo consumer
+  read-only sobre S3 artifacts (FastAPI/Streamlit que sirve modelos).
+- Lambdas `dispatcher` y `scheduler` ahora reciben `job_queue_spot_name` /
+  `job_queue_ondemand_name` como variables (antes reconstruian
+  `"${var.project}-job-queue-spot"` inline). Wireado desde `envs/prod/main.tf`
+  via `module.batch.job_queue_spot` y `.job_queue_ondemand` (outputs ya
+  existentes pero no consumidos).
+- `lambdas/notifier.py`: `AWS_REGION` y `BATCH_LOG_GROUP` ahora son
+  `os.environ[...]` (hard requirement). Antes tenian defaults engañosos que
+  enmascaraban env vars faltantes.
+
+**Tasks / Taskfile:**
+- `Taskfile.yml` raiz: nueva var global `REGION`, e `includes:` propaga
+  `PROJECT` + `REGION` a cada include via `vars:`. Las redeclaraciones de
+  esos defaults en cada task .yml se eliminaron.
+- NUEVO: `tasks/lib/batch_wait.sh` con `wait_job()` compartido. `batch:train`
+  y `batch:train-lambda` hacen `source tasks/lib/batch_wait.sh` en vez de
+  inlinear la funcion bash en cada task.
+- `tasks/aws.yml`: `_empty-bucket` unificado con flag `DELETE` (acepta full
+  bucket name); `_delete-tfstate-bucket` eliminado (era 95% identico).
+- `tasks/cluster.yml`: nuevo helper `_assert-no-running` extraido de
+  `scale-down` (pre-check de Batch jobs RUNNING antes de apagar).
+- `tasks/ecr.yml:build`: los 3 `case` shell para resolver IMAGE_NAME /
+  DOCKERFILE / RESOLVED_TAG por IMG se reemplazaron por templating go-task
+  nativo (`{{if eq .IMG "trainer"}}...{{else}}...{{end}}`). Quita 3 fork de
+  shell por invocacion.
+- `tasks/mlflow_registry.yml`: doc bug fixed — header decia `VARIETY=POP`
+  pero las tasks requieren `MODEL_NAME=rnd-forest-POP`. Tambien arreglado en
+  `Taskfile.yml` `help:aws` y `default`.
+
+Verificacion: `terraform validate` OK, `task --list` parsea, `task --summary
+batch:train` muestra `PROJECT=ml-training` y `REGION=us-east-1` propagandose
+correctamente a los includes.
+
 ## Apendice D — Mapa de archivos creados por la guia
 
 Al terminar las 5 oleadas, tu repo tiene **agregados** (todo lo que
@@ -9491,10 +9798,10 @@ Lectura cruzada de `docker-compose.yml` + `scripts/s3_sync.py` +
 | Pieza | Donde vive en local | Donde va a S3 |
 |---|---|---|
 | MLflow artifacts (joblib, plots, signatures) | Va directo a S3 (no toca disco local) | `s3://${S3_MLFLOW_BUCKET}/artifacts/` via `--default-artifact-root` en `docker-compose.yml:66` |
-| MLflow tracking metadata (runs, params, metrics, experiments, run_id) | **Postgres en volumen Docker `pg-data`** (`docker-compose.yml:20`, `:129`) | **NO se sube a ningun lado** |
-| `./artifacts/` del trainer (joblib, run_summary, champion JSON) | Bind mount `./artifacts:/app/artifacts` (`docker-compose.yml:119`) | `s3://${S3_ARTIFACTS_BUCKET}/artifacts/` via `scripts/s3_sync.py:81` |
-| `./reports/` (HTML, xlsx) | Bind mount `./reports:/app/reports` | `s3://${S3_ARTIFACTS_BUCKET}/reports/` via `scripts/s3_sync.py:89` |
-| Credenciales AWS | `~/.aws:/aws:ro` montado en mlflow + trainer (`docker-compose.yml:52, :116`) | — |
+| MLflow tracking metadata (runs, params, metrics, experiments, run_id) | **Postgres en volumen Docker `pg-data`** (`docker-compose.yml:20`, `:131-132`) | **NO se sube a ningun lado** |
+| `./artifacts/` del trainer (joblib, run_summary, champion JSON) | Bind mount `./artifacts:/app/artifacts` (`docker-compose.yml:122`) | `s3://${S3_ARTIFACTS_BUCKET}/artifacts/` via `scripts/s3_sync.py:81` |
+| `./reports/` (HTML, xlsx) | Bind mount `./reports:/app/reports` (`docker-compose.yml:123`) | `s3://${S3_ARTIFACTS_BUCKET}/reports/` via `scripts/s3_sync.py:89` |
+| Credenciales AWS | `~/.aws:/aws:ro` montado en mlflow + trainer (`docker-compose.yml:52`, `:119`) | — |
 
 > **El unico dato que se queda atrapado en local es el Postgres de
 > MLflow**. Los `.joblib` y los reports siempre llegan a S3. Lo que
@@ -9523,7 +9830,7 @@ aws s3 ls s3://"$(grep ^S3_MLFLOW_BUCKET .env | cut -d= -f2)"/artifacts/ | head
 
 | Concepto | Local (compose) | Produccion (ECS Task Def / Batch) |
 |---|---|---|
-| **Credenciales AWS** | `~/.aws:/aws:ro` montado (`docker-compose.yml:52, :116`) + `AWS_SHARED_CREDENTIALS_FILE`/`AWS_PROFILE` | **Sin volumen** — IAM Task Role del Task Definition aporta las creds via metadata endpoint. El SDK las resuelve solo |
+| **Credenciales AWS** | `~/.aws:/aws:ro` montado (`docker-compose.yml:52`, `:119`) + `AWS_SHARED_CREDENTIALS_FILE`/`AWS_PROFILE` | **Sin volumen** — IAM Task Role del Task Definition aporta las creds via metadata endpoint. El SDK las resuelve solo |
 | **Backend store de MLflow** | Servicio `postgres` (compose:10-26) con volumen `pg-data` | RDS Postgres (modulo `rds` de Parte 3). El server MLflow recibe `--backend-store-uri postgresql://...@<RDS-DNS>:5432/mlflow` |
 | **Servidor MLflow** | Container `mlflow` expuesto a `127.0.0.1:5000` | ECS Fargate detras de ALB (modulo `mlflow` de Parte 3) — el trainer apunta a `http://<ALB-DNS>` en vez de `http://mlflow:5000` |
 | **Reports estaticos** | Servicio `reports` (nginx, compose:82-94) en `127.0.0.1:8080` | ECS Fargate con la misma imagen nginx detras del mismo ALB en path `/reports/` (modulo `reports` de Parte 3). Los archivos vienen de S3 (montados via `s3fs` o sincronizados en startup) |

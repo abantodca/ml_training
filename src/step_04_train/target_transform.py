@@ -15,11 +15,40 @@ predicciones extremas sin perder estabilidad.
 """
 from __future__ import annotations
 
+import os
+
 import numpy as np
 from sklearn.base import BaseEstimator
 from sklearn.compose import TransformedTargetRegressor
 
+from src.config import RANDOM_STATE
+
 CAP_PERCENTILE: float = 99.5  # p99.5 -> ~0.5% de filas aplastadas en train
+
+
+# Docstring compartido por las factories model_xgb / model_lgb. Se inyecta via
+# format() para evitar duplicar el bloque sobre paralelismo en cada modulo.
+_PARALLELISM_DOCSTRING = """`n_jobs` lee env var MODEL_N_JOBS (default -1 = todos los cores). Antes
+    estaba hardcoded a 1, lo que desperdiciaba cores cuando se entrena UNA
+    sola variedad (caso comun: `task train VARIETIES=POP`). Para multi-variedad
+    en paralelo (--parallel-varieties >1) setear MODEL_N_JOBS=1 para evitar
+    oversubscription (parallel-varieties * n_jobs > cores)."""
+
+
+def _common_kwargs() -> dict:
+    """Kwargs compartidos por las factories de XGB y LGB.
+
+    Centraliza:
+      - `random_state` desde config (reproducibilidad).
+      - `n_jobs` desde env var MODEL_N_JOBS (default -1 = todos los cores).
+
+    Los kwargs especificos del backend (objective, verbose/verbosity,
+    tree_method, subsample_freq, ...) se mergean en el call site.
+    """
+    return dict(
+        random_state=RANDOM_STATE,
+        n_jobs=int(os.environ.get("MODEL_N_JOBS", "-1")),
+    )
 
 
 def _log1p_cap(y):

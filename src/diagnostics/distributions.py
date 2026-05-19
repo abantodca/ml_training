@@ -56,7 +56,7 @@ def _outliers_iqr(x: pd.Series, factor: float = 1.5) -> int:
 
 def _outliers_zscore(x: pd.Series, threshold: float = 3.0) -> int:
     """Cuenta valores |z| > threshold."""
-    if x.std() == 0 or x.std() is None:
+    if x.std() == 0 or pd.isna(x.std()):
         return 0
     z = (x - x.mean()) / x.std()
     return int((z.abs() > threshold).sum())

@@ -7,6 +7,22 @@ import numpy as np
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 
+def mape_safe(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """MAPE en porcentaje, descartando observaciones con y_true == 0.
+
+    Si todas las observaciones tienen y_true == 0 (divisor cero global),
+    devuelve NaN en lugar de propagar una division por cero. Usado por
+    `calculate_regression_metrics`, por el bootstrap de IC y por los
+    calculos de MAPE por subgrupo en el dashboard.
+    """
+    yt = np.asarray(y_true, dtype=float)
+    yp = np.asarray(y_pred, dtype=float)
+    nz = yt != 0
+    if not nz.any():
+        return float("nan")
+    return float(np.mean(np.abs((yt[nz] - yp[nz]) / yt[nz])) * 100.0)
+
+
 def calculate_regression_metrics(y_true, y_pred) -> Dict[str, float]:
     """Devuelve {mae, rmse, r2, mape}.
 

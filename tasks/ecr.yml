@@ -15,11 +15,9 @@
 version: "3"
 
 vars:
-  PROJECT:     '{{.PROJECT            | default "ml-training"}}'
-  REGION:      '{{.AWS_DEFAULT_REGION | default "us-east-1"}}'
-  TAG_TRAINER: '{{.TAG_TRAINER        | default "latest"}}'
-  TAG_MLFLOW:  '{{.TAG_MLFLOW         | default "v3.12.0"}}'
-  TAG_REPORTS: '{{.TAG_REPORTS        | default "stable"}}'
+  TAG_TRAINER: '{{.TAG_TRAINER | default "latest"}}'
+  TAG_MLFLOW:  '{{.TAG_MLFLOW  | default "v3.12.0"}}'
+  TAG_REPORTS: '{{.TAG_REPORTS | default "stable"}}'
 
 tasks:
 
@@ -52,29 +50,11 @@ tasks:
         sh: git rev-parse --short=12 HEAD 2>/dev/null || echo unknown
       BUILD_DATE:
         sh: date -u +%Y-%m-%dT%H:%M:%SZ
-      # Resolvemos image name, dockerfile y tag segun IMG
-      IMAGE_NAME:
-        sh: |
-          case "{{.IMG}}" in
-            trainer) echo "{{.PROJECT}}" ;;
-            mlflow)  echo "{{.PROJECT}}-mlflow" ;;
-            reports) echo "{{.PROJECT}}-reports" ;;
-            *)       echo "ERROR" ;;
-          esac
-      DOCKERFILE:
-        sh: |
-          case "{{.IMG}}" in
-            trainer) echo "Dockerfile" ;;
-            mlflow)  echo "docker/mlflow/Dockerfile" ;;
-            reports) echo "docker/reports/Dockerfile" ;;
-          esac
-      RESOLVED_TAG:
-        sh: |
-          case "{{.IMG}}" in
-            trainer) echo "{{.TAG | default .TAG_TRAINER}}" ;;
-            mlflow)  echo "{{.TAG | default .TAG_MLFLOW}}" ;;
-            reports) echo "{{.TAG | default .TAG_REPORTS}}" ;;
-          esac
+      # Tabla IMG -> (image_name, dockerfile, default_tag). Cualquier IMG fuera
+      # de trainer|mlflow|reports cae en el branch ERROR validado abajo.
+      IMAGE_NAME: '{{if eq .IMG "trainer"}}{{.PROJECT}}{{else if eq .IMG "mlflow"}}{{.PROJECT}}-mlflow{{else if eq .IMG "reports"}}{{.PROJECT}}-reports{{else}}ERROR{{end}}'
+      DOCKERFILE: '{{if eq .IMG "trainer"}}Dockerfile{{else if eq .IMG "mlflow"}}docker/mlflow/Dockerfile{{else if eq .IMG "reports"}}docker/reports/Dockerfile{{else}}ERROR{{end}}'
+      RESOLVED_TAG: '{{if eq .IMG "trainer"}}{{.TAG | default .TAG_TRAINER}}{{else if eq .IMG "mlflow"}}{{.TAG | default .TAG_MLFLOW}}{{else if eq .IMG "reports"}}{{.TAG | default .TAG_REPORTS}}{{else}}ERROR{{end}}'
     cmds:
       - 'test "{{.IMAGE_NAME}}" != "ERROR" || { echo "ERROR IMG debe ser trainer|mlflow|reports (recibido {{.IMG}})"; exit 1; }'
       - 'echo ">>> Build {{.IMAGE_NAME}}:{{.RESOLVED_TAG}}  (sha-{{.GIT_SHA}})"'

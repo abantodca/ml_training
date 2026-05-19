@@ -21,7 +21,7 @@ Variables de entorno reconocidas (todas opcionales, con fallback sano):
                                 Default vacio -> el experimento es la variedad.
     MODEL_REGISTRY_PREFIX     : prefijo del Model Registry.
                                 Default 'rnd-forest-'.
-    REPORT_PLOTLY_OFFLINE     : 1 = embeber plotly.js (default), 0 = CDN.
+    REPORT_PLOTLY_OFFLINE     : 0 = CDN (default, recomendado), 1 = embeber plotly.js (offline).
 
 Esquema de modelado (decidido tras EDA):
     Target          : KG/JR_H (kg cosechados por jornal-hora)
@@ -139,6 +139,36 @@ SKEW_THRESHOLD: float = 1.5      # |skew| above this -> log1p
 SKEW_KURT_THRESHOLD: float = 50.0  # kurtosis above this -> sqrt (mas agresivo)
 
 # ---------------------------------------------------------------------------
+# EDA thresholds (diagnostics/*.py)
+# ---------------------------------------------------------------------------
+# Reportar findings de skew/kurt en EDA. Independientes de SKEW_THRESHOLD
+# y SKEW_KURT_THRESHOLD (que rigen transformacion en FeatureGenerator):
+# aqui solo se trata de avisar al humano en el reporte de auditoria.
+EDA_KURT_WARN: float = 5.0          # kurt > 5 -> finding "medium"
+EDA_KURT_HIGH: float = 10.0         # kurt > 10 -> escala el finding a "high"
+EDA_SKEW_HIGH: float = 3.0          # |skew| > 3 -> escala el finding a "high"
+
+# Fraccion de outliers IQR sobre n_total que dispara warning en EDA.
+OUTLIER_FRACTION_WARN: float = 0.05
+
+# Threshold para considerar dos numericas "muy correlacionadas". Se usa en
+# diagnostics/multivariate.py:correlation_matrix y en eda.py al llamarla.
+CORRELATION_HIGH_THRESHOLD: float = 0.85
+
+# Cardinalidad de variables categoricas (diagnostics/categorical.py).
+#   CARDINALITY_HIGH : por encima de esto, NO se calcula chi2/Cramer's V
+#                      (tabla de contingencia se vuelve poco confiable).
+#   CARDINALITY_WARN : aviso para considerar target-encoding / agrupar.
+CARDINALITY_HIGH: int = 200
+CARDINALITY_WARN: int = 50
+
+# Bandas de interpretacion de V de Cramer (asociacion categorica-target).
+#   < CRAMERS_V_WEAK   : asociacion debil, candidata a drop / agrupar.
+#   >= CRAMERS_V_STRONG: asociacion fuerte, target-encoding util.
+CRAMERS_V_WEAK: float = 0.05
+CRAMERS_V_STRONG: float = 0.3
+
+# ---------------------------------------------------------------------------
 # Hiperparametros de CV y tuning
 # ---------------------------------------------------------------------------
 RANDOM_STATE: int = 42
@@ -147,9 +177,6 @@ RANDOM_STATE: int = 42
 # elige el mejor por variedad usando lex-order (gap -> full_mape -> tiempo).
 # Si en el futuro se agrega un nuevo backend al BACKEND_REGISTRY, queda
 # incluido automaticamente.
-#
-# Nota: CatBoost fue evaluado y eliminado del proyecto 2026-05-05 (no
-# aportaba en POP; mismo patron que GAMM Phase 0).
 
 # ---------------------------------------------------------------------------
 # Quality gates del campeon (umbrales minimos para considerar un modelo util)
@@ -240,6 +267,13 @@ INNER_CV_FOLDS: int = TUNING_PROFILES[DEFAULT_TUNING]["inner_folds"]
 # tiempo del refit final, que es despreciable vs el nested CV.
 # K=1 = legacy (refit unico sobre todo el dataset).
 OOF_ENSEMBLE_K: int = 5
+
+# Sample weights por densidad del target (compute_sample_weights).
+# Centralizado aqui para tunear sin tocar codigo. n_bins=10 fija el valor
+# que el caller usaba de facto (antes hardcoded en tuning.py overrideando
+# el default 20 de la funcion); cap=5.0 alinea con el default historico.
+SAMPLE_WEIGHT_BINS: int = 10
+SAMPLE_WEIGHT_CAP: float = 5.0
 
 # ---------------------------------------------------------------------------
 # Feature flags para ABLATION (env-var driven, default = legacy)
@@ -417,3 +451,14 @@ REPORT_MAE_AMBER_RATIO: float = 2.0
 # o S3 web hosting; ambos casos tienen internet. Para casos offline (email,
 # archivo en avion) setear `REPORT_PLOTLY_OFFLINE=1` en ese run especifico.
 REPORT_PLOTLY_OFFLINE: bool = os.environ.get("REPORT_PLOTLY_OFFLINE", "0") != "0"
+
+# ---------------------------------------------------------------------------
+# === HISTORIAL ===
+# ---------------------------------------------------------------------------
+# Notas historicas / decisiones de diseño preservadas como contexto. NO
+# afectan la ejecucion: ningun codigo lee de aqui.
+#
+# CatBoost (2026-05-05): evaluado y eliminado del BACKEND_REGISTRY. No
+#     aportaba en POP frente a XGB/LGB; mismo patron que GAMM Phase 0.
+#     Si se reincorpora a futuro hay que reagregarlo al registry y al
+#     pipeline de tuning.

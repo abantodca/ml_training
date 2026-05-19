@@ -6,7 +6,7 @@ data "archive_file" "notifier" {
 
 resource "aws_iam_role" "notifier" {
   name               = "${var.project}-notifier"
-  assume_role_policy = data.aws_iam_policy_document.lambda_assume.json
+  assume_role_policy = file("${path.module}/../_shared/assume-lambda.json")
 }
 
 resource "aws_iam_role_policy" "notifier" {
@@ -50,8 +50,8 @@ resource "aws_lambda_function" "notifier" {
 
   environment {
     variables = {
-      SNS_TOPIC_ARN = var.sns_topic_arn
-      PROJECT       = var.project # usado para construir el URL de CloudWatch
+      SNS_TOPIC_ARN   = var.sns_topic_arn
+      BATCH_LOG_GROUP = var.batch_log_group_name
     }
   }
 
