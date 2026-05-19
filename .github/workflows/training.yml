@@ -53,6 +53,7 @@ on:
 permissions:
   id-token: write
   contents: read
+  actions:  read  # gh run list (detect.BASE_SHA en auto-train)
 
 concurrency:
   group: training-${{ github.event.inputs.action || 'auto' }}
@@ -72,33 +73,52 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # para git diff before..sha (push de N commits o squash)
+          fetch-depth: 0   # historial completo: BASE_SHA puede ser viejo
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
 
       - name: Decide modo
         id: decide
         env:
-          BASE_SHA: ${{ github.event.workflow_run.head_sha && github.event.before || '' }}
-          HEAD_SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -e
           if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            ACTION="${{ inputs.action }}"
-            echo "mode=$ACTION"                             >> $GITHUB_OUTPUT
+            echo "mode=${{ inputs.action }}"                  >> $GITHUB_OUTPUT
             echo "varieties=${{ inputs.varieties || 'all' }}" >> $GITHUB_OUTPUT
             echo "tuning=${{ inputs.tuning || 'prod' }}"      >> $GITHUB_OUTPUT
             exit 0
           fi
-          # workflow_run (post-Deploy): solo auto-train si toco el trainer
-          BEFORE="${{ github.event.workflow_run.head_branch && github.event.workflow_run.head_sha || '' }}"
-          CHANGED=$(git diff --name-only "${BASE_SHA:-HEAD~1}" "${HEAD_SHA}" 2>/dev/null || echo "")
+
+          # workflow_run (post-Deploy): solo auto-train si toco el trainer.
+          # Para fijar BASE_SHA buscamos el ultimo Deploy success ANTERIOR
+          # (cubre push de N commits y squash merges; HEAD~1 fallaba en ambos).
+          HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
+          PREV_SHA=$(gh run list \
+            --workflow Deploy \
+            --branch main \
+            --status success \
+            --limit 20 \
+            --json headSha \
+            --jq "[.[] | select(.headSha != \"$HEAD_SHA\")] | .[0].headSha" 2>/dev/null || echo "")
+
+          if [ -n "$PREV_SHA" ] && [ "$PREV_SHA" != "null" ]; then
+            BASE_SHA="$PREV_SHA"
+            echo "::notice::Diff contra ultimo Deploy success $BASE_SHA..$HEAD_SHA"
+          else
+            BASE_SHA="${HEAD_SHA}^"
+            echo "::notice::Primer auto-train (sin Deploy previo). Diff contra parent $BASE_SHA..$HEAD_SHA"
+          fi
+
+          CHANGED=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" 2>/dev/null || echo "")
           echo "Cambios:"; echo "$CHANGED"
-          if echo "$CHANGED" | grep -qE '^(src/|main\.py|Dockerfile)'; then
+
+          if echo "$CHANGED" | grep -qE '^(src/|main\.py|Dockerfile|requirements\.txt|scripts/)'; then
             echo "mode=train"      >> $GITHUB_OUTPUT
             echo "varieties=all"   >> $GITHUB_OUTPUT
             echo "tuning=prod"     >> $GITHUB_OUTPUT
           else
             echo "mode=skip"       >> $GITHUB_OUTPUT
-            echo "::notice::Push no toco trainer (src/**, main.py, Dockerfile), skip auto-train"
+            echo "::notice::Push no toco trainer (src/**, main.py, Dockerfile, requirements.txt, scripts/**), skip auto-train"
           fi
 
   # ════════════════════════════════════════════════════════════════════════
@@ -109,59 +129,31 @@ jobs:
     if: needs.detect.outputs.mode == 'train'
     runs-on: ubuntu-latest
     outputs:
-      mlflow_was_up: ${{ steps.check.outputs.was_up }}
+      mlflow_was_up: ${{ steps.wake.outputs.was_up }}
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Assume gha-train role
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_GHA_TRAIN_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Estado actual de MLflow
-        id: check
+      # Single source of truth: misma logica que `task cluster:wake-and-wait` local.
+      - name: Wake + esperar healthy
+        id: wake
+        env:
+          MLFLOW_ALB_DNS: ${{ vars.MLFLOW_ALB_DNS }}
+          PROJECT: ${{ vars.PROJECT }}
+          STATUS_FILE: /tmp/wake-status
         run: |
-          if curl -fs -o /dev/null --max-time 5 "http://${{ vars.MLFLOW_ALB_DNS }}/health"; then
-            echo "was_up=true"  >> $GITHUB_OUTPUT
-            echo "::notice::MLflow ya esta UP, skip wake"
-          else
-            echo "was_up=false" >> $GITHUB_OUTPUT
-            echo "::notice::MLflow DOWN, invocando scheduler.start"
-          fi
-
-      - name: Wake (scheduler.start) si esta down
-        if: steps.check.outputs.was_up == 'false'
-        run: |
-          aws lambda invoke \
-            --function-name ${{ vars.PROJECT }}-scheduler \
-            --cli-binary-format raw-in-base64-out \
-            --payload '{"action":"start"}' \
-            /tmp/start.out
-          cat /tmp/start.out
-
-      - name: Esperar RDS available
-        if: steps.check.outputs.was_up == 'false'
-        run: |
-          for i in $(seq 1 24); do
-            STATUS=$(aws rds describe-db-instances \
-                       --db-instance-identifier ${{ vars.PROJECT }}-mlflow \
-                       --query 'DBInstances[0].DBInstanceStatus' --output text)
-            echo "RDS=$STATUS"
-            [[ "$STATUS" == "available" ]] && break
-            sleep 30
-          done
-          [[ "$STATUS" == "available" ]] || (echo "::error::RDS no available tras 12 min"; exit 1)
-
-      - name: Esperar ALB MLflow 200
-        if: steps.check.outputs.was_up == 'false'
-        run: |
-          for i in $(seq 1 30); do
-            CODE=$(curl -fs -o /dev/null -w "%{http_code}" --max-time 5 \
-                   "http://${{ vars.MLFLOW_ALB_DNS }}/health" || echo "000")
-            echo "MLflow=$CODE"
-            [[ "$CODE" == "200" ]] && break
-            sleep 10
-          done
-          [[ "$CODE" == "200" ]] || (echo "::error::MLflow no respondio 200 tras 5 min"; exit 1)
+          task cluster:wake-and-wait
+          echo "was_up=$(cat $STATUS_FILE)" >> $GITHUB_OUTPUT
 
   train:
     needs: [detect, wake-services]
@@ -196,25 +188,24 @@ jobs:
       needs.wake-services.outputs.mlflow_was_up == 'false'
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-task@v2
+        with:
+          version: 3.x
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Assume gha-train role
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ vars.AWS_GHA_TRAIN_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
 
-      - name: Cool-down (10 min para sync S3 + reading dashboards)
-        run: |
-          echo "::notice::Cool-down 600s antes de apagar"
-          sleep 600
-
-      - name: Stop (scheduler.stop)
-        run: |
-          aws lambda invoke \
-            --function-name ${{ vars.PROJECT }}-scheduler \
-            --cli-binary-format raw-in-base64-out \
-            --payload '{"action":"stop"}' \
-            /tmp/stop.out
-          cat /tmp/stop.out
+      # Single source of truth: misma logica que `task cluster:cool-down-and-stop` local.
+      - run: task cluster:cool-down-and-stop
+        env:
+          AWS_DEFAULT_REGION: ${{ vars.AWS_REGION }}
+          PROJECT: ${{ vars.PROJECT }}
 
   # ════════════════════════════════════════════════════════════════════════
   # PROMOTE PATH: requiere approval del environment production

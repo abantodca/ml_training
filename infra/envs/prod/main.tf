@@ -1,8 +1,8 @@
-# OIDC provider de GitHub (creado en Parte 2.5, NO creado por Terraform).
-# Si saltaste 📖 2.5, este `data` falla con "no resource found" en plan.
+# OIDC provider de GitHub (creado en GUIA_MLOPS_AWS_V2.md §2.5, NO creado por Terraform).
+# Si saltaste §2.5, este `data` falla con "no resource found" en plan.
 # Pre-check antes de `terraform plan`:
 #   aws iam list-open-id-connect-providers --query 'OpenIDConnectProviderList[?contains(Arn,`token.actions.githubusercontent.com`)]'
-# Si devuelve [], correr `bash infra/bootstrap-oidc.sh` (📖 2.5).
+# Si devuelve [], correr `bash infra/bootstrap-oidc.sh` (§2.5).
 data "aws_iam_openid_connect_provider" "github" {
   url = "https://token.actions.githubusercontent.com"
 }

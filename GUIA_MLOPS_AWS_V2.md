@@ -278,6 +278,13 @@ export ACCOUNT_SUFFIX="${ACCOUNT_ID: -6}"
 > Partes 1-2). Los Taskfiles (`tasks/*.yml`) las recalculan internamente con
 > `aws sts get-caller-identity`; no las heredan del shell.
 
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar prereqs**: `docker --version && task --version && terraform version && aws --version` debe imprimir las 4 versiones sin error.
+> - **Verificar variables**: `echo "$ACCOUNT_ID $ACCOUNT_SUFFIX"` debe imprimir 12 digitos + 6 digitos (no vacio).
+> - **Pitfall tipico (host)**: WSL sin systemd o Docker Desktop sin WSL integration -> `docker` falla con `Cannot connect to the Docker daemon`.
+> - **Pitfall tipico (vars)**: si `aws sts get-caller-identity` falla, `AWS_PROFILE` no esta seteado o las credenciales expiraron -> re-correr `aws configure` o renovar token SSO.
+> - **Commit sugerido**: N/A (no genera archivos versionables).
+
 ---
 
 ## Capítulo 4 · Entorno local desde cero
@@ -316,8 +323,13 @@ ml_training/
 ├── .dockerignore                 (§4.3)       qué NO va al build
 ├── docker/
 │   ├── mlflow/Dockerfile         (§4.5.1)     MLflow + psycopg2 + boto3
-│   └── nginx-reports.conf        (§4.5.2)     nginx static
+│   ├── nginx-reports.conf        (§4.5.2)     nginx static (Tramo I local)
+│   └── reports/                  (Tramo II)   imagen ECS reports (S3-sync + nginx)
+│       ├── Dockerfile                          nginx:1.27-alpine + aws-cli + dumb-init
+│       ├── nginx.conf                          config para servir /reports y /artifacts
+│       └── entrypoint.sh                       aws s3 sync inicial + nginx -g daemon off
 ├── docker-compose.yml            (§4.5.3)     postgres + mlflow + reports + trainer
+├── docker-compose.override.yml.example (§13.8) template para apuntar el trainer local a MLflow prod
 ├── Taskfile.yml                  (§4.6)       tasks locales + namespaces AWS
 ├── tasks/local.yml               (§4.6.2)     helper para buckets sandbox
 ├── .env.example                  (§4.7)       plantilla de variables
@@ -389,6 +401,12 @@ docs/
 docker build --progress=plain --no-cache -t ml-training:dryrun . 2>&1 | head -5
 # transferring context: ...kB     ← debe ser kB, no MB
 ```
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `docker build --progress=plain --no-cache -t ml-training:dryrun . 2>&1 | head -5` debe mostrar `transferring context: ...kB` (en KB, no MB).
+> - **Pitfall tipico**: si el transfer es >10 MB el `.dockerignore` no se aplico (path incorrecto, archivo en subdirectorio o sintaxis rota); revisar que el archivo este en la raiz junto al `Dockerfile`.
+> - **Tiempo esperado**: instantaneo (solo creacion de archivo + dry-run del build context).
+> - **Commit sugerido**: `chore(docker): add .dockerignore`
 
 ### 4.4 `Dockerfile`
 
@@ -492,6 +510,12 @@ docker images ml-training:local
 # REPOSITORY    TAG     IMAGE ID       SIZE
 # ml-training   local   <id>           ~1.2 GB
 ```
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `docker build -t ml-training:local . && docker images ml-training:local` debe imprimir una fila con SIZE ~1.2 GB.
+> - **Pitfall tipico**: si stage 1 (builder) falla compilando wheels (`lightgbm`, `xgboost`, `psycopg2`), faltan headers o `build-essential` en el builder; revisar el bloque `apt-get install --no-install-recommends build-essential` y que la linea `# syntax=docker/dockerfile:1.7` este presente (sin eso el cache mount se ignora).
+> - **Tiempo esperado**: ~5 min la primera vez (compila wheels), ~20s con cache.
+> - **Commit sugerido**: `feat(docker): Dockerfile multi-stage del trainer`
 
 ### 4.5 Servicios `docker/` y `docker-compose.yml`
 
@@ -667,6 +691,11 @@ volumes:
 > deja la puerta abierta a apuntar el trainer local contra el MLflow
 > productivo (`export MLFLOW_TRACKING_URI=http://<ALB-DNS>`) sin tocar el
 > compose. Detalle en Parte 13.8.
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `docker compose config` debe parsear sin errores y listar los 4 servicios (`postgres`, `mlflow`, `reports`, `trainer`).
+> - **Pitfall tipico**: line endings CRLF en WSL rompen el YAML con mensajes cripticos (`mapping values are not allowed here`); ejecutar `dos2unix docker-compose.yml docker/nginx-reports.conf docker/mlflow/Dockerfile` si falla.
+> - **Commit sugerido**: `feat(docker): compose con mlflow + postgres + reports + trainer`
 
 ### 4.6 `Taskfile.yml`
 
@@ -903,10 +932,20 @@ tasks:
 task --list
 # Debe mostrar: build, up, down, train, data:split, eda, lint, test,
 # reports:dashboard, local:ensure-buckets, local:bucket-name
+# Ademas el repo real expone tres tasks de ayuda UX:
+#   default     — banner quick-start (lo que ves al correr `task` sin args)
+#   help        — referencia completa de comandos LOCALES
+#   help:aws    — referencia completa de comandos AWS (Tramo II)
+# Estas tres son `echo` de bloques de texto, no afectan estado.
 ```
 
 Si `task --list` da errores tipo `failed to read taskfile`, revisar
 indentación YAML — Task es estricto con tabs vs spaces.
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `task --list` debe mostrar las tasks locales (`build`, `up`, `down`, `train`, `data:split`, `eda`, `lint`, `test`, `reports:dashboard`, `local:ensure-buckets`, `local:bucket-name`) mas las 3 de ayuda UX (`default`, `help`, `help:aws`).
+> - **Pitfall tipico**: indentacion con TABS en `Taskfile.yml` o `tasks/local.yml` rompe el parser (Task exige espacios); el error tipico es `failed to read taskfile` o `yaml: line N: found character that cannot start any token`.
+> - **Commit sugerido**: `feat(taskfile): tasks locales + namespace local:`
 
 ### 4.7 `.env.example` y `.env`
 
@@ -964,6 +1003,11 @@ cp .env.example .env
 | `POSTGRES_PASSWORD` | Equipo / red compartida | `mlflow` |
 | `TRAINER_MEM` / `TRAINER_CPUS` | Laptop con <16 GB / <4 CPUs | `8g` / `4` |
 
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `cp .env.example .env && grep -c "^[A-Z]" .env` debe ser >= 5 (vars activas, no comentadas).
+> - **Pitfall tipico**: dejar el placeholder `XXXXXX` en `S3_MLFLOW_BUCKET` / `S3_ARTIFACTS_BUCKET` rompe `task up` con `Set S3_MLFLOW_BUCKET in .env` (Compose no resuelve la variable); completarlas tras correr §4.8.
+> - **Commit sugerido**: `chore(env): .env.example template`
+
 ### 4.8 Buckets S3 sandbox
 
 Única dependencia AWS para correr local. `task local:ensure-buckets` los
@@ -999,6 +1043,12 @@ aws s3api get-bucket-versioning --bucket "ml-training-artifacts-${SUFFIX}"
 > el mismo. Sólo separarlos si vas a aplicar políticas IAM o lifecycle
 > distintas (Tramo II).
 
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `aws s3 ls | grep ml-training` debe listar 2 buckets (`ml-training-data-<suffix>` + `ml-training-artifacts-<suffix>`) con el mismo `ACCOUNT_SUFFIX` de §3.5.
+> - **Pitfall tipico**: si `aws sts get-caller-identity` no responde (credenciales expiradas / `AWS_PROFILE` mal), `SUFFIX` queda vacio y los buckets se intentan crear con nombre invalido (`ml-training-data-`); re-correr §3.3 antes.
+> - **Tiempo esperado**: ~30s (2 buckets + 2 calls de versioning + 2 de encryption + 2 de PAB).
+> - **Commit sugerido**: N/A (operacion AWS, no genera archivos).
+
 ### 4.9 Primera ejecución
 
 Tres comandos en orden, no saltearse:
@@ -1024,6 +1074,12 @@ task train VARIETIES=POP TUNING=smoke
 #   Campeones por variedad:
 #     POP                       -> xgb composite=...
 ```
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: corre los 5 checks de §4.10 (ya documentados ahi: `/health` 200, runs en Postgres, joblib en S3, nginx 200, `run_summary_AGGREGATE.json`).
+> - **Pitfall tipico**: si `task up` queda en `waiting for mlflow healthcheck` >2 min, `docker logs ml_training-mlflow-1` muestra la causa real; los dos clasicos son `NoSuchBucket` (bucket S3 no existe -> §4.8) o `Unable to locate credentials` (`~/.aws` mal montado o `AWS_PROFILE` mal).
+> - **Tiempo esperado**: 5-10 min primera vez (compila imagen + corre smoke); 1-2 min en re-ejecuciones con cache.
+> - **Commit sugerido**: `chore(smoke): primer entrenamiento local OK`
 
 ### 4.10 Verificación post-smoke (5 checks)
 
@@ -1349,6 +1405,11 @@ echo "    bucket=$TFSTATE_BUCKET  lock=$LOCK_TABLE  region=$REGION"
 > detallado, validaciones de region, y exports sugeridos. El bloque de
 > arriba es el minimo que la guia necesita para el resto del flujo.
 
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `bash -n infra/bootstrap.sh` (syntax check) debe salir sin error y sin output.
+> - **Pitfall tipico**: heredoc roto (`<<EOF` sin cierre) o variables con `$` sin escapar dentro del script — `bash -n` lo detecta antes de ejecutar contra AWS.
+> - **Commit sugerido**: `chore(infra): bootstrap script para tfstate + DDB lock`
+
 ## 2.3 Ejecutar UNA vez
 
 ```bash
@@ -1380,6 +1441,11 @@ arriba (revisa con `bash -x infra/bootstrap.sh` para verlo paso a paso).
 **Si re-ejecutas el script**: es idempotente. Va a decir "Ya existe.
 Skip create." en los pasos donde el recurso ya esta, y los SLR no
 fallan (estan filtrados con `2>$null`).
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `aws s3 ls | grep tfstate` y `aws dynamodb describe-table --table-name ml-training-tflock --region us-east-1 --query 'Table.TableStatus'` deben responder (`ACTIVE`).
+> - **Pitfall tipico**: si ya corriste el bootstrap antes y el bucket existe con nombre distinto (account-id distinto, region distinta), el script es idempotente PERO no detecta drift de nombre — vas a terminar con dos buckets tfstate. Revisa con `aws s3 ls | grep tfstate` antes de re-correr.
+> - **Tiempo esperado**: ~30s
 
 ## 2.4 Verificacion post-bootstrap (4 checks)
 
@@ -1481,6 +1547,11 @@ aws iam get-open-id-connect-provider \
 > trust policy (que se define en Parte 3.12 del modulo `cicd`) es lo
 > que limita el acceso a tu repo especifico.
 
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `aws iam list-open-id-connect-providers | grep token.actions.githubusercontent.com` debe devolver una linea con el ARN del provider.
+> - **Pitfall tipico**: el thumbprint hardcoded cambia raramente, pero si AWS lo rota antes del bootstrap el `create-open-id-connect-provider` falla con `InvalidInput`. Diagnostico: comparar el thumbprint del script con el publicado por AWS en su doc oficial de OIDC + GitHub Actions.
+> - **Commit sugerido**: `chore(infra): bootstrap-oidc para GitHub Actions`
+
 ## 2.6 Snapshot del estado bootstrapped (commit + tag)
 
 El bootstrap es irreversible y no esta versionado en Terraform. Marcalo
@@ -1543,9 +1614,9 @@ ml_training/
 │   │   ├── storage/                        # 3.4
 │   │   ├── mlflow/                         # 3.5 (split: main.tf + alb.tf + ecs.tf + iam.tf + rds.tf)
 │   │   ├── reports/                        # 3.6
-│   │   ├── batch/                          # 3.7
+│   │   ├── batch/                          # 3.7 (split: main.tf + iam.tf)
 │   │   ├── monitoring/                     # 3.8
-│   │   ├── lambdas/                        # 3.9
+│   │   ├── lambdas/                        # 3.9 (split: dispatcher.tf + notifier.tf, sin main.tf)
 │   │   ├── scheduler/                      # 3.10
 │   │   ├── cicd/                           # 3.11
 │   │   └── consumer-iam/                   # 3.11.5 (Patch 13.5 — rol OIDC repo consumer)
@@ -1919,10 +1990,15 @@ output "gha_train_role_arn" {
 
 # Patch 13.5
 output "consumer_role_arn" {
-  description = "Role que asume el repo consumer (ml-serving) via OIDC para descargar artifacts."
+  description = "Role que asume el repo consumer (ml_serving) via OIDC para descargar artifacts."
   value       = module.consumer_iam.consumer_role_arn
 }
 ```
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `terraform -chdir=infra/envs/prod init && terraform -chdir=infra/envs/prod validate` debe terminar con `Success! The configuration is valid.`
+> - **Pitfall tipico**: `terraform.tfvars` debe existir con valores reales y NO commitearse (revisa que `.gitignore` contenga `**/terraform.tfvars`). Si falta el archivo, `validate` aun pasa pero `plan` falla con "No value for required variable".
+> - **Commit sugerido**: `feat(infra): envs/prod skeleton (versions/backend/vars/main/outputs)`
 
 ## 3.3 `modules/network/` — VPC + subnets + NAT + SGs
 
@@ -2264,6 +2340,11 @@ module "network" {
 > `terraform fmt` y `terraform validate` (no `plan` todavia — falta
 > el resto de los modulos). Si valida → seguir a §3.4.
 
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `terraform -chdir=infra/modules/network init -backend=false && terraform -chdir=infra/modules/network validate` debe terminar con `Success! The configuration is valid.`
+> - **Pitfall tipico**: si el split `security_groups.tf` no se crea como archivo separado, los 4 SGs quedan en `main.tf` y la guia diverge del repo (ver §3.1 layout). `validate` pasa igual pero el diff vs repo crece.
+> - **Commit sugerido**: `feat(infra/network): VPC + subnets + NAT + SGs`
+
 ---
 
 ## 3.4 `modules/storage/` — S3 buckets + ECR repos
@@ -2564,6 +2645,11 @@ module "storage" {
 > todo lo demas (§4.2). Asi tenes ECR listo para hacer `docker push`
 > antes de levantar ECS.
 
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `terraform -chdir=infra/modules/storage init -backend=false && terraform -chdir=infra/modules/storage validate` debe terminar con `Success! The configuration is valid.`
+> - **Pitfall tipico**: nombres de buckets S3 con uppercase o underscores rompen `validate` con `BucketName ... is not valid`. Mantener `lowercase` + guion.
+> - **Commit sugerido**: `feat(infra/storage): S3 buckets + ECR repos`
+
 ---
 
 ## 3.4.5 `modules/_shared/` — Trust policies compartidos
@@ -2701,6 +2787,11 @@ inlinearlo en el modulo.
 }
 ```
 
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `ls infra/modules/_shared/` debe mostrar 4 archivos JSON + 1 archivo `.tftpl` + `README.md`.
+> - **Pitfall tipico**: los JSON deben validar como JSON estricto (NO JSON5: sin comentarios, sin trailing commas). Diagnostico: `jq . infra/modules/_shared/assume-ecs-tasks.json` no debe errorizar; si lo hace, hay coma sobrante o comentario.
+> - **Commit sugerido**: `feat(infra/_shared): trust policies dedupe`
+
 ---
 
 ## 3.5 `modules/mlflow/` — RDS + ECS Fargate + ALB
@@ -2740,12 +2831,20 @@ variable "artifacts_bucket_arn" { type = string }
 variable "log_retention_days" { type = number }
 ```
 
-### 3.5.2 `modules/mlflow/main.tf`
+### 3.5.2 `modules/mlflow/` (split en 5 archivos)
 
-Este `main.tf` es el archivo mas grande de la guia (~270 lineas). Lo
-partimos en 5 sub-bloques para que puedas pegar uno, releer el "por
-que", y pasar al siguiente. **Todos van al mismo archivo
-`modules/mlflow/main.tf`** en este orden.
+Este modulo es el mas grande de la guia (~270 lineas). En el **repo
+real** esta **split en 5 archivos** (consistente con §3.1):
+
+- `rds.tf` ← sub-bloque 3.5.2.a (Postgres + Secrets Manager)
+- `alb.tf` ← sub-bloque 3.5.2.b (ALB + target group + listener)
+- `iam.tf` ← sub-bloque 3.5.2.d (roles ECS exec/task + policies)
+- `ecs.tf` ← sub-bloques 3.5.2.c + 3.5.2.e (cluster + service discovery + task def + service)
+- `main.tf` ← solo `data "aws_region"` + comentarios apuntando al split
+
+Lee los 5 sub-bloques en orden, pegando cada uno **en su archivo
+correspondiente**. Si preferis un archivo unico, podes concatenar
+todos en `main.tf` y borrar los otros — Terraform los procesa igual.
 
 #### 3.5.2.a — RDS Postgres (password + subnet group + instance)
 
@@ -3158,7 +3257,7 @@ output "namespace_id" { value = aws_service_discovery_private_dns_namespace.main
 > - EC2 → Load Balancers → `ml-training-alb` (internet-facing). DNS
 >   `ml-training-alb-XXXX.us-east-1.elb.amazonaws.com` — este es el
 >   `MLFLOW_ALB_DNS` que va a las GitHub vars.
-> - EC2 → Target Groups → `ml-training-mlflow-tg` (health=200 en `/`).
+> - EC2 → Target Groups → `ml-training-tg-mlflow` (health=200 en `/`).
 > - ECS → Clusters → `ml-training-cluster` → Services → `mlflow`
 >   (desiredCount=1, runningCount=1, healthy).
 > - ECS → Task Definitions → `ml-training-mlflow:N` (imagen custom de
@@ -3201,6 +3300,11 @@ module "mlflow" {
 > validate` falla con "Unsupported attribute" o "Reference to
 > undeclared module", revisa que pegaste §3.3.4 y §3.4.4 antes que
 > esto.
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `terraform -chdir=infra/modules/mlflow init -backend=false && terraform -chdir=infra/modules/mlflow validate` debe terminar con `Success! The configuration is valid.`
+> - **Pitfall tipico**: el modulo esta SPLIT en 5 archivos (`alb.tf` / `ecs.tf` / `iam.tf` / `rds.tf` / `main.tf`). Si los pegas todos en `main.tf` funciona igual pero diverge del repo (ver §3.5.2 nota). Terraform los lee igual; el split es por legibilidad.
+> - **Commit sugerido**: `feat(infra/mlflow): RDS + ECS Fargate + ALB (5 archivos split)`
 
 ---
 
@@ -3390,9 +3494,9 @@ output "service_name" { value = aws_ecs_service.reports.name }
 > **En consola AWS veras**:
 > - EC2 → Load Balancers → `ml-training-alb` → Listeners → HTTP:80 →
 >   Rules: 2 nuevas con `path-pattern=/reports/*` y `/artifacts/*` que
->   ruteo al target group `ml-training-reports-tg`. Default (/) sigue
+>   ruteo al target group `ml-training-tg-reports`. Default (/) sigue
 >   yendo al de MLflow.
-> - EC2 → Target Groups → `ml-training-reports-tg` (health=200 en
+> - EC2 → Target Groups → `ml-training-tg-reports` (health=200 en
 >   `/healthz`).
 > - ECS → Cluster `ml-training-cluster` → Services → `reports` (segundo
 >   service, mismo cluster que MLflow). Task definition con imagen
@@ -3500,6 +3604,11 @@ module "reports" {
 > de `module.mlflow` — por eso §3.5.4 **tiene que estar antes**. Si
 > intentas validar sin haber pegado mlflow, vas a ver "Reference to
 > undeclared module module.mlflow".
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `terraform -chdir=infra/modules/reports init -backend=false && terraform -chdir=infra/modules/reports validate` debe terminar con `Success! The configuration is valid.`
+> - **Pitfall tipico**: la imagen `reports` requiere `docker/reports/{Dockerfile,nginx.conf,entrypoint.sh}` — si no los creaste (§3.6.4-3.6.6), el `task ecr:build` fallara mas adelante con "Cannot locate specified Dockerfile". `terraform validate` pasa porque no toca Docker.
+> - **Commit sugerido**: `feat(infra/reports): Fargate nginx sirviendo S3`
 
 ---
 
@@ -3933,6 +4042,11 @@ module "batch" {
 > como env var al job-def para que los containers de entrenamiento
 > sepan a donde loguear runs sin hardcodearlo.
 
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `terraform -chdir=infra/modules/batch init -backend=false && terraform -chdir=infra/modules/batch validate` OK
+> - **Pitfall tipico**: el modulo esta split en `main.tf + iam.tf`; el `name` (no `compute_environment_name` deprecado) es key para AWS provider v6
+> - **Commit sugerido**: `feat(infra/batch): CE Spot+OnDemand + queues + job-def`
+
 ---
 
 ## 3.8 `modules/monitoring/` — SNS + alarmas
@@ -4101,6 +4215,11 @@ module "monitoring" {
 > (para alarmas de jobs failed) y el `alb_arn_suffix` de `module.mlflow`
 > (para alarma 5XX del ALB). El `sns_topic_arn` que genera lo consumira
 > `module.lambdas` en §3.9.7 (notifier).
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `terraform -chdir=infra/modules/monitoring init -backend=false && terraform -chdir=infra/modules/monitoring validate` OK
+> - **Pitfall tipico**: si `varieties` esta vacio en tfvars, el `for_each` de alarmas MAPE no crea ninguna alarma (silencioso)
+> - **Commit sugerido**: `feat(infra/monitoring): SNS + alarmas CW (batch+mape+5xx)`
 
 ---
 
@@ -4583,6 +4702,11 @@ module "lambdas" {
 > los `.py`, `terraform plan` truena al hacer `archive_file` del zip.
 > Por eso §3.9 te dice **primero pegar los `.py`, despues los `.tf`**.
 
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `terraform -chdir=infra/modules/lambdas init -backend=false && terraform -chdir=infra/modules/lambdas validate` OK + `python3 -m py_compile infra/lambdas/dispatcher.py infra/lambdas/notifier.py` sin errores
+> - **Pitfall tipico**: el modulo NO tiene main.tf; tiene `dispatcher.tf + notifier.tf` split — si pegas todo en main.tf funciona pero diverge del layout §3.1
+> - **Commit sugerido**: `feat(infra/lambdas): dispatcher + notifier`
+
 ---
 
 ## 3.10 `modules/scheduler/` — auto on/off RDS + Fargate
@@ -4859,11 +4983,17 @@ output "function_arn" { value = aws_lambda_function.scheduler.arn }
 
 ### 3.10.4 `infra/lambdas/scheduler.py`
 
-> **Variante con dias custom (L/Mi/V o cualquier subset)**: el codigo
-> de abajo asume `weekday < 5` hardcoded — funciona para el default
-> `MON-FRI`. Si necesitas otros workdays (ej. solo lunes/miercoles/
-> viernes), aplicar el patch de **§13.1** *despues* de Parte 4. El patch
-> reemplaza el hardcode por un parser de la env var `WORKDAYS_CRON`.
+> **NOTA — version didactica vs codigo real del repo**: el snippet
+> que sigue es la **version base** (paralela, ventana hardcoded
+> `weekday < 5` y `13 <= utc_hour < 17`) que sirve para entender la
+> logica de scheduler. El **archivo real** en `/infra/lambdas/scheduler.py`
+> ya tiene aplicados los patches **§13.1** (parser `WORKDAYS_CRON` +
+> `WORK_START_UTC`/`WORK_END_UTC` configurable) y **§13.3** (wake
+> secuencial RDS → MLflow → Reports con waits). Si comparas el snippet
+> contra el archivo veras helpers extra (`_parse_workdays`, `_rds_state`,
+> `_wait_until`) y un `_start()` secuencial — eso es esperado. Para la
+> version "limpia" sin patches, mirar el codigo abajo. Para la version
+> productiva, ver el archivo real + §13.1 + §13.3.
 
 ```python
 """Lambda scheduler: start/stop RDS + Fargate.
@@ -5018,6 +5148,11 @@ module "scheduler" {
 > `rds_instance_id` para escalar Fargate a 0 y parar RDS fuera de
 > horario laboral. Igual que §3.9.7, depende de que `scheduler.py`
 > (§3.10.4) ya este pegado.
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `terraform -chdir=infra/modules/scheduler init -backend=false && terraform -chdir=infra/modules/scheduler validate` OK + `python3 -m py_compile infra/lambdas/scheduler.py`
+> - **Pitfall tipico**: la guia muestra version PRE-PATCH del scheduler.py; el archivo REAL ya tiene §13.1 (WORKDAYS_CRON) + §13.3 (wake secuencial) aplicados — ver nota §3.10.4
+> - **Commit sugerido**: `feat(infra/scheduler): auto on/off RDS + Fargate (con patches 13.1+13.3)`
 
 ---
 
@@ -5256,6 +5391,11 @@ module "cicd" {
 > la validacion sintactica integrada (`terraform fmt -recursive` y
 > `terraform validate`) antes de pasar a Parte 4 (apply real).
 
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `terraform -chdir=infra/modules/cicd init -backend=false && terraform -chdir=infra/modules/cicd validate` OK
+> - **Pitfall tipico**: las vars `*_arn` declaradas en variables.tf pero NO usadas en main.tf son legacy; no las elimines o romperas envs/prod/main.tf
+> - **Commit sugerido**: `feat(infra/cicd): OIDC trust + GHA roles (deploy + train)`
+
 ---
 
 ## 3.11.5 `modules/consumer-iam/` — Rol OIDC para repo consumer (Patch 13.5)
@@ -5322,7 +5462,7 @@ de §3.11.4):
 
 ```hcl
 # -------------------------------------------------------------------------
-# Capa 10: Consumer IAM (Patch 13.5 — repo ml-serving consume artifacts read-only)
+# Capa 10: Consumer IAM (Patch 13.5 — repo ml_serving consume artifacts read-only)
 # -------------------------------------------------------------------------
 module "consumer_iam" {
   source = "../../modules/consumer-iam"
@@ -5346,6 +5486,11 @@ module "consumer_iam" {
 >   ARN va al repo consumer como `vars.AWS_CONSUMER_ROLE_ARN` para que
 >   su workflow GHA pueda hacer `aws-actions/configure-aws-credentials`
 >   contra este rol.
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `terraform -chdir=infra/modules/consumer-iam init -backend=false && terraform -chdir=infra/modules/consumer-iam validate` OK
+> - **Pitfall tipico**: requiere `consumer_oidc_arn` valido — si el repo consumer aun no tiene OIDC trust setup, el plan falla
+> - **Commit sugerido**: `feat(infra/consumer-iam): rol cross-repo para ml_serving (Patch 13.5)`
 
 ---
 
@@ -5376,7 +5521,7 @@ Cada modulo es un workspace independiente para Terraform (no hay
 `backend`, solo recursos). Se valida sin tocar AWS:
 
 ```bash
-for mod in network storage mlflow reports batch monitoring lambdas scheduler cicd; do
+for mod in network storage mlflow reports batch monitoring lambdas scheduler cicd consumer-iam; do
   echo "=== modules/${mod} ==="
   terraform -chdir="infra/modules/${mod}" init -backend=false -input=false > /dev/null
   terraform -chdir="infra/modules/${mod}" validate
@@ -5412,6 +5557,11 @@ cd ../../..
 > trainer (env vars S3, command `--varieties X --tuning Y`, variedades
 > válidas, custom metric MAPE con dimension `variety`).
 >
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: el loop completo de §3.12.2 + el `terraform validate` de envs/prod en §3.12.3 deben pasar TODOS los modulos con "Success! The configuration is valid."
+> - **Pitfall tipico**: si un modulo dice "Module not installed" durante validate, falto `init -backend=false` para ese modulo
+
 # Parte 4 — Apply incremental + smoke test
 
 > **Filosofia de la Parte 4**: aplicar Terraform en 3 olas en vez de un
@@ -5533,6 +5683,11 @@ Definirlos una sola vez en el root permite override via CLI
 hijo. La propagacion via `includes:.vars:` (§4.1.10) los hace visibles
 en cada `tasks/*.yml` sin redeclaraciones — go-task aisla el scope de los
 includes, asi sin esto los hijos no verian las vars del root.
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `task --list` ahora debe mostrar prefijos `infra:`, `ecr:`, `batch:`, `cluster:`, `mlflow-aws:`, `aws:`, `local:`
+> - **Pitfall tipico**: si Task no encuentra `./tasks/X.yml`, el include silenciosamente lo skipea; revisar paths relativos al Taskfile raiz
+> - **Commit sugerido**: `feat(taskfile): includes namespacing AWS`
 
 ### 4.1.4 `tasks/infra.yml` (Terraform wrapper + bootstrap)
 
@@ -5672,6 +5827,11 @@ y no replicann su logica**: los scripts ya son idempotentes y bien
 probados. Envolverlos como tasks da consistencia (`task infra:bootstrap`
 en vez de `bash infra/bootstrap.sh`) sin re-implementar.
 
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `task infra:validate` debe pasar
+> - **Pitfall tipico**: el `_init` resuelve `SUFFIX` cada invocacion; si las creds AWS apuntan a otra cuenta, el backend bucket name cambia y el state se queda huerfano
+> - **Commit sugerido**: `feat(tasks/infra): wrapper Terraform + bootstrap`
+
 ### 4.1.5 `tasks/ecr.yml` (build + push 3 imagenes)
 
 ```yaml
@@ -5799,6 +5959,11 @@ viene mal escrito y permite parametrizar sin escribir 3 tasks separadas
 y lo embebe como label (`org.opencontainers.image.created`). Util para
 auditar "que imagen tengo desplegada y desde cuando" via
 `docker inspect <image>`.
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `task ecr:login` debe responder "Login Succeeded"
+> - **Pitfall tipico**: ECR repos deben existir (Ola A los crea); si corres `ecr:login` sin Ola A previa, falla con `repository does not exist`
+> - **Commit sugerido**: `feat(tasks/ecr): build + push 3 imagenes`
 
 ### 4.1.6 `tasks/batch.yml` (training jobs en la nube)
 
@@ -5980,6 +6145,11 @@ wait_job() {
 }
 ```
 
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `task --summary batch:train` debe mostrar las 5 vars (JOB_DEF, QUEUE_SPOT, QUEUE_OD, TUNING, PARALLEL)
+> - **Pitfall tipico**: olvidar `source tasks/lib/batch_wait.sh` rompe `wait_job: command not found`; el helper se sourcea, no se ejecuta
+> - **Commit sugerido**: `feat(tasks/batch): submit + polling de jobs`
+
 ### 4.1.7 `tasks/cluster.yml` (lifecycle scale up/down + teardown)
 
 ```yaml
@@ -5998,6 +6168,8 @@ wait_job() {
 #   task cluster:scale-up                             encender (RDS + Fargate)
 #   task cluster:scale-down                           apagar (preserva infra)
 #   task cluster:wait-healthy                         polling ALB hasta 200
+#   task cluster:wake-and-wait                        wake idempotente (CI auto-train)
+#   task cluster:cool-down-and-stop                   sleep + stop (CI post-train)
 #   task cluster:teardown                             destroy volatiles
 #   task cluster:rebuild                              re-apply + scale-up
 # =============================================================================
@@ -6119,6 +6291,72 @@ tasks:
     cmds:
       - 'test -d {{.TF_DIR}} || { echo "ERROR {{.TF_DIR}} no existe. Aplicar infra: task infra:apply"; exit 1; }'
 
+  # ═══ Wake + cool-down (auto-train flow) ═════════════════════════════════════
+
+  wake-and-wait:
+    desc: "Wake idempotente: si MLflow esta DOWN invoca scheduler.start y espera RDS+ALB healthy. Escribe true|false a STATUS_FILE (default /tmp/wake-status)"
+    silent: true
+    cmds:
+      - |
+        STATUS_FILE="${STATUS_FILE:-/tmp/wake-status}"
+        ALB="${MLFLOW_ALB_DNS:-$(terraform -chdir={{.TF_DIR}} output -raw alb_dns 2>/dev/null)}"
+        if [ -z "$ALB" ]; then
+          echo "ERROR ALB no resuelto. Setear MLFLOW_ALB_DNS o aplicar infra"
+          exit 1
+        fi
+        echo ">>> Pre-check MLflow en http://$ALB/health"
+        if curl -fs -o /dev/null --max-time 5 "http://$ALB/health"; then
+          echo "WAS_UP=true (MLflow ya respondia, skip wake)"
+          echo "true" > "$STATUS_FILE"
+          exit 0
+        fi
+        echo "WAS_UP=false. Invocando scheduler.start..."
+        echo "false" > "$STATUS_FILE"
+        aws lambda invoke \
+          --function-name {{.SCHEDULER_FN}} \
+          --cli-binary-format raw-in-base64-out \
+          --payload '{"action":"start"}' \
+          /tmp/wake-start.out
+        cat /tmp/wake-start.out && echo ""
+
+        echo ">>> Esperando RDS available (24x30s = 12 min max)..."
+        STATUS=""
+        for i in $(seq 1 24); do
+          STATUS=$(aws rds describe-db-instances \
+                     --db-instance-identifier {{.PROJECT}}-mlflow \
+                     --query 'DBInstances[0].DBInstanceStatus' --output text 2>/dev/null || echo "missing")
+          echo "  $(date +%H:%M:%S)  RDS=$STATUS"
+          [ "$STATUS" = "available" ] && break
+          sleep 30
+        done
+        if [ "$STATUS" != "available" ]; then
+          echo "::error::RDS no available tras 12 min (estado=$STATUS)"
+          exit 1
+        fi
+
+        echo ">>> Esperando MLflow ALB 200 (30x10s = 5 min max)..."
+        CODE="000"
+        for i in $(seq 1 30); do
+          CODE=$(curl -fs -o /dev/null -w "%{http_code}" --max-time 5 "http://$ALB/health" || echo "000")
+          echo "  $(date +%H:%M:%S)  GET /health -> $CODE"
+          [ "$CODE" = "200" ] && break
+          sleep 10
+        done
+        if [ "$CODE" != "200" ]; then
+          echo "::error::MLflow no respondio 200 tras 5 min (code=$CODE)"
+          exit 1
+        fi
+        echo "OK wake completo. MLflow UP en http://$ALB/"
+
+  cool-down-and-stop:
+    desc: "Sleep COOLDOWN_SEC (default 600) y scale-down. Para flujos auto-train: da margen al sync S3 + lectura de dashboards antes de apagar"
+    vars:
+      COOLDOWN_SEC: '{{.COOLDOWN_SEC | default "600"}}'
+    cmds:
+      - 'echo "Cool-down {{.COOLDOWN_SEC}}s antes de apagar..."'
+      - sleep {{.COOLDOWN_SEC}}
+      - task: scale-down
+
   # ═══ Teardown / Rebuild ═════════════════════════════════════════════════════
 
   teardown:
@@ -6174,6 +6412,34 @@ no-op. Mas simple que mantener una lista paralela de "modulos a re-apply".
 **Por que `wait-healthy` usa `terraform output -raw alb_dns` cada vez y
 no cachea**: el ALB DNS puede cambiar tras un teardown/rebuild. Resolver
 dinamicamente garantiza que poll-eamos el ALB actual, no uno fantasma.
+
+**Por que `wake-and-wait` y `cool-down-and-stop` son tasks separadas y
+no reuso `scale-up` + `wait-healthy`**: el flujo auto-train (CI) tiene
+dos requisitos extra que el flujo manual no:
+1. **Idempotencia + senal de estado previo**: `wake-and-wait` hace un
+   pre-check con `curl /health`; si MLflow ya estaba UP, salta el wake
+   y escribe `true` al `STATUS_FILE`. El workflow lee ese flag para
+   decidir si tiene que apagar al final (no apagamos lo que no
+   prendimos). `scale-up` no tiene este pre-check porque el caso manual
+   es "siempre quiero prender" (es el operador el que ya sabe que esta
+   DOWN).
+2. **Resolucion del ALB sin Terraform state**: `wake-and-wait` acepta
+   `MLFLOW_ALB_DNS` como env var (lo inyecta el workflow desde GH
+   Variables) y solo cae al `terraform output` si no esta seteada. Asi
+   el job CI no necesita acceso al state remoto (mas rapido y un
+   permiso IAM menos). En local el operador no tiene la var seteada y
+   cae al `terraform output` como `wait-healthy`.
+
+**Por que `cool-down-and-stop` reusa `scale-down` despues del sleep**:
+mismas safety checks (Batch jobs RUNNING, scheduler stop con
+notificacion SNS). Es solo un wrapper "esperar + apagar" sobre la task
+existente. Si en el futuro `scale-down` cambia (ej. drena Batch
+explicitamente), `cool-down-and-stop` hereda el comportamiento gratis.
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `task --list | grep "cluster:"` debe listar status/scale-up/scale-down/wait-healthy/wake-and-wait/cool-down-and-stop/teardown/rebuild (8 tasks)
+> - **Pitfall tipico**: `wake-and-wait` y `cool-down-and-stop` son nuevas (post-refactor §6.0.1); si las omitis los workflows auto-train fallan en CI
+> - **Commit sugerido**: `feat(tasks/cluster): lifecycle scale + wake/cool-down`
 
 ### 4.1.8 `tasks/mlflow_registry.yml` (promote con quality gate MAPE)
 
@@ -6337,6 +6603,11 @@ cada job (ahorra ~30s + necesita credenciales para el backend S3).
 La var `vars.MLFLOW_ALB_DNS` que el workflow exporta como env permite
 que el promote corra sin tocar Terraform. Para uso local, el fallback
 a `terraform output -raw alb_dns` sigue funcionando.
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `task mlflow-aws:current-prod MODEL_NAME=rnd-forest-POP` (requiere ALB up); en local sin ALB salta el `_mlflow-uri`
+> - **Pitfall tipico**: si la metrica registrada es `mape` en lugar de `mape_oof`, el gate evalua el train set (overfit) y promociona modelos malos — chequear el run con `jq '.run.data.metrics'`
+> - **Commit sugerido**: `feat(tasks/mlflow-aws): promote con gates MAPE + A/B`
 
 ### 4.1.9 `tasks/aws.yml` (orquestadores high-level)
 
@@ -6591,6 +6862,11 @@ OIDC, los rompes. `nuke` es para tear-down de cuenta entera o demo
 descartable; despues requiere correr `infra:bootstrap` +
 `infra:bootstrap-oidc` desde cero.
 
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `task --list | grep "aws:"` debe listar deploy/smoke/wake/sleep/teardown/rebuild/destroy/nuke/status (9 tasks)
+> - **Pitfall tipico**: `aws:nuke` borra el OIDC provider que pueden estar usando otros repos en la misma cuenta — chequear con `aws iam list-open-id-connect-providers` antes
+> - **Commit sugerido**: `feat(tasks/aws): orquestadores high-level + nuke`
+
 ### 4.1.10 Anadir `includes:` al Taskfile raiz + verificacion final
 
 Ahora que los 7 `tasks/*.yml` existen (§4.1.4 a §4.1.9 + §4.1.11),
@@ -6660,6 +6936,10 @@ task --list-all > /dev/null && echo "OK"
 
 Si `task --list` muestra los 7 namespaces, el setup esta completo. A
 partir de aca, las oleadas A/B/C (§4.2 a §4.5) usan estas tasks.
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `task --summary aws:deploy` debe expandir 3 etapas (storage / build-all / apply full)
+> - **Pitfall tipico**: si pegas `includes:` ANTES de que existan los `tasks/*.yml`, `task --list` falla con "open ./tasks/X.yml: no such file"
 
 ### 4.1.11 `tasks/local.yml` (helpers para desarrollo local que toca AWS)
 
@@ -6765,6 +7045,11 @@ es para tu maquina. Si manana se agregan helpers tipo
 `local:download-latest-model` o `local:sync-data-from-s3`, viven naturalmente
 aca y no pisan el namespace de orquestacion.
 
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `task local:bucket-name KIND=data` debe imprimir `ml-training-data-<SUFFIX>` con tu account ID
+> - **Pitfall tipico**: si `aws sts get-caller-identity` falla (creds expiradas), `SUFFIX` queda vacio y el bucket-name sale truncado `ml-training-data-`
+> - **Commit sugerido**: `feat(tasks/local): ensure-buckets sandbox`
+
 ## 4.2 Ola A — apply storage solo
 
 Crea los 2 buckets S3 + 3 repos ECR. Tiempo: ~1 min.
@@ -6817,6 +7102,12 @@ aws s3 ls "s3://${DATA_BUCKET}/" --human-readable
 >   (vacio).
 > - ECR → Repositories → 3 (`ml-training`, `ml-training-mlflow`,
 >   `ml-training-reports`) los 3 vacios — el push viene en Ola B.
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `aws s3 ls | grep ml-training` debe mostrar 2 buckets (`data` + `artifacts`) y `aws ecr describe-repositories --query 'repositories[].repositoryName' --output text | tr '\t' '\n' | grep ml-training` debe listar 3 repos.
+> - **Pitfall tipico**: si la Ola A falla con `BucketAlreadyExists`, el `ACCOUNT_SUFFIX` colisiona con otra cuenta o un bucket previamente borrado todavia retiene el nombre; revisar §3.5 (calculo del suffix) y re-exportar con `export ACCOUNT_SUFFIX="${ACCOUNT_ID: -6}"`.
+> - **Tiempo esperado**: ~2 min.
+> - **Commit sugerido**: N/A (es apply de Terraform, no cambios en archivos).
 
 ## 4.3 Ola B — build + push 3 imagenes a ECR
 
@@ -6876,6 +7167,12 @@ Cada uno debe devolver un array con 1 item (no vacio).
 > - Cada imagen muestra el resultado del scan-on-push (vulnerabilities
 >   findings: usualmente "No findings" en imagenes oficiales, algunos
 >   MEDIUM/LOW en `ml-training` por las deps de Python).
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `aws ecr describe-images --repository-name ml-training --query 'imageDetails[].imageTags' --output table` debe listar imagenes con tag `latest` y `sha-<commit>` para los 3 repos (`ml-training`, `ml-training-mlflow`, `ml-training-reports`).
+> - **Pitfall tipico**: si `docker buildx` falla en WSL con `no space left on device`, limpiar con `docker system prune -a` (libera capas viejas) y reintentar; si falla en `aws ecr get-login-password` con `403`, re-autenticar el perfil AWS.
+> - **Tiempo esperado**: ~10 min la primera vez (3 imagenes, sin cache); ~3 min con cache caliente.
+> - **Commit sugerido**: N/A (es build + push, no cambios en archivos).
 
 ## 4.4 Ola C — apply full (en 4 sub-olas con checkpoint)
 
@@ -7050,6 +7347,13 @@ aws rds describe-db-instances \
 
 Si los 5 checks dan OK, la infra esta arriba.
 
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `task aws:status` debe mostrar RDS `available` + ECS services con `runningCount=1` para `mlflow` y `reports` + Batch compute envs `ENABLED`.
+> - **Pitfall tipico en C2**: el subnet group de RDS requiere 2 AZs; si tu VPC solo tiene 1 subnet privada, el apply falla con `DBSubnetGroupDoesNotCoverEnoughAZs` — revisar `module.network` y agregar segunda AZ.
+> - **Pitfall tipico en C3**: si el OIDC provider de §2.5 no existe, el `data "aws_iam_openid_connect_provider"` falla — verificar el pre-check en `envs/prod/main.tf` y bootstrapear el provider antes de aplicar `module.cicd`.
+> - **Tiempo esperado**: C1 ~2 min, C2 ~10 min (RDS domina), C3 ~3 min, C4 ~2 min (total ~17 min).
+> - **Commit sugerido**: N/A (es apply de Terraform, no cambios en archivos).
+
 ## 4.5 Smoke test — entrenar 1 variedad end-to-end
 
 Esto verifica (el item 1 sobre Lambda dispatcher se valida indirectamente
@@ -7129,6 +7433,12 @@ Si (1) y (2) salen OK, **el smoke pasa**. (3) y (4) tambien deberian
 salir OK porque `main.py:scripts.s3_sync.sync_to_s3` ya sube reports
 si `S3_ARTIFACTS_BUCKET` esta seteado (ya esta, via job-def).
 
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `task batch:smoke` debe terminar con `jobId` impreso + status `SUCCEEDED` tras ~5-8 min; el run aparece en MLflow UI (`http://${ALB}/`) bajo experiment `POP`.
+> - **Pitfall tipico**: si el job queda en `RUNNABLE` eternamente, revisar §8.3.1 — tipicamente Spot bid muy bajo, sin capacity en la AZ del CE, o el role de Batch sin permisos para `ec2:RunInstances`.
+> - **Tiempo esperado**: ~8 min (incluye spin-up de EC2 Spot + pull de imagen 3 GB + `--tuning smoke` con 5 iter Optuna).
+> - **Commit sugerido**: N/A (es ejecucion de smoke, no cambios en archivos).
+
 ## 4.6 Confirmar suscripcion SNS
 
 SNS manda un email de confirmacion cuando creas la suscripcion (Parte
@@ -7157,6 +7467,11 @@ aws sns publish \
     --subject "TEST: ml-training alerts" \
     --message "Si recibis este mail, la suscripcion esta OK."
 ```
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: revisar el email (`abantodca@gmail.com`) y clickear "Confirm subscription"; luego `aws sns list-subscriptions-by-topic --topic-arn "${TOPIC_ARN}"` debe mostrar el `SubscriptionArn` con `arn:aws:sns:...` en lugar de `PendingConfirmation`.
+> - **Pitfall tipico**: el email de confirmacion puede caer en spam — chequear remitente `no-reply@sns.amazonaws.com`; si tampoco aparece ahi, re-disparar con `terraform apply -replace=module.monitoring.aws_sns_topic_subscription.email`.
+> - **Commit sugerido**: N/A (es confirmacion via UI/email, no cambios en archivos).
 
 ## 4.7 Tasks operativas (referencia)
 
@@ -7429,6 +7744,11 @@ def emit_mape_metric(variety: str, mape_value: float) -> None:
         log.warning("CloudWatch put_metric_data fallo: %s", exc)
 ```
 
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `python3 -m py_compile src/utils/cloudwatch_metrics.py` no debe imprimir nada (exit 0); `python3 -c "from src.utils.cloudwatch_metrics import emit_mape_metric"` importa OK.
+> - **Pitfall tipico**: si el archivo nace con BOM (Windows) o tabs mezclados con spaces, `py_compile` falla con `IndentationError`; abrir con `dos2unix` y verificar `cat -A`.
+> - **Commit sugerido**: `feat(utils): emit MAPE metric a CloudWatch`
+
 ## 5.3 Invocar desde el runner
 
 Editar `src/orchestration/variety_runner.py` (no `runners.py` — ese
@@ -7474,6 +7794,11 @@ emit_mape_metric(variety=variety, mape_value=champion.oof_mape)
 > mide degradacion en datos no vistos (OOF), que es lo que el negocio
 > realmente experimenta. `full_mape` es in-sample (optimista) y mete
 > ruido cuando el modelo memoriza el train.
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `grep -n "emit_mape_metric" src/orchestration/variety_runner.py` debe encontrar la llamada justo despues del bloque del quality gate (~linea 104) y el import al inicio del modulo.
+> - **Pitfall tipico**: si lo pegas en `runners.py` en lugar de `variety_runner.py`, no tenes acceso al `champion: ModelResult` (solo el dict serializado) y la metric sale con `mape_value=0` o falla con `AttributeError`.
+> - **Commit sugerido**: `feat(runner): invocar emit_mape_metric post-quality-gate`
 
 ## 5.4 Verificar local que no rompe
 
@@ -7531,6 +7856,11 @@ aws cloudwatch get-metric-statistics
 
 Si trae un valor, **la alarma `ml-training-mape-pop` ya tiene datos**
 y va a dispararse cuando supere `mape_alarm_threshold` (default 25%).
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: tras un training, `aws cloudwatch get-metric-statistics --namespace "ml-training/Training" --metric-name MAPE --dimensions Name=variety,Value=POP --start-time "$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)" --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" --period 60 --statistics Maximum` debe devolver al menos 1 datapoint con `Maximum` numerico.
+> - **Pitfall tipico**: si `Datapoints` vuelve vacio, la nueva imagen no se desplego — confirmar que `terraform.tfvars` tenga `trainer_image_tag = "v0.2.0"` (o el tag nuevo) y re-aplicar `module.batch`.
+> - **Tiempo esperado**: ~5-10 min end-to-end (build + push de la nueva imagen + smoke run + propagacion de la metric a CloudWatch).
 
 ---
 
@@ -7680,7 +8010,7 @@ Settings → Secrets and variables → Actions.
 | Nombre | Valor |
 |---|---|
 | `AWS_REGION` | `us-east-1` |
-| `AWS_ACCOUNT_ID` | tu account id 12 digitos |
+| `AWS_ACCOUNT_ID` | tu account id 12 digitos. **LEGACY**: ningun workflow V2 la consume (el account-id se obtiene implicitamente via OIDC `role-to-assume` ARN). Mantener por compatibilidad si tenes scripts auxiliares que la lean; eliminar de aca cuando se confirme que nadie depende. |
 | `AWS_GHA_DEPLOY_ROLE_ARN` | `arn:aws:iam::<account>:role/ml-training-gha-deploy` |
 | `AWS_GHA_TRAIN_ROLE_ARN` | `arn:aws:iam::<account>:role/ml-training-gha-train` |
 | `ECR_TRAINER` | `<account>.dkr.ecr.us-east-1.amazonaws.com/ml-training` |
@@ -7698,7 +8028,7 @@ ahi si va en secrets.
 
 ```bash
 gh variable set AWS_REGION              -b "us-east-1"
-gh variable set AWS_ACCOUNT_ID          -b $ACCOUNT_ID
+gh variable set AWS_ACCOUNT_ID          -b $ACCOUNT_ID  # legacy, no consumida por workflows V2 (ver tabla)
 gh variable set AWS_GHA_DEPLOY_ROLE_ARN -b "$(terraform -chdir=infra/envs/prod output -raw gha_deploy_role_arn)"
 gh variable set AWS_GHA_TRAIN_ROLE_ARN  -b "$(terraform -chdir=infra/envs/prod output -raw gha_train_role_arn)"
 gh variable set ECR_TRAINER             -b "$ACCOUNT_ID.dkr.ecr.us-east-1.amazonaws.com/ml-training"
@@ -7713,6 +8043,11 @@ gh variable set CONSUMER_REPO           -b "ml_serving"
 > estar seteadas **antes** del primer run del job `infra-apply` de
 > `deploy.yml`, sino el step `task aws:deploy` falla con
 > `variable "alert_email"/"consumer_org"/"consumer_repo" required value not provided`.
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `gh variable list` debe listar las 9 variables (`AWS_REGION`, `AWS_GHA_DEPLOY_ROLE_ARN`, `AWS_GHA_TRAIN_ROLE_ARN`, `ECR_TRAINER`, `MLFLOW_ALB_DNS`, `PROJECT`, `ALERT_EMAIL`, `CONSUMER_ORG`, `CONSUMER_REPO`).
+> - **Pitfall tipico**: `gh variable set` requiere `repo` scope en el token; si falla con `HTTP 403: Resource not accessible by integration`, re-autenticar con `gh auth refresh -s repo` y reintentar.
+> - **Commit sugerido**: N/A (configuracion en GitHub, no cambios en archivos del repo).
 
 ## 6.2 `.github/workflows/deploy.yml` — consolidado (lint/test/build/plan/apply)
 
@@ -7840,6 +8175,11 @@ jobs:
 > approval). Si todo OK, ves los outputs (`alb_dns`, `tracking_uri`,
 > ...) en el summary.
 
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: tras un push a una branch, `gh run list --workflow=Deploy --limit 1` debe mostrar un run disparado con `status=in_progress` o `completed`.
+> - **Pitfall tipico**: si el job `infra-apply` falla con `AccessDenied for sts:AssumeRoleWithWebIdentity`, revisar el trust policy del rol `ml-training-gha-deploy` — el `sub` debe permitir `repo:<org>/<repo>:*` (no solo `repo:<org>/<repo>:ref:refs/heads/main`).
+> - **Commit sugerido**: `feat(ci): deploy workflow (lint+test+build+plan+apply)`
+
 ## 6.3 `terraform-plan.yml` (eliminado)
 
 > **§6.3 (terraform-plan.yml) eliminado**: ahora es un job dentro de
@@ -7915,6 +8255,7 @@ on:
 permissions:
   id-token: write
   contents: read
+  actions:  read   # detect usa gh run list -> headSha del ultimo Deploy success
 
 concurrency:
   group: training-${{ github.event.inputs.action || 'auto' }}
@@ -7922,11 +8263,34 @@ concurrency:
 
 jobs:
   detect:                             # decide mode=train|promote|skip
-  wake-services:                      # if: mode == 'train'  -> outputs.mlflow_was_up
+                                      # En workflow_run, busca el ultimo Deploy success
+                                      # via `gh run list` para fijar BASE_SHA (cubre
+                                      # squash merges y push multi-commit). Path filter:
+                                      # ^(src/|main\.py|Dockerfile|requirements\.txt|scripts/)
+  wake-services:                      # if: mode == 'train'  -> task cluster:wake-and-wait
+                                      # outputs.mlflow_was_up=true|false (decide cool-down)
   train:                              # if: mode == 'train'  -> task batch:train-lambda
-  cool-down-and-stop:                 # if: mode == 'train' && was_up == 'false' -> scheduler.stop
+  cool-down-and-stop:                 # if: mode == 'train' && was_up == 'false'
+                                      #   -> task cluster:cool-down-and-stop
   promote:                            # if: mode == 'promote' -> task mlflow-aws:promote + env=production
 ```
+
+> **Por que `permissions: actions: read`**: el job `detect` corre
+> `gh run list --workflow Deploy --status success` para encontrar el
+> `headSha` del Deploy exitoso anterior. Eso es el `BASE_SHA` correcto
+> para `git diff BASE..HEAD` (cubre push de N commits y squash merges,
+> donde `HEAD~1` falla). Sin este permiso, `gh` devuelve 403 y caemos
+> al fallback `${HEAD_SHA}^` que solo funciona para single-commit pushes.
+
+> **Por que `wake-services` y `cool-down-and-stop` delegan a `task`**:
+> filosofia SSOT (§6.0.1). El polling de RDS available + curl al ALB +
+> invocacion del scheduler Lambda son ~70 lineas de bash que se
+> ejecutan IGUAL desde laptop con `task cluster:wake-and-wait` /
+> `task cluster:cool-down-and-stop` que desde el workflow. El workflow
+> es un thin wrapper: assume role + setup-task + `- run: task ...`.
+> La comunicacion del `was_up=true|false` entre Task y GHA usa un
+> `STATUS_FILE` (default `/tmp/wake-status`) que el step posterior lee
+> con `echo "was_up=$(cat $STATUS_FILE)" >> $GITHUB_OUTPUT`.
 
 > **Por que el job `train` NO hace `aws batch submit-job` directo**:
 > seguridad. El rol `gha-train` SOLO tiene `lambda:InvokeFunction` sobre
@@ -7979,6 +8343,11 @@ Uso desde la UI:
 > aws logs tail /aws/lambda/ml-training-dispatcher --since 5m
 > # Esperado: log con SubmitJob OK + jobId del Batch
 > ```
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `gh workflow run training.yml -f action=train -f varieties=POP -f tuning=smoke` debe disparar el workflow y el job `detect` debe resolver `mode=train` (visible en `gh run view <id> --log`).
+> - **Pitfall tipico**: el job `detect` necesita `permissions: actions: read` para que `gh run list --workflow Deploy` funcione; sin eso falla con `403` silencioso y cae al fallback `${HEAD_SHA}^` que solo cubre single-commit pushes (squash merges fallan).
+> - **Commit sugerido**: `feat(ci): training workflow consolidado (train+auto-train+promote)`
 
 ## 6.5 `promote.yml` (eliminado)
 
@@ -8134,6 +8503,11 @@ jobs:
 > terminado el proyecto. DESTROY es irreversible para artifacts/RDS;
 > NUKE adicionalmente exige re-bootstrap completo.
 
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `gh workflow run destroy.yml -f confirmar=NOPE -f modo=TEAR-DOWN` debe registrar un run que termina con `conclusion=skipped` (porque `confirmar != DESTRUIR-ML-TRAINING`); confirmable via `gh run list --workflow=destroy.yml --limit 1`.
+> - **Pitfall tipico**: el modo `NUKE` elimina el tfstate bucket + DynamoDB lock + OIDC provider; la doble salvaguarda con `environment: production` + string magica `DESTRUIR-ML-TRAINING` son CRITICAS — no las saques aunque parezcan redundantes.
+> - **Commit sugerido**: `feat(ci): destroy workflow con 3 modos`
+
 ## 6.6 Branch protection
 
 El required status check cambio de nombre con la consolidacion: antes
@@ -8168,6 +8542,11 @@ EOF
 (O configurar via GitHub UI: Settings → Branches → Branch protection
 rules → Add rule → Require status checks to pass → buscar y agregar
 `Deploy / lint-and-test`.)
+
+> **🔄 Al re-ejecutar esta seccion**:
+> - **Verificar**: `gh api repos/:owner/:repo/branches/main/protection` debe devolver un JSON con `required_status_checks.contexts` incluyendo `Deploy / lint-and-test` y `required_pull_request_reviews.required_approving_review_count >= 1`.
+> - **Pitfall tipico**: si el status check aparece como `lint-and-test` solo (sin el prefijo `Deploy / `), es porque el workflow viejo `ci.yml` todavia existe — borrarlo del repo para que GitHub use el nombre nuevo del workflow consolidado.
+> - **Commit sugerido**: N/A (configuracion en GitHub via API, no cambios en archivos del repo).
 
 ---
 
@@ -9248,43 +9627,65 @@ ya estaba se preserva):
 
 ```
 ml_training/
-├── infra/                              # NUEVO
-│   ├── bootstrap.sh                    # Parte 2.2
-│   ├── bootstrap-oidc.sh               # Parte 2.5
-│   ├── envs/prod/                      # Parte 3.2 (6 archivos)
-│   ├── modules/                        # Parte 3 (9 modulos × 2-3 archivos cada uno)
-│   │   └── consumer-iam/               # Parte 13.5 (solo si aplicas Parte 13)
-│   └── lambdas/                        # Parte 3.9, 3.10 (3 archivos .py)
-├── tasks/                              # NUEVO (orquestacion AWS + helpers locales)
-│   ├── infra.yml                       # Parte 4.1.4   terraform + bootstrap
-│   ├── ecr.yml                         # Parte 4.1.5   build + push 3 imagenes
-│   ├── batch.yml                       # Parte 4.1.6   submit jobs + polling (+ train-lambda)
-│   ├── cluster.yml                     # Parte 4.1.7   lifecycle scale up/down
-│   ├── mlflow_registry.yml             # Parte 4.1.8   promote con gate MAPE + A/B
-│   ├── aws.yml                         # Parte 4.1.9   orquestadores high-level (+ nuke)
-│   └── local.yml                       # Parte 4.1.11  helpers dev local (ensure-buckets)
-├── Taskfile.yml                        # MODIFICADO (Parte 4.1.3 anade includes:)
-├── docker/                             # SOLO NUEVO el subdir reports/
-│   └── reports/                        # Parte 3.6 (Dockerfile + nginx.conf + entrypoint.sh)
-├── .github/workflows/                  # NUEVO
-│   ├── deploy.yml                      # Parte 6.2 (consolida ci + terraform-plan + infra-apply)
-│   ├── training.yml                    # Parte 6.4 (consolida train + auto-train + promote)
-│   └── destroy.yml                     # Parte 6.5.5 (3 modos: TEAR-DOWN / DESTROY / NUKE)
-├── src/                                # MODIFICADO
-│   ├── orchestration/variety_runner.py # Parte 5.3 (agrega emit_mape_metric tras quality gate)
-│   └── utils/cloudwatch_metrics.py     # Parte 5.2 (archivo nuevo)
-├── main.py                             # OPCIONAL: signal handler (8.4)
-├── GUIA_MLOPS_AWS_V2.md                # esta guia
-└── (resto del proyecto)
+├── infra/                                       # NUEVO
+│   ├── bootstrap.sh                             # Parte 2.2
+│   ├── bootstrap-oidc.sh                        # Parte 2.5
+│   ├── envs/prod/                               # Parte 3.2 (5 archivos .tf + terraform.tfvars gitignored)
+│   ├── modules/
+│   │   ├── _shared/                             # 5 trust policies JSON/tftpl + README (dedupe IAM)
+│   │   ├── network/                             # variables + main + security_groups + outputs (4)
+│   │   ├── storage/                             # variables + main + outputs (3)
+│   │   ├── mlflow/                              # split: variables + main + alb + ecs + iam + rds + outputs (7)
+│   │   ├── reports/                             # variables + main + outputs (3)
+│   │   ├── batch/                               # split: variables + main + iam + outputs (4)
+│   │   ├── monitoring/                          # variables + main + outputs (3)
+│   │   ├── lambdas/                             # split: variables + dispatcher + notifier + outputs (4; sin main.tf)
+│   │   ├── scheduler/                           # variables + main + outputs (3)
+│   │   ├── cicd/                                # variables + main + outputs (3)
+│   │   └── consumer-iam/                        # Patch 13.5 APLICADO (variables + main + outputs)
+│   └── lambdas/                                 # Codigo Python de las Lambdas (3 .py)
+│       ├── dispatcher.py                        # Parte 3.9.5
+│       ├── notifier.py                          # Parte 3.9.6
+│       └── scheduler.py                         # Parte 3.10.4 (con patches §13.1 + §13.3)
+├── tasks/                                       # NUEVO (orquestacion AWS + helpers locales)
+│   ├── infra.yml                                # Parte 4.1.4   terraform + bootstrap
+│   ├── ecr.yml                                  # Parte 4.1.5   build + push 3 imagenes
+│   ├── batch.yml                                # Parte 4.1.6   submit jobs + polling (+ train-lambda)
+│   ├── cluster.yml                              # Parte 4.1.7   lifecycle scale up/down
+│   ├── mlflow_registry.yml                      # Parte 4.1.8   promote con gate MAPE + A/B
+│   ├── aws.yml                                  # Parte 4.1.9   orquestadores high-level (+ nuke)
+│   ├── local.yml                                # Parte 4.1.11  helpers dev local (ensure-buckets)
+│   └── lib/batch_wait.sh                        # Parte 4.1.6.1 polling compartido
+├── Taskfile.yml                                 # MODIFICADO (Parte 4.1.3 anade includes:; tambien tasks `default`/`help`/`help:aws`)
+├── docker/
+│   ├── mlflow/Dockerfile                        # Parte 4.5.1 (Tramo I local)
+│   ├── nginx-reports.conf                       # Parte 4.5.2 (Tramo I local)
+│   └── reports/                                 # Parte 3.6 (Tramo II ECS: Dockerfile + nginx.conf + entrypoint.sh)
+├── docker-compose.yml                           # Parte 4.5.3 (con override-friendly MLFLOW_TRACKING_URI — Patch 13.8)
+├── docker-compose.override.yml.example          # Patch 13.8 — template para apuntar trainer local a MLflow prod
+├── .github/workflows/                           # NUEVO
+│   ├── deploy.yml                               # Parte 6.2 (consolida ci + terraform-plan + infra-apply)
+│   ├── training.yml                             # Parte 6.4 (consolida train + auto-train-on-push + promote)
+│   └── destroy.yml                              # Parte 6.5.5 (3 modos: TEAR-DOWN / DESTROY / NUKE)
+├── src/                                         # MODIFICADO
+│   ├── orchestration/variety_runner.py          # Parte 5.3 (emit_mape_metric tras quality gate)
+│   └── utils/cloudwatch_metrics.py              # Parte 5.2 (archivo nuevo)
+├── main.py                                      # OBLIGATORIO (entrypoint del trainer); signal handler en §8.4
+├── GUIA_MLOPS_AWS_V2.md                         # esta guia
+└── (resto del proyecto: README.md, pyproject.toml, requirements*.txt, .dockerignore,
+    .env.example, .gitignore, .editorconfig, docs/adr/, notebooks/, scripts/, .claude/, etc.)
 ```
 
-Total agregado: ~70 archivos nuevos, ~2 modificados (~72 con Parte 13
-aplicada). Total LOC agregadas: ~3500 (HCL + Python + YAML + Markdown).
+Total agregado: ~80 archivos nuevos (Parte 13 incluida), ~3 modificados.
+Total LOC agregadas: ~3500 (HCL + Python + YAML + Markdown).
 
-**Archivos extra si aplicas Parte 13** (customizaciones):
-- `infra/modules/consumer-iam/` (3 archivos: variables.tf, main.tf,
-  outputs.tf) — §13.5.
-- `.github/workflows/auto-train-on-push.yml` — §13.2.
+**Notas sobre Parte 13** (todos los patches APLICADOS en este repo):
+- `infra/modules/consumer-iam/` ya cableado en `envs/prod/main.tf` como
+  Capa 10 (§13.5).
+- `.github/workflows/auto-train-on-push.yml` **NO existe** como archivo
+  separado: la funcionalidad esta absorbida en `training.yml` (jobs
+  `detect` + `wake-services` + `train` + `cool-down-and-stop`; §13.2 +
+  §6.4).
 - Modificaciones a `infra/envs/prod/{main,variables,outputs}.tf` y
   `terraform.tfvars` para registrar el modulo `consumer_iam` — §13.5.2.
 
@@ -9308,28 +9709,29 @@ aplicada). Total LOC agregadas: ~3500 (HCL + Python + YAML + Markdown).
 
 ---
 
-# Parte 13 — Customizaciones puntuales (patches PROPUESTOS, no aplicados aun)
+# Parte 13 — Customizaciones puntuales (patches APLICADOS post-auditoria 2026-05-18)
 
-> **STATUS**: los 5 patches de esta parte estan **todos APLICADOS post-auditoria 2026-05-18**;
-> mantener documentacion para historicidad y como referencia para
-> futuros forks que quieran adoptarlos selectivamente. Si queres
+> **STATUS**: los 5 patches de esta parte estan **todos APLICADOS** en
+> el codigo del repo. Esta seccion documenta cada patch + su estado
+> final + el motivo por el cual existe, como referencia historica y
+> para futuros forks que quieran adoptarlos selectivamente. Si queres
 > re-aplicar alguno tras cambios, segui las instrucciones del
 > sub-bloque y corre `task infra:apply TARGET=module.X` correspondiente.
 >
 > **Por que esta parte existe**: las Partes 1-12 son la guia generica
 > que sirve para cualquier deployment. Esta Parte 13 documenta **5
-> patches** que podes aplicar a tu caso de uso particular:
+> patches** que se aplicaron a este caso de uso particular:
 >
-> 1. Scheduler L/Mi/V (no L-V) — Sec 13.1 — **no aplicado**
-> 2. Auto-train on push con wake/sleep — Sec 13.2 — **no aplicado** (workflow `auto-train-on-push.yml` no existe)
-> 3. Orden serializado de wake (RDS → MLflow → Reports) — Sec 13.3 — **no aplicado** (scheduler.py sigue paralelo)
+> 1. Scheduler L/Mi/V (no L-V) — Sec 13.1 — **APLICADO** (vars `WORKDAYS_CRON`/`WORK_*_UTC` en `modules/scheduler/main.tf`)
+> 2. Auto-train on push con wake/sleep — Sec 13.2 — **APLICADO y ABSORBIDO** en `.github/workflows/training.yml` (no existe `auto-train-on-push.yml` separado; el job `detect` con `workflow_run: workflows:["Deploy"]` cumple la funcion; ver §6.4)
+> 3. Orden serializado de wake (RDS → MLflow → Reports) — Sec 13.3 — **APLICADO** (`scheduler.py::_start` ahora secuencial con waits, `timeout=900`)
 > 4. URLs locales documentadas (para que el dev sepa donde mirar local vs prod) — Sec 13.4 — solo doc
-> 5. Como otro proyecto (FastAPI + Streamlit) consume este MLflow — Sec 13.5 — **modulo consumer-iam no creado**
-> 6. MLflow local→prod (override del compose) — Sec 13.8 — **parcial** (codigo soporta override via `MLFLOW_TRACKING_URI`, falta `docker-compose.override.yml`)
+> 5. Como otro proyecto (FastAPI + Streamlit) consume este MLflow — Sec 13.5 — **APLICADO** (`modules/consumer-iam/` creado + cableado como Capa 10 en `envs/prod/main.tf`)
+> 6. MLflow local→prod (override del compose) — Sec 13.8 — **APLICADO** (`docker-compose.yml` permite override via `MLFLOW_TRACKING_URI`, `docker-compose.override.yml.example` provisto como template)
 >
-> Aplicarlos DESPUES de que Oleadas 1-5 esten funcionando. Cada patch
-> es independiente; podes adoptar 0, 1, varios o todos. Si los aplicas
-> en mitad de un stand-up, podes dejar el state Terraform inconsistente.
+> El orden recomendado de aplicacion (si los re-aplicaras de cero) esta
+> en §13.7. Cada patch es independiente; podes adoptar 0, 1, varios o
+> todos en un fork.
 
 ## 13.1 Scheduler L/Mi/V (en vez de L-V)
 
@@ -9572,6 +9974,16 @@ task infra:apply TARGET=module.cicd
 ```
 
 ### 13.2.2 Nuevo workflow `.github/workflows/auto-train-on-push.yml`
+
+> **HISTORICO — ABSORBIDO en `training.yml` (V2)**: este workflow se
+> creo como archivo separado en una primera version y luego se
+> **consolido en `.github/workflows/training.yml`** (ver §6.4). El
+> bloque YAML que sigue se mantiene como referencia historica para
+> entender la intencion del patch; **NO crear** el archivo
+> `auto-train-on-push.yml` en el repo. Si necesitas modificar la
+> logica auto-train-on-push, editar `training.yml` (job `detect` con
+> trigger `workflow_run: workflows:["Deploy"]` + jobs `wake-services`,
+> `train`, `cool-down-and-stop`, `promote`).
 
 ```yaml
 name: Auto-train on push
@@ -10083,7 +10495,7 @@ module "consumer_iam" {
   artifacts_bucket_arn = module.storage.artifacts_bucket_arn
   consumer_oidc_arn    = data.aws_iam_openid_connect_provider.github.arn
   consumer_org         = var.consumer_org  # ej "abantodca"
-  consumer_repo        = var.consumer_repo # ej "ml-serving"
+  consumer_repo        = var.consumer_repo # ej "ml_serving"
 }
 ```
 
@@ -10099,7 +10511,7 @@ variable "consumer_repo" { type = string }
 
 ```hcl
 consumer_org  = "abantodca"
-consumer_repo = "ml-serving"
+consumer_repo = "ml_serving"
 ```
 
 **d) `infra/envs/prod/outputs.tf`** — agregar al final, para poder
@@ -10142,7 +10554,7 @@ MLFLOW_TRACKING_URI = "http://<ALB-DNS>/"   # ya lo tenes
 
 ### 13.5.4 Snippet FastAPI que carga modelo Production
 
-En tu repo `ml-serving`, agregar:
+En tu repo `ml_serving`, agregar:
 
 ```python
 # src/serving/model_loader.py
@@ -10257,7 +10669,7 @@ st.markdown(f"[Abrir /reports/{variety}/]({ALB}/reports/{variety}/)")
 
 ### 13.5.7 Workflow CI del proyecto consumer (resumen)
 
-En el `ml-serving` repo, `.github/workflows/deploy.yml`:
+En el `ml_serving` repo, `.github/workflows/deploy.yml`:
 
 ```yaml
 permissions:
@@ -10282,7 +10694,7 @@ jobs:
 | Cosa | Donde vive | Por que |
 |---|---|---|
 | Trainer + Terraform + Task + GHA train | `ml_training` (este repo) | Owner del MLflow server, del Registry y de los modelos |
-| FastAPI inference + Streamlit UI | `ml-serving` (otro repo) | Consumer; ciclo de vida distinto (cambios de UI no requieren re-train) |
+| FastAPI inference + Streamlit UI | `ml_serving` (otro repo) | Consumer; ciclo de vida distinto (cambios de UI no requieren re-train) |
 | IAM role consumer | Modulo `consumer-iam` de **este** repo | El trust lo definimos del lado del owner del recurso |
 | MLFLOW_TRACKING_URI del consumer | Variable de GH del repo consumer | Se setea con el output `alb_dns` de este repo |
 
@@ -10293,8 +10705,8 @@ actualizar la variable del otro repo:
 ```bash
 NEW_ALB="$(terraform -chdir=infra/envs/prod output -raw alb_dns)"
 
-# Actualizar la variable en el repo ml-serving (requiere gh CLI auth en ambos repos)
-gh variable set MLFLOW_TRACKING_URI -b "http://${NEW_ALB}/" -R abantodca/ml-serving
+# Actualizar la variable en el repo ml_serving (requiere gh CLI auth en ambos repos)
+gh variable set MLFLOW_TRACKING_URI -b "http://${NEW_ALB}/" -R abantodca/ml_serving
 ```
 
 Si tenes muchos consumers, considera la Parte 10.1 (Route 53 + ACM)

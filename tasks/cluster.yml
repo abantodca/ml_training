@@ -13,6 +13,8 @@
 #   task cluster:scale-up                             encender (RDS + Fargate)
 #   task cluster:scale-down                           apagar (preserva infra)
 #   task cluster:wait-healthy                         polling ALB hasta 200
+#   task cluster:wake-and-wait                        wake idempotente (CI auto-train)
+#   task cluster:cool-down-and-stop                   sleep + stop (CI post-train)
 #   task cluster:teardown                             destroy volatiles
 #   task cluster:rebuild                              re-apply + scale-up
 # =============================================================================
@@ -133,6 +135,72 @@ tasks:
     internal: true
     cmds:
       - 'test -d {{.TF_DIR}} || { echo "ERROR {{.TF_DIR}} no existe. Aplicar infra: task infra:apply"; exit 1; }'
+
+  # ═══ Wake + cool-down (auto-train flow) ═════════════════════════════════════
+
+  wake-and-wait:
+    desc: "Wake idempotente: si MLflow esta DOWN invoca scheduler.start y espera RDS+ALB healthy. Escribe true|false a STATUS_FILE (default /tmp/wake-status)"
+    silent: true
+    cmds:
+      - |
+        STATUS_FILE="${STATUS_FILE:-/tmp/wake-status}"
+        ALB="${MLFLOW_ALB_DNS:-$(terraform -chdir={{.TF_DIR}} output -raw alb_dns 2>/dev/null)}"
+        if [ -z "$ALB" ]; then
+          echo "ERROR ALB no resuelto. Setear MLFLOW_ALB_DNS o aplicar infra"
+          exit 1
+        fi
+        echo ">>> Pre-check MLflow en http://$ALB/health"
+        if curl -fs -o /dev/null --max-time 5 "http://$ALB/health"; then
+          echo "WAS_UP=true (MLflow ya respondia, skip wake)"
+          echo "true" > "$STATUS_FILE"
+          exit 0
+        fi
+        echo "WAS_UP=false. Invocando scheduler.start..."
+        echo "false" > "$STATUS_FILE"
+        aws lambda invoke \
+          --function-name {{.SCHEDULER_FN}} \
+          --cli-binary-format raw-in-base64-out \
+          --payload '{"action":"start"}' \
+          /tmp/wake-start.out
+        cat /tmp/wake-start.out && echo ""
+
+        echo ">>> Esperando RDS available (24x30s = 12 min max)..."
+        STATUS=""
+        for i in $(seq 1 24); do
+          STATUS=$(aws rds describe-db-instances \
+                     --db-instance-identifier {{.PROJECT}}-mlflow \
+                     --query 'DBInstances[0].DBInstanceStatus' --output text 2>/dev/null || echo "missing")
+          echo "  $(date +%H:%M:%S)  RDS=$STATUS"
+          [ "$STATUS" = "available" ] && break
+          sleep 30
+        done
+        if [ "$STATUS" != "available" ]; then
+          echo "::error::RDS no available tras 12 min (estado=$STATUS)"
+          exit 1
+        fi
+
+        echo ">>> Esperando MLflow ALB 200 (30x10s = 5 min max)..."
+        CODE="000"
+        for i in $(seq 1 30); do
+          CODE=$(curl -fs -o /dev/null -w "%{http_code}" --max-time 5 "http://$ALB/health" || echo "000")
+          echo "  $(date +%H:%M:%S)  GET /health -> $CODE"
+          [ "$CODE" = "200" ] && break
+          sleep 10
+        done
+        if [ "$CODE" != "200" ]; then
+          echo "::error::MLflow no respondio 200 tras 5 min (code=$CODE)"
+          exit 1
+        fi
+        echo "OK wake completo. MLflow UP en http://$ALB/"
+
+  cool-down-and-stop:
+    desc: "Sleep COOLDOWN_SEC (default 600) y scale-down. Para flujos auto-train: da margen al sync S3 + lectura de dashboards antes de apagar"
+    vars:
+      COOLDOWN_SEC: '{{.COOLDOWN_SEC | default "600"}}'
+    cmds:
+      - 'echo "Cool-down {{.COOLDOWN_SEC}}s antes de apagar..."'
+      - sleep {{.COOLDOWN_SEC}}
+      - task: scale-down
 
   # ═══ Teardown / Rebuild ═════════════════════════════════════════════════════
 

@@ -6,8 +6,8 @@ set -euo pipefail
 
 PROJECT="${PROJECT:-ml-training}"
 REGION="${AWS_DEFAULT_REGION:-us-east-1}"
-# Mismas convenciones que 📖 0.4 (ACCOUNT_ID / ACCOUNT_SUFFIX) — si el
-# usuario ya las exporto en su sesion, las reusamos; sino las calculamos.
+# Mismas convenciones que GUIA_MLOPS_AWS_V2.md §3.5 (ACCOUNT_ID / ACCOUNT_SUFFIX) —
+# si el usuario ya las exporto en su sesion, las reusamos; sino las calculamos.
 ACCOUNT_ID="${ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text)}"
 ACCOUNT_SUFFIX="${ACCOUNT_SUFFIX:-${ACCOUNT_ID: -6}}"
 TFSTATE_BUCKET="${PROJECT}-tfstate-${ACCOUNT_SUFFIX}"

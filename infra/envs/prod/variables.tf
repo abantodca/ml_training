@@ -32,7 +32,7 @@ variable "github_repo" {
 }
 
 variable "varieties_allowed" {
-  description = "Variedades validas. Tiene que matchear src/orchestration/cli.py:resolve_varieties."
+  description = "Allow-list defensivo para el Lambda dispatcher (rechaza submits con variety no listada). NO define las variedades del modelo: la verdad esta en las hojas del Excel (data/BD_HISTORICO_ACUMULADO.xlsx) y se descubre dinamicamente con src/step_01_load/data_loader.py::list_varieties(). Esta lista solo previene typos en `aws lambda invoke`."
   type        = list(string)
   default     = ["POP", "JUPITER", "VENTURA", "SEKOYA", "ALLISON", "STELLA"]
 }

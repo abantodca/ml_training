@@ -380,6 +380,7 @@ tasks:
 
   clean:docker:
     desc: "DESTRUCTIVO: detiene servicios y borra volumen Postgres. Pierde TODO el historial MLflow (metadata). Los artifacts en S3 real NO se tocan. La imagen del trainer se conserva"
+    prompt: "Esto borra TODO el historial MLflow (metadata). Artifacts en S3 no se tocan. Continuar?"
     cmds:
       - docker compose down -v
 
