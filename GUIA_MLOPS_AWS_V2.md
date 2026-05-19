@@ -11,28 +11,36 @@
 
 ## Tabla de contenidos
 
-**Tramo I — Entorno local (desde cero)**
+### 🏠 Tramo I — Entorno local (Capítulos 1-4)
 
-- [Capítulo 1 · Visión general](#capítulo-1--visión-general)
-- [Capítulo 2 · Decisiones fijas](#capítulo-2--decisiones-fijas)
-- [Capítulo 3 · Prerrequisitos del host](#capítulo-3--prerrequisitos-del-host)
-- [Capítulo 4 · Entorno local desde cero](#capítulo-4--entorno-local-desde-cero)
+> Construir el binario y validarlo en tu máquina, con Docker. **No avances al Tramo II** hasta que el smoke local termine en verde.
 
-**Tramo II — AWS (producción)**
+| § | Capítulo | Qué se hace |
+|---|---|---|
+| 1 | [Visión general](#capítulo-1--visión-general) | Qué entrenamos, dos entornos una imagen, endpoints, costo objetivo |
+| 2 | [Decisiones fijas](#capítulo-2--decisiones-fijas) | Qué no se discute (lenguaje, runtime, region, modelos) |
+| 3 | [Prerrequisitos del host](#capítulo-3--prerrequisitos-del-host) | Herramientas, WSL, credenciales AWS, variables de sesión |
+| 4 | [Entorno local desde cero](#capítulo-4--entorno-local-desde-cero) | `.dockerignore`, `Dockerfile`, compose, Taskfile, smoke + verificación |
 
-- Parte 1 · Lifecycle (stand-up / tear-down / rebuild / destroy)
-- Parte 2 · Bootstrap irreversible (S3 backend + DynamoDB + OIDC)
-- Parte 3 · Módulos Terraform
-- Parte 4 · Apply incremental + smoke test
-- Parte 5 · Patch del trainer (MAPE a CloudWatch)
-- Parte 6 · CI/CD con GitHub Actions
-- Parte 7 · Promotion gate
-- Parte 8 · Runbook operativo extendido
-- Parte 9 · Costos detallados
-- Parte 10 · Hardening (futuro)
-- Parte 11 · Troubleshooting (catálogo)
-- Parte 12 · Apéndices (glosario, conceptos, mapa de archivos)
-- Parte 13 · Customizaciones puntuales (addendum, opcional)
+### ☁️ Tramo II — Producción AWS (Partes 1-13)
+
+> Mismo binario, promovido a AWS Batch + MLflow productivo via Terraform + Task + GitHub Actions.
+
+| § | Parte | Qué se hace |
+|---|---|---|
+| 1 | [Lifecycle](#parte-1--overview-del-lifecycle-y-stand-up) | Modos: STAND-UP / TEAR-DOWN / REBUILD / DESTROY |
+| 2 | [Bootstrap irreversible](#parte-2--bootstrap-irreversible) | Backend Terraform (S3 + DynamoDB) + OIDC (UNA VEZ) |
+| 3 | [Módulos Terraform](#parte-3--modulos-terraform) | network · storage · mlflow · reports · batch · monitoring · lambdas · scheduler · cicd · consumer-iam |
+| 4 | [Apply incremental + smoke](#parte-4--apply-incremental--smoke-test) | `tasks/*.yml` AWS + Olas A/B/C + smoke end-to-end |
+| 5 | [Patch trainer → CloudWatch](#parte-5--patch-del-trainer-emitir-mape-a-cloudwatch) | Emitir métrica MAPE custom |
+| 6 | [CI/CD con GitHub Actions](#parte-6--cicd-con-github-actions) | Workflows `deploy.yml` · `training.yml` · `destroy.yml` |
+| 7 | [Promotion gate](#parte-7--promotion-gate-extendido) | Staging → Production con MAPE + A/B + approval |
+| 8 | [Runbook operativo](#parte-8--runbook-operativo-extendido) | Diario · semanal · incidentes · TEAR-DOWN · REBUILD · DESTROY |
+| 9 | [Costos detallados](#parte-9--costos-detallados) | ~$68/mes con scheduler L-V 08-12 PET |
+| 10 | [Hardening (futuro)](#parte-10--hardening-production-grade-futuro) | TLS · WAF · VPC endpoints · Multi-AZ · KMS |
+| 11 | [Troubleshooting (catálogo)](#parte-11--troubleshooting-catalogo) | Errores comunes y fixes |
+| 12 | [Apéndices](#parte-12--apendices) | Glosario · conceptos · mapa de archivos · changelog |
+| 13 | [Customizaciones (addendum)](#parte-13--customizaciones-puntuales-patches-aplicados-post-auditoria-2026-05-18) | 5 patches aplicados post-auditoría |
 
 ---
 
@@ -49,9 +57,17 @@
 - **Una sola imagen**: el `Dockerfile` que usa `task build` localmente es el
   mismo binario que `task ecr:build IMG=trainer` empuja a ECR en producción.
 - **Convención de avisos**:
-  - `> **Nota** — …` aclara el porqué de una decisión.
+  - `> **Nota** — …` aclara el porqué de una decisión (inline, dentro de pasos).
   - `> **Warning** — …` señala riesgos reales (pérdida de datos, costo
-    inesperado, operación irreversible).
+    inesperado, operación irreversible) dentro de pasos.
+  - Para transiciones críticas entre Partes/Capítulos se usan **callouts
+    GitHub-flavored**, que en GitHub.com y la mayoría de previews renderean
+    como cajas coloreadas:
+    - `> [!NOTE]` — información complementaria.
+    - `> [!TIP]` — atajo o mejor práctica.
+    - `> [!IMPORTANT]` — paso que **no se puede saltear**.
+    - `> [!WARNING]` — operación con riesgo de pérdida de tiempo o datos.
+    - `> [!CAUTION]` — operación **irreversible** (destroy, nuke, force-push).
 - **Convención de verificación**: cada bloque importante cierra con un
   comando o tabla que valida el estado. Si falla, parar y resolver antes
   de seguir.
@@ -240,6 +256,12 @@ aws sts get-caller-identity
 
 ### 3.4 Service quotas (sólo para Tramo II)
 
+> [!NOTE]
+> **Salteable si solo vas a trabajar en Tramo I (local con Docker).** Los
+> aumentos de quota de EC2 son únicamente necesarios para AWS Batch (Tramo
+> II Parte 4). Si por ahora solo querés validar el binario en tu laptop,
+> volvé a esta sección antes de la Parte 2 del Tramo II.
+
 Los aumentos tardan 24-48 h: pedirlos **antes** del primer `terraform apply`.
 
 | Servicio | Quota | Mínimo |
@@ -257,26 +279,39 @@ aws service-quotas request-service-quota-increase \
 
 ### 3.5 Variables de sesión
 
-Setear una vez por terminal antes de operar Tramo II:
+> [!TIP]
+> **Tramo I** (local con Docker) sólo necesita `AWS_PROFILE` y
+> `AWS_DEFAULT_REGION` (los buckets sandbox los resuelve `tasks/local.yml`
+> internamente via `aws sts get-caller-identity`). **Tramo II** requiere
+> además `PROJECT`, `ACCOUNT_ID` y `ACCOUNT_SUFFIX` porque los bloques
+> `bash` manuales de Partes 1-2 (bootstrap) los referencian de tu shell.
+> Si arrancás solo con Tramo I, podés exportar únicamente los 2 primeros
+> y volver a esta sección antes de empezar Tramo II.
+
+Setear una vez por terminal:
 
 ```bash
+# === MINIMO para Tramo I (local) ===
 export AWS_DEFAULT_REGION="us-east-1"
 export AWS_PROFILE="default"          # o el profile que uses
+
+# === ADICIONALES para Tramo II (AWS) ===
 export PROJECT="ml-training"
 export ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
 export ACCOUNT_SUFFIX="${ACCOUNT_ID: -6}"
 ```
 
-| Variable | Valor | Usada para |
-|---|---|---|
-| `$PROJECT` | `ml-training` | Prefijo de todos los recursos AWS. |
-| `$ACCOUNT_ID` | 12 dígitos | tfstate bucket, ECR URIs, role ARNs. |
-| `$ACCOUNT_SUFFIX` | 6 dígitos | Sufijo de buckets, evita colisión cross-account. |
-| `$AWS_DEFAULT_REGION` | `us-east-1` | Scope del deployment. |
+| Variable | Valor | Tramo | Usada para |
+|---|---|---|---|
+| `$AWS_DEFAULT_REGION` | `us-east-1` | I + II | Scope (compose lo lee, Taskfile lo propaga). |
+| `$AWS_PROFILE` | `default` | I + II | Credenciales AWS (compose monta `~/.aws:ro`). |
+| `$PROJECT` | `ml-training` | II | Prefijo de todos los recursos AWS. |
+| `$ACCOUNT_ID` | 12 dígitos | II | tfstate bucket, ECR URIs, role ARNs. |
+| `$ACCOUNT_SUFFIX` | 6 dígitos | II | Sufijo de buckets, evita colisión cross-account. |
 
-> **Nota** — Estas variables las usan los bloques `bash` manuales (Tramo II,
-> Partes 1-2). Los Taskfiles (`tasks/*.yml`) las recalculan internamente con
-> `aws sts get-caller-identity`; no las heredan del shell.
+> **Nota** — En Tramo II, estas variables las usan los bloques `bash`
+> manuales (Partes 1-2). Los Taskfiles (`tasks/*.yml`) las recalculan
+> internamente con `aws sts get-caller-identity`; no las heredan del shell.
 
 > **🔄 Al re-ejecutar esta seccion**:
 > - **Verificar prereqs**: `docker --version && task --version && terraform version && aws --version` debe imprimir las 4 versiones sin error.
@@ -347,32 +382,39 @@ imagen crece innecesariamente.
 Crear `.dockerignore` en la raíz:
 
 ```gitignore
-# Git
+# =============================================================================
+# .dockerignore — qué NO entra al build context que se envia al daemon
+# =============================================================================
+# Filosofia: el Dockerfile usa COPY selectivo (solo src/, scripts/, main.py,
+# requirements.txt). Este archivo acelera el envio al daemon ignorando todo
+# lo que no se va a usar nunca durante el build.
+
+# ── Git ──────────────────────────────────────────────────────────────────
 .git/
 .gitignore
 .gitattributes
 
-# Datos locales (se montan como volumen en runtime)
+# ── Datos locales (se montan como volumen en runtime, no van en la imagen)
 data/
 
-# Salidas (se generan en runtime, montadas como volumen)
+# ── Salidas (se generan en runtime, montadas como volumen) ───────────────
 artifacts/
 logs/
 reports/
 
-# Legacy del modo file://
+# ── Legacy del modo file:// (ADR-001) ────────────────────────────────────
 mlruns/
 
-# Notebooks y experimentación
+# ── Notebooks y experimentacion ──────────────────────────────────────────
 notebooks/
 
-# Cache Python
+# ── Cache Python ─────────────────────────────────────────────────────────
 __pycache__/
 **/__pycache__/
 *.py[cod]
 *.pyo
 
-# Tests y caches de tooling
+# ── Tests y caches de tooling (no van a la imagen de runtime) ────────────
 tests/
 .pytest_cache/
 .mypy_cache/
@@ -380,19 +422,55 @@ tests/
 .coverage
 htmlcov/
 
-# Entornos virtuales
+# ── Entornos virtuales ───────────────────────────────────────────────────
 .venv/
 venv/
 env/
 
-# IDE
+# ── IDE ──────────────────────────────────────────────────────────────────
 .vscode/
 .idea/
 
-# Documentación
-*.md
+# ── Documentacion (no necesaria en runtime; el build context vuela menos) ─
 docs/
+*.md
+LICENSE
+
+# ── Meta de build / orquestacion del HOST (el container no las necesita) ──
+Taskfile.yml
+Taskfile.*.yml
+docker-compose.yml
+docker-compose.*.yml
+docker/
+Dockerfile
+.dockerignore
+
+# ── Dev-only deps (la imagen runtime usa solo requirements.txt) ──────────
+requirements-dev.txt
+
+# ── Variables de entorno locales (NUNCA en la imagen) ────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Claude Code / agentes ────────────────────────────────────────────────
+.claude/
+
+# ── Sistema operativo ────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── Archivos temporales ──────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
 ```
+
+> **Nota** — Las secciones "Meta de build", "Variables locales" y `.claude/`
+> son críticas: sin ellas, `Taskfile.yml`, `docker-compose.yml`, tu `.env`
+> con buckets reales y la carpeta `.claude/` (agentes locales) se copiarían
+> a la imagen. La regla `!.env.example` re-incluye explícitamente la
+> plantilla pública, que sí queremos en `docs/` y como referencia.
 
 **Verificación**
 
@@ -701,12 +779,23 @@ volumes:
 
 Task orquesta tres cosas: (a) build/up/down de Docker, (b) ejecutar el
 trainer con argumentos parametrizables, (c) operaciones AWS namespaced
-(`infra:`, `ecr:`, `batch:`, …). Los namespaces AWS se importan desde
-`tasks/*.yml` que se construyen en la Parte 4 — por ahora declaramos los
-`includes:` para que el Taskfile esté listo, y dejamos que `task --list`
-funcione aunque las tasks AWS aún no existan.
+(`infra:`, `ecr:`, `batch:`, …). En Tramo I sólo necesitamos (a) y (b)
++ un namespace `local:` para crear buckets sandbox S3. Los namespaces
+AWS (`infra:`, `ecr:`, `batch:`, `cluster:`, `mlflow-aws:`, `aws:`)
+se agregan en Tramo II Parte 4 §4.1.10 — cuando los `tasks/*.yml`
+correspondientes ya existan. Declararlos ahora rompería `task --list`
+con "open ./tasks/X.yml: no such file".
 
 #### 4.6.1 Raíz `Taskfile.yml`
+
+> [!NOTE]
+> Esta es la versión **Tramo I (local)** del Taskfile. Solo importa el
+> namespace `local:` (que vas a crear en §4.6.2, sirve para buckets
+> sandbox S3). Los namespaces AWS (`infra:`, `ecr:`, `batch:`,
+> `cluster:`, `mlflow-aws:`, `aws:`) se añaden recién en Tramo II Parte
+> 4 §4.1.10 — cuando ya existan los `tasks/*.yml` correspondientes.
+> Pegar acá el Taskfile completo final con `includes:` AWS rompería
+> `task --list` por archivos faltantes.
 
 ```yaml
 version: "3"
@@ -714,16 +803,14 @@ version: "3"
 # `.env` es opcional. Si no existe, los defaults de config.py aplican.
 dotenv: [ ".env" ]
 
-# Cada include prefija con su namespace, así las tasks locales no
-# chocan con las AWS (infra:apply, ecr:build, ...).
+# Tramo I: solo importamos el namespace `local:` (buckets sandbox S3).
+# Los namespaces AWS se agregan en Tramo II Parte 4 §4.1.10.
 includes:
-  infra:      { taskfile: ./tasks/infra.yml,           vars: { PROJECT: '{{.PROJECT}}', REGION: '{{.REGION}}' } }
-  ecr:        { taskfile: ./tasks/ecr.yml,             vars: { PROJECT: '{{.PROJECT}}', REGION: '{{.REGION}}' } }
-  batch:      { taskfile: ./tasks/batch.yml,           vars: { PROJECT: '{{.PROJECT}}', REGION: '{{.REGION}}' } }
-  cluster:    { taskfile: ./tasks/cluster.yml,         vars: { PROJECT: '{{.PROJECT}}', REGION: '{{.REGION}}' } }
-  mlflow-aws: { taskfile: ./tasks/mlflow_registry.yml, vars: { PROJECT: '{{.PROJECT}}', REGION: '{{.REGION}}' } }
-  aws:        { taskfile: ./tasks/aws.yml,             vars: { PROJECT: '{{.PROJECT}}', REGION: '{{.REGION}}' } }
-  local:      { taskfile: ./tasks/local.yml,           vars: { PROJECT: '{{.PROJECT}}', REGION: '{{.REGION}}' } }
+  local:
+    taskfile: ./tasks/local.yml
+    vars:
+      PROJECT: '{{.PROJECT}}'
+      REGION: '{{.REGION}}'
 
 vars:
   TUNING:    '{{.TUNING    | default "prod"}}'
@@ -858,6 +945,144 @@ Perfiles de `TUNING`:
 | `prod` | ~2 h | 5×3 | Producción (default) |
 | `prod_xl` | ~6 h | 6×3 | Búsqueda exhaustiva (overnight) |
 
+#### 4.6.1.1 Banners UX LOCAL (`default`, `help`) — opcional
+
+> **Nota** — Estas dos tasks son **sólo `echo`** (no tocan estado) y
+> existen para que `task` sin argumentos muestre un quick-start, y
+> `task help` imprima la referencia completa LOCAL. Funcionalmente la
+> guía corre sin ellas; agregarlas mejora la ergonomía del repo.
+> Pegar este bloque **dentro de `tasks:`**, antes de `lint:` (por
+> convención van al inicio bajo el comentario `# ═══ Ayuda ═══`).
+>
+> El banner `help:aws` (referencia de tasks AWS) **no se agrega en
+> Tramo I** — los comandos que mostraría no existen todavía. Se añade
+> en Tramo II Parte 4 §4.1.10 junto con los `includes:` AWS.
+
+```yaml
+  # ═══ Ayuda ══════════════════════════════════════════════════════════════
+
+  default:
+    desc: "Quick-start guiado (Tramo I local). Mas detalle: `task help`"
+    silent: true
+    cmds:
+      - |
+        echo ""
+        echo "==================================================================="
+        echo " ml_training - predice productividad de cosecha por variedad"
+        echo "==================================================================="
+        echo ""
+        echo " QUE HACE: Entrena modelos ML (XGBoost + LightGBM) para predecir"
+        echo " kg/jornal-hora por variedad. El sistema elige automaticamente"
+        echo " el mejor algoritmo."
+        echo ""
+        echo " Este Taskfile es la version LOCAL (Tramo I de la guia)."
+        echo " Tras completar Tramo II Parte 4, este banner se amplia con la"
+        echo " seccion AWS y aparece el comando `task help:aws`."
+        echo ""
+        echo " ================================================================="
+        echo " PRIMERA VEZ (ejecuta en orden, copia y pega linea x linea):"
+        echo " ================================================================="
+        echo ""
+        echo "   1) task build                              construye el entorno (5-10 min)"
+        echo "   2) task data:split                         prepara los datos historicos"
+        echo "   3) task eda VARIETIES=POP                  revisa la calidad de los datos"
+        echo "   4) task train VARIETIES=POP TUNING=smoke   prueba rapida (~1 min) para"
+        echo "                                              confirmar que todo corre OK"
+        echo ""
+        echo " ================================================================="
+        echo " DIA A DIA (entorno ya construido):"
+        echo " ================================================================="
+        echo ""
+        echo "   task up                                       enciende los servicios"
+        echo "   task train VARIETIES=POP TUNING=prod          entrenamiento real (~2 h)"
+        echo "   task train VARIETIES=all PARALLEL=3           todas las variedades en paralelo"
+        echo "   task logs                                     ver progreso del entrenamiento"
+        echo "   task down                                     apaga los servicios al terminar"
+        echo ""
+        echo "   Resultados (servicios encendidos):"
+        echo "     http://localhost:5000           MLflow: ranking de entrenamientos"
+        echo "     http://localhost:8080/reports/  Dashboards HTML por variedad"
+        echo ""
+        echo " -----------------------------------------------------------------"
+        echo " GLOSARIO RAPIDO:"
+        echo " -----------------------------------------------------------------"
+        echo ""
+        echo "   VARIETIES   que variedades entrenar: POP, VENTURA, JUPITER, ... o 'all'"
+        echo "   TUNING      cuanto tarda buscando el mejor modelo:"
+        echo "                  smoke    ~1 min    prueba rapida de que todo corre"
+        echo "                  dev      ~20 min   baseline para iterar codigo/features"
+        echo "                  prod     ~2 h      entrenamiento de produccion (default)"
+        echo "                  prod_xl  ~6 h      busqueda exhaustiva (overnight)"
+        echo "   PARALLEL    cuantas variedades entrenar al mismo tiempo (default 1)"
+        echo ""
+        echo "   Ejemplo: task train VARIETIES=POP,VENTURA TUNING=dev PARALLEL=2"
+        echo ""
+        echo " -----------------------------------------------------------------"
+        echo " MAS COMANDOS:"
+        echo " -----------------------------------------------------------------"
+        echo ""
+        echo "   task help          referencia completa LOCAL (Docker en tu maquina)"
+        echo "   task --list        listado plano de TODOS los comandos disponibles"
+        echo ""
+        echo "==================================================================="
+        echo ""
+
+  help:
+    desc: "Referencia completa local: workflow, variables, URLs, cleanup"
+    silent: true
+    cmds:
+      - |
+        echo ""
+        echo "==================================================================="
+        echo " ml_training - referencia completa (comandos locales)"
+        echo "==================================================================="
+        echo ""
+        echo "PRIMERA VEZ (setup inicial, ejecutar en orden):"
+        echo "   task build                                  imagen + servicios + URLs"
+        echo "   task data:split                             Genera DB-HISTORICA.xlsx"
+        echo "   task eda VARIETIES=POP                      EDA estadistico (BP/DW/ADF/VIF/MI/PSI)"
+        echo "   task train VARIETIES=POP TUNING=smoke       primer sanity check (~1 min)"
+        echo ""
+        echo "DIA A DIA (servicios ya construidos):"
+        echo "   task up                                     levanta servicios sin rebuild"
+        echo "   task train VARIETIES=POP TUNING=dev         baseline           (~20 min)"
+        echo "   task train VARIETIES=POP TUNING=prod        produccion         (~2 h)"
+        echo "   task train VARIETIES=all PARALLEL=3         todas en paralelo"
+        echo "   task logs                                   tail trainer + mlflow"
+        echo "   task reports:dashboard                      regenera reports/index_static.html"
+        echo "   task down                                   detiene servicios"
+        echo ""
+        echo "TRAS CAMBIO DE CODIGO O REQUIREMENTS:"
+        echo "   task build                                  rebuild imagen + up"
+        echo ""
+        echo "   El sistema entrena XGB y LGB y elige el campeon por variedad."
+        echo "   No se puede forzar un modelo: el contrato del proyecto es"
+        echo "   que la maquina decida (lex-order: gap -> MAPE -> tiempo)."
+        echo ""
+        echo "VARIABLES (override por CLI):"
+        echo "   VARIETIES = \"POP\" | \"POP,VENTURA\" | \"all\"            (default POP)"
+        echo "   TUNING    = smoke (~1m) | dev (~20m) | prod (~2h, default) | prod_xl (~6h)"
+        echo "   PARALLEL  = N variedades en paralelo                  (default 1)"
+        echo ""
+        echo "URLS (servicios up):"
+        echo "   http://localhost:5000              MLflow UI (tracking + Registry)"
+        echo "   http://localhost:8080/reports/     Dashboards HTML por variedad"
+        echo "   http://localhost:8080/artifacts/   joblib + run_summary + best_params"
+        echo "   s3://...                           Backend de artifacts MLflow (S3 sandbox)"
+        echo ""
+        echo "CLEANUP local:   task clean:docker   (DESTRUCTIVO: borra volumen Postgres)"
+        echo "==================================================================="
+        echo ""
+```
+
+**Verificación**
+
+```bash
+task            # debe mostrar el banner default Tramo I (sin argumentos)
+task help       # referencia LOCAL
+# Nota: `task help:aws` NO existe todavia — se agrega en Tramo II Parte 4 §4.1.10
+```
+
 #### 4.6.2 `tasks/local.yml`
 
 Helper para crear los buckets S3 sandbox de forma idempotente. Se invoca
@@ -932,11 +1157,9 @@ tasks:
 task --list
 # Debe mostrar: build, up, down, train, data:split, eda, lint, test,
 # reports:dashboard, local:ensure-buckets, local:bucket-name
-# Ademas el repo real expone tres tasks de ayuda UX:
-#   default     — banner quick-start (lo que ves al correr `task` sin args)
-#   help        — referencia completa de comandos LOCALES
-#   help:aws    — referencia completa de comandos AWS (Tramo II)
-# Estas tres son `echo` de bloques de texto, no afectan estado.
+# Si pegaste §4.6.1.1 (banners UX), tambien aparecen: default, help.
+# Nota: help:aws NO aparece todavia — se agrega en Tramo II Parte 4 §4.1.10.1
+# junto con los includes AWS.
 ```
 
 Si `task --list` da errores tipo `failed to read taskfile`, revisar
@@ -948,6 +1171,15 @@ indentación YAML — Task es estricto con tabs vs spaces.
 > - **Commit sugerido**: `feat(taskfile): tasks locales + namespace local:`
 
 ### 4.7 `.env.example` y `.env`
+
+> [!NOTE]
+> Este `.env.example` es **self-contained** para Tramo I. Las únicas
+> variables **obligatorias** son los dos buckets S3 sandbox, que vas a
+> crear en §4.8 con `task local:ensure-buckets`. Las demás tienen
+> defaults sanos y las vars comentadas son opcionales (no requieren
+> setearse para que el smoke local pase). En Tramo II este mismo
+> archivo se reusa tal cual — el binario es el mismo, sólo cambian los
+> nombres de buckets (de sandbox a productivos).
 
 `docker-compose.yml` exige dos variables obligatorias
 (`S3_MLFLOW_BUCKET`, `S3_ARTIFACTS_BUCKET`); las demás tienen defaults
@@ -963,7 +1195,7 @@ sanos.
 AWS_PROFILE=default
 AWS_DEFAULT_REGION=us-east-1
 
-# Postgres (MLflow backend store)
+# Postgres (MLflow backend store local)
 # Default sano para localhost-only. Override en cualquier entorno
 # compartido o VM en red.
 # POSTGRES_PASSWORD=mlflow
@@ -972,13 +1204,14 @@ AWS_DEFAULT_REGION=us-east-1
 # TRAINER_MEM=8g
 # TRAINER_CPUS=4
 
-# Buckets S3 (REQUERIDOS)
-# Crear con `task local:ensure-buckets` (§4.8)
+# Buckets S3 SANDBOX (REQUERIDOS para Tramo I)
+# Crear con `task local:ensure-buckets` (§4.8).
 # Pueden ser el mismo bucket si no necesitás políticas IAM separadas.
+# En Tramo II se reemplazan por los buckets productivos creados via Terraform.
 S3_MLFLOW_BUCKET=ml-training-artifacts-XXXXXX
 S3_ARTIFACTS_BUCKET=ml-training-artifacts-XXXXXX
 
-# MLflow (opcional)
+# MLflow (opcional — útil si querés apuntar a un MLflow remoto)
 # MLFLOW_TRACKING_URI=http://localhost:5000
 # MLFLOW_EXPERIMENT_PREFIX=
 # MODEL_REGISTRY_PREFIX=rnd-forest-
@@ -1050,6 +1283,12 @@ aws s3api get-bucket-versioning --bucket "ml-training-artifacts-${SUFFIX}"
 > - **Commit sugerido**: N/A (operacion AWS, no genera archivos).
 
 ### 4.9 Primera ejecución
+
+> [!TIP]
+> Este es el **smoke test del Tramo I**. Si los 3 comandos pasan, tenés
+> infraestructura local sana y podés iterar sobre código del trainer sin
+> tocar AWS. Si algo rompe, los §4.10 (verificación) y §4.12
+> (troubleshooting) cubren los 5 fallos comunes.
 
 Tres comandos en orden, no saltearse:
 
@@ -1183,6 +1422,30 @@ Lo que **sí cambia**:
 
 > **Nota** — Si querés que tu laptop entrene contra el MLflow productivo
 > (sin runs locales huérfanos en el Postgres local), ver Parte 13.8.
+
+---
+
+# ☁️ Tramo II — Producción AWS
+
+> El mismo binario que validaste en Tramo I se promueve aquí a AWS Batch +
+> MLflow productivo. La infraestructura se levanta con Terraform por capas
+> (módulos), Task orquesta builds y lifecycle, y GitHub Actions automatiza
+> deploy/training/destroy via OIDC.
+
+> [!IMPORTANT]
+> **No empieces el Tramo II sin haber pasado el smoke local del Capítulo 4**
+> (`task train VARIETIES=POP TUNING=smoke` exitoso, MLflow UI mostrando el
+> run, joblib del champion en `artifacts/`). Si el smoke local rompe, AWS
+> sólo va a amplificar el problema y vas a pagar minutos de Batch para
+> debug que es más rápido en Docker.
+
+**Orden de lectura en el Tramo II:**
+1. **Parte 1** — entender los 4 modos de lifecycle (lo que vas a hacer / no hacer).
+2. **Parte 2** — bootstrap UNA VEZ por cuenta (irreversible si se hace mal).
+3. **Parte 3** — construir los 10 módulos Terraform.
+4. **Parte 4** — orquestador Task + apply incremental + smoke en AWS.
+5. **Partes 5-7** — emitir métricas, CI/CD, promotion gate.
+6. **Partes 8-13** — runbook, costos, hardening, troubleshooting, customizaciones.
 
 ---
 
@@ -1411,6 +1674,14 @@ echo "    bucket=$TFSTATE_BUCKET  lock=$LOCK_TABLE  region=$REGION"
 > - **Commit sugerido**: `chore(infra): bootstrap script para tfstate + DDB lock`
 
 ## 2.3 Ejecutar UNA vez
+
+> [!IMPORTANT]
+> Este bootstrap **se corre exactamente una vez por cuenta + región**. Crea
+> el bucket `tfstate` (que guarda el state de TODA la infra) y la tabla
+> DynamoDB de locks. Es idempotente, así que re-ejecutarlo no rompe nada,
+> pero **destruir el bucket tfstate** sólo se hace en `aws:nuke` (§8.7) — y
+> si lo borrás a mano sin nuke, pierdes el historial Terraform y el próximo
+> `terraform plan` ve toda la infra como "a crear" aunque ya exista.
 
 ```bash
 # Desde la raiz del repo (WSL Ubuntu o bash nativo Linux/Mac)
@@ -5576,6 +5847,8 @@ cd ../../..
 > - **Verificar**: el loop completo de §3.12.2 + el `terraform validate` de envs/prod en §3.12.3 deben pasar TODOS los modulos con "Success! The configuration is valid."
 > - **Pitfall tipico**: si un modulo dice "Module not installed" durante validate, falto `init -backend=false` para ese modulo
 
+---
+
 # Parte 4 — Apply incremental + smoke test
 
 > **Filosofia de la Parte 4**: aplicar Terraform en 3 olas en vez de un
@@ -6881,14 +7154,15 @@ descartable; despues requiere correr `infra:bootstrap` +
 > - **Pitfall tipico**: `aws:nuke` borra el OIDC provider que pueden estar usando otros repos en la misma cuenta — chequear con `aws iam list-open-id-connect-providers` antes
 > - **Commit sugerido**: `feat(tasks/aws): orquestadores high-level + nuke`
 
-### 4.1.10 Anadir `includes:` al Taskfile raiz + verificacion final
+### 4.1.10 Ampliar `includes:` del Taskfile raiz + banners AWS
 
-Ahora que los 7 `tasks/*.yml` existen (§4.1.4 a §4.1.9 + §4.1.11),
-agregar el bloque `includes:` al `Taskfile.yml` raiz, **despues de
-`dotenv:` y antes de `vars:`**:
+Ahora que los 6 `tasks/*.yml` AWS existen (§4.1.4 a §4.1.9), y que el
+namespace `local:` ya estaba presente desde Tramo I §4.6.1, **reemplazar
+el bloque `includes:`** del `Taskfile.yml` raiz por este, que agrega
+los 6 namespaces AWS:
 
 ```yaml
-# === ANADIR despues del bloque dotenv existente ===
+# === REEMPLAZAR el bloque `includes:` actual (que solo tenia `local:`) ===
 # Modulos AWS por dominio. Cada include prefija con su namespace, asi las
 # tasks locales (build, up, train, ...) no chocan con las AWS (infra:apply,
 # ecr:build, ...).
@@ -6954,6 +7228,163 @@ partir de aca, las oleadas A/B/C (§4.2 a §4.5) usan estas tasks.
 > **🔄 Al re-ejecutar esta seccion**:
 > - **Verificar**: `task --summary aws:deploy` debe expandir 3 etapas (storage / build-all / apply full)
 > - **Pitfall tipico**: si pegas `includes:` ANTES de que existan los `tasks/*.yml`, `task --list` falla con "open ./tasks/X.yml: no such file"
+
+#### 4.1.10.1 Ampliar banners UX: `default` (versión AWS) + `help:aws`
+
+Con los namespaces AWS ya cableados, los banners de §4.6.1.1 (Tramo I) se
+amplían. Hay dos cambios:
+
+1. **Reemplazar** la task `default:` por la versión completa (LOCAL + AWS
+   + GLOSARIO ampliado).
+2. **Añadir** la task `help:aws:` (referencia completa de tasks AWS).
+
+Pegar dentro de `tasks:`, bajo el comentario `# ═══ Ayuda ═══`:
+
+```yaml
+  # ═══ Ayuda (versión Tramo II — REEMPLAZA `default:` de Tramo I) ════════
+
+  default:
+    desc: "Quick-start guiado (local + AWS). Mas detalle: `task help` o `task help:aws`"
+    silent: true
+    cmds:
+      - |
+        echo ""
+        echo "==================================================================="
+        echo " ml_training - predice productividad de cosecha por variedad"
+        echo "==================================================================="
+        echo ""
+        echo " QUE HACE: Entrena modelos ML (XGBoost + LightGBM) para predecir"
+        echo " kg/jornal-hora por variedad. El sistema elige automaticamente"
+        echo " el mejor algoritmo. Dos entornos:"
+        echo ""
+        echo "   [LOCAL]  Docker en tu maquina - desarrollo + experimentos"
+        echo "   [AWS]    Produccion en la nube - batch training + registry"
+        echo ""
+        echo " ================================================================="
+        echo " [LOCAL] PRIMERA VEZ (ejecuta en orden, copia y pega linea x linea):"
+        echo " ================================================================="
+        echo ""
+        echo "   1) task build                              construye el entorno (5-10 min)"
+        echo "   2) task data:split                         prepara los datos historicos"
+        echo "   3) task eda VARIETIES=POP                  revisa la calidad de los datos"
+        echo "   4) task train VARIETIES=POP TUNING=smoke   prueba rapida (~1 min) para"
+        echo "                                              confirmar que todo corre OK"
+        echo ""
+        echo " ================================================================="
+        echo " [LOCAL] DIA A DIA (entorno ya construido):"
+        echo " ================================================================="
+        echo ""
+        echo "   task up                                       enciende los servicios"
+        echo "   task train VARIETIES=POP TUNING=prod          entrenamiento real (~2 h)"
+        echo "   task train VARIETIES=all PARALLEL=3           todas las variedades en paralelo"
+        echo "   task logs                                     ver progreso del entrenamiento"
+        echo "   task down                                     apaga los servicios al terminar"
+        echo ""
+        echo "   Resultados (servicios encendidos):"
+        echo "     http://localhost:5000           MLflow: ranking de entrenamientos"
+        echo "     http://localhost:8080/reports/  Dashboards HTML por variedad"
+        echo ""
+        echo " ================================================================="
+        echo " [AWS] PRODUCCION (requiere credenciales AWS configuradas):"
+        echo " ================================================================="
+        echo ""
+        echo "   task aws:deploy                               stand-up completo del stack"
+        echo "   task aws:wake  /  task aws:sleep              encender / apagar stack"
+        echo "   task batch:train VARIETIES=POP TUNING=prod    entrenar en AWS Batch"
+        echo "   task mlflow-aws:promote MODEL_NAME=rnd-forest-POP VERSION=N  promover modelo a Production"
+        echo ""
+        echo "   task help:aws                                 referencia AWS completa"
+        echo ""
+        echo " -----------------------------------------------------------------"
+        echo " GLOSARIO RAPIDO (parametros comunes a LOCAL y AWS):"
+        echo " -----------------------------------------------------------------"
+        echo ""
+        echo "   VARIETIES   que variedades entrenar: POP, VENTURA, JUPITER, ... o 'all'"
+        echo "   TUNING      cuanto tarda buscando el mejor modelo:"
+        echo "                  smoke    ~1 min    prueba rapida de que todo corre"
+        echo "                  dev      ~20 min   baseline para iterar codigo/features"
+        echo "                  prod     ~2 h      entrenamiento de produccion (default)"
+        echo "                  prod_xl  ~6 h      busqueda exhaustiva (overnight)"
+        echo "   PARALLEL    cuantas variedades entrenar al mismo tiempo (default 1)"
+        echo ""
+        echo "   Ejemplo: task train VARIETIES=POP,VENTURA TUNING=dev PARALLEL=2"
+        echo ""
+        echo " -----------------------------------------------------------------"
+        echo " MAS COMANDOS:"
+        echo " -----------------------------------------------------------------"
+        echo ""
+        echo "   task help          referencia completa LOCAL (Docker en tu maquina)"
+        echo "   task help:aws      referencia completa AWS  (produccion en la nube)"
+        echo "   task --list        listado plano de TODOS los comandos disponibles"
+        echo ""
+        echo "==================================================================="
+        echo ""
+
+  help:aws:
+    desc: "Comandos de produccion en AWS: infra, ECR, Batch, lifecycle, registry, destructivos"
+    silent: true
+    cmds:
+      - |
+        echo ""
+        echo "==================================================================="
+        echo " ml_training - PRODUCCION AWS"
+        echo " (tasks namespaced: infra: ecr: batch: cluster: mlflow-aws: aws:)"
+        echo "==================================================================="
+        echo ""
+        echo "ATAJOS HIGH-LEVEL (encadenan otros namespaces):"
+        echo "   task aws:deploy                             stand-up completo (storage + 3 imgs + resto)"
+        echo "   task aws:smoke                              deploy + smoke test (~1 min)"
+        echo "   task aws:wake                               encender stack (scale-up + wait-healthy)"
+        echo "   task aws:sleep                              apagar stack (scale-down)"
+        echo "   task aws:status                             outputs Terraform + cluster status"
+        echo ""
+        echo "INFRA (Terraform):"
+        echo "   task infra:bootstrap                        backend S3 + DynamoDB lock (UNA VEZ)"
+        echo "   task infra:bootstrap-oidc                   rol GitHub Actions via OIDC (UNA VEZ)"
+        echo "   task infra:plan [TARGET=module.X]           ver cambios"
+        echo "   task infra:apply [TARGET=module.X]          aplicar (parcial o full)"
+        echo "   task infra:output                           outputs (alb_dns, ecr_urls, ...)"
+        echo "   task infra:validate                         fmt -check + validate (pre-commit)"
+        echo ""
+        echo "IMAGENES (ECR):"
+        echo "   task ecr:build-all                          build + push las 3 imagenes"
+        echo "   task ecr:build IMG=trainer [TAG=v1.2.3]     build + push UNA imagen (trainer|mlflow|reports)"
+        echo "   task ecr:list                               listar tags en ECR"
+        echo ""
+        echo "TRAINING EN BATCH:"
+        echo "   task batch:train VARIETIES=POP TUNING=prod  entrenar en AWS Batch (espera SUCCEEDED)"
+        echo "   task batch:smoke                            sanity check (POP + smoke, ~1 min)"
+        echo "   task batch:status                           jobs activos (spot + ondemand)"
+        echo "   task batch:cancel JOB_ID=<id>               terminar job RUNNING/PENDING"
+        echo ""
+        echo "CLUSTER LIFECYCLE:"
+        echo "   task cluster:status                         estado RDS + ECS + Batch"
+        echo "   task cluster:scale-up / scale-down          encender / apagar (preserva infra)"
+        echo "   task cluster:wait-healthy                   polling ALB hasta 200 (timeout 10 min)"
+        echo "   task cluster:teardown / rebuild             destroy / restore modulos volatiles"
+        echo ""
+        echo "MLFLOW REGISTRY (AWS):"
+        echo "   task mlflow-aws:list-versions MODEL_NAME=rnd-forest-POP   listar versiones del modelo"
+        echo "   task mlflow-aws:current-prod  MODEL_NAME=rnd-forest-POP   version Production actual"
+        echo "   task mlflow-aws:promote MODEL_NAME=rnd-forest-POP VERSION=N [MAX_MAPE=20]"
+        echo "                                               promover a Production con gate MAPE"
+        echo ""
+        echo "DESTRUCTIVO AWS:"
+        echo "   task aws:teardown                           destroy volatiles (preserva storage + VPC)"
+        echo "   task aws:destroy                            TOTAL: borra S3 + ECR + RDS, irreversible"
+        echo ""
+        echo "DOC AWS COMPLETA: GUIA_MLOPS_AWS_V2.md secciones 4-9 (runbook + troubleshooting)"
+        echo "==================================================================="
+        echo ""
+```
+
+**Verificación**
+
+```bash
+task          # banner default ahora muestra secciones [LOCAL] + [AWS] + GLOSARIO
+task help     # referencia LOCAL (sin cambios)
+task help:aws # referencia AWS — ahora SI funciona
+```
 
 ### 4.1.11 `tasks/local.yml` (helpers para desarrollo local que toca AWS)
 
@@ -7370,6 +7801,13 @@ Si los 5 checks dan OK, la infra esta arriba.
 
 ## 4.5 Smoke test — entrenar 1 variedad end-to-end
 
+> [!TIP]
+> Este es el **gate de aceptación del Tramo II**: si pasa, la infra AWS
+> está bien armada y podés avanzar a Parte 5 (CloudWatch metric) y Parte 6
+> (CI/CD). Si falla, **no parches workarounds** — volvé a las olas de §4.4
+> y verificá los checkpoints. El costo del smoke es centavos (~10 min de
+> EC2 Spot c6i.xlarge).
+
 Esto verifica (el item 1 sobre Lambda dispatcher se valida indirectamente
 en §4.7.1 cuando uses `task batch:train`; el smoke va directo a Batch):
 
@@ -7681,7 +8119,9 @@ Ver `task --list` para el catalogo completo incluyendo helpers
 >   terraform-plan.yml).
 > - **Parte 7**: gate de promotion automatico (A/B contra Production).
 > - **Parte 8-12**: runbook extendido, costos, hardening, troubleshooting.
->
+
+---
+
 # Parte 5 — Patch del trainer (emitir MAPE a CloudWatch)
 
 > **STATUS: APLICADO** (auditoria 2026-05-18). El patch esta integrado en `src/orchestration/variety_runner.py` (import + llamada `emit_mape_metric(variety=variety, mape_value=champion.oof_mape)` despues del bloque mape_ok/gap_ok). `trainer_image_tag` bumpeado a `v0.2.0` en `infra/envs/prod/terraform.tfvars`. La proxima vez que rebuiledes con `task ecr:build IMG=trainer` la imagen llevara el patch.
@@ -9250,6 +9690,14 @@ rules → Add rule → Require status checks to pass → buscar y agregar
 
 # Parte 7 — Promotion gate (extendido)
 
+> [!IMPORTANT]
+> Esta es la **única vía oficial** de promover un modelo a `Production`.
+> No hay `mlflow.set_model_version_alias("Production")` manual permitido —
+> todo pasa por `task mlflow-aws:promote` (que valida MAPE absoluto) y
+> opcionalmente por el workflow `training.yml action=promote` (que añade
+> A/B contra Production actual + approval humano via GitHub Environment).
+> Saltarse el gate rompe trazabilidad y el rollback automático.
+
 La Parte 6.5 ya implementa el gate basico (MAPE umbral + A/B + approval).
 Esta Parte 7 documenta el ciclo completo del modelo y cuando se promueve.
 
@@ -9347,7 +9795,9 @@ buena → "Transition to" → Production.
 > - **Parte 10**: hardening (futuro) (TLS, WAF, Multi-AZ, KMS-CMK, VPC endpoints, DR).
 > - **Parte 11**: troubleshooting catalogo.
 > - **Parte 12**: apendices (glosario, conceptos, diferencias V1->V2).
->
+
+---
+
 # Parte 8 — Runbook operativo extendido
 
 > **Por que esta parte**: cuando el sistema esta en produccion y vos
@@ -9691,6 +10141,13 @@ es interceptable. Cualquier estado a medio escribir queda corrupto.
 
 ## 8.5 TEAR-DOWN — apagar todo preservando state + datos
 
+> [!WARNING]
+> TEAR-DOWN es **reversible** (con `task aws:rebuild` levantás todo de
+> nuevo en ~20-30 min), pero te lleva un `terraform destroy` de 5-6
+> módulos. Si sólo querés ahorrar 1-2 noches, usá `task aws:sleep`
+> (apaga RDS + Fargate, costo cae a ~$15/mes mientras esté apagado) en
+> vez de teardown — el rebuild a partir de sleep es 5 min, no 30.
+
 Cuando lo uso: vacaciones de 1+ semanas, fin del mes y queres bajar el
 gasto, evento de costo inesperado, pausar el proyecto.
 
@@ -9781,6 +10238,14 @@ custom via Route53, el dominio sigue igual; sólo el record A apunta al
 nuevo ALB.)
 
 ## 8.7 DESTROY — eliminar TODO de la cuenta AWS
+
+> [!CAUTION]
+> **Operación irreversible**. `task aws:destroy` borra buckets S3 (incluido
+> `tfstate`), repos ECR (todas las tags), la instancia RDS (Model Registry
+> completo), los IAM roles y el OIDC provider. Pide confirmación textual
+> **dos veces** (`DESTROY <PROJECT>`). Antes de correrlo: hacer los 3
+> backups de la sub-sección siguiente (export Registry → JSON, snapshot
+> manual RDS, export tfstate) — sin ellos no hay forma de recuperar.
 
 Cuando lo uso: cierre del proyecto, migracion a otra cuenta, hard reset
 para empezar de cero.
