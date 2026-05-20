@@ -479,6 +479,18 @@ def run_eda(variety: str, out_dir: Path | None = None,
         except Exception as exc:
             logger.warning(f"[EDA/{variety}] log_artifact MLflow fallo: {exc}")
 
+    # ---- 10. Regenerar dashboard global (reports/index.html) ----
+    # Sin esto el sidebar de http://localhost:8080/reports/ no muestra la
+    # variedad nueva hasta el siguiente training. variety_runner ya hace
+    # esto post-training; replicamos aqui para que `task eda VARIETIES=X`
+    # tambien aparezca de inmediato — con solo el bloque EDA mientras no
+    # exista Winner/Residuals para X.
+    try:
+        from src.diagnostics.dashboard_index import write_dashboard
+        write_dashboard(out_dir)
+    except Exception:
+        logger.exception(f"[EDA/{variety}] no se pudo regenerar reports/index.html")
+
     return out_path
 
 

@@ -77,11 +77,14 @@ services:
       S3_ARTIFACTS_PREFIX: artifacts
       S3_REPORTS_PREFIX: reports
       # Hydrate paritario con AWS Batch (opcional en Tramo Local).
-      # Si estas dos estan seteadas, el trainer baja el Excel desde S3
-      # al boot, replicando el flujo productivo. Si no, lee el bind-mount
-      # de ./data como hoy. Ver §G9/§4.13.
+      # Si estas dos estan seteadas, el trainer baja el Excel ACUMULADO
+      # desde S3 al boot y corre split_workbook() — replica el flujo
+      # productivo end-to-end. Si quedan vacias, lee ./data del bind-mount.
+      # El default de S3_DATA_KEY coincide con el del Lambda dispatcher
+      # (infra/lambdas/dispatcher.py): el archivo acumulado, no el split.
+      # Ver §G9/§4.13.
       S3_DATA_BUCKET: ${S3_DATA_BUCKET:-}
-      S3_DATA_KEY: ${S3_DATA_KEY:-training/DB-HISTORICA.xlsx}
+      S3_DATA_KEY: ${S3_DATA_KEY:-BD_HISTORICO_ACUMULADO.xlsx}
     volumes:
       - ~/.aws:/aws:ro
       - ./data:/app/data

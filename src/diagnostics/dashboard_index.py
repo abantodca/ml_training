@@ -135,13 +135,11 @@ def _classify(path: Path) -> Optional[ReportFile]:
             return ReportFile(name, "resid", m.group(1), m.group(2),
                               "Diagnostico residuales", ext, mtime)
 
-    # Catch-all
-    if ext == "xlsx":
-        return ReportFile(name, "excel", None, base, "", ext, mtime)
-    if ext == "json":
-        return ReportFile(name, "json", None, base, "", ext, mtime)
-    if ext == "html":
-        return ReportFile(name, "other", None, base, "", ext, mtime)
+    # Sin variedad reconocible -> descartar del indice. El dashboard solo
+    # lista archivos cuya variedad sale del filename; los huerfanos
+    # (JSON sidecars, xlsx sueltos, html ad-hoc) quedan accesibles
+    # directamente via http://localhost:8080/reports/<file> pero no
+    # ensucian el sidebar.
     return None
 
 
@@ -164,55 +162,38 @@ class VarietyBucket:
 @dataclass
 class ScanResult:
     by_variety: Dict[str, VarietyBucket]
-    orphans_excel: List[ReportFile]
-    orphans_json: List[ReportFile]
-    orphans_other: List[ReportFile]
 
     @property
     def total(self) -> int:
-        n = sum(b.total for b in self.by_variety.values())
-        return n + len(self.orphans_excel) + len(self.orphans_json) + len(self.orphans_other)
+        return sum(b.total for b in self.by_variety.values())
 
 
 def scan_reports(reports_dir: Path) -> ScanResult:
     if not reports_dir.exists():
-        return ScanResult({}, [], [], [])
+        return ScanResult({})
 
     by_var: Dict[str, VarietyBucket] = {}
-    orphans_xlsx: List[ReportFile] = []
-    orphans_json: List[ReportFile] = []
-    orphans_other: List[ReportFile] = []
 
     for p in reports_dir.iterdir():
         rf = _classify(p)
-        if rf is None:
+        if rf is None or not rf.variety:
             continue
-        if rf.variety:
-            bucket = by_var.setdefault(rf.variety, VarietyBucket(rf.variety))
-            if rf.kind == "winner":
-                bucket.winners.append(rf)
-            elif rf.kind == "eda":
-                bucket.edas.append(rf)
-            elif rf.kind == "resid":
-                bucket.resids.append(rf)
-            elif rf.kind == "excel":
-                bucket.excels.append(rf)
-        else:
-            if rf.kind == "excel":
-                orphans_xlsx.append(rf)
-            elif rf.kind == "json":
-                orphans_json.append(rf)
-            else:
-                orphans_other.append(rf)
+        bucket = by_var.setdefault(rf.variety, VarietyBucket(rf.variety))
+        if rf.kind == "winner":
+            bucket.winners.append(rf)
+        elif rf.kind == "eda":
+            bucket.edas.append(rf)
+        elif rf.kind == "resid":
+            bucket.resids.append(rf)
+        elif rf.kind == "excel":
+            bucket.excels.append(rf)
 
     # Sort: mas reciente primero
     for b in by_var.values():
         for items in (b.winners, b.edas, b.resids, b.excels):
             items.sort(key=lambda x: x.mtime, reverse=True)
-    for items in (orphans_xlsx, orphans_json, orphans_other):
-        items.sort(key=lambda x: x.mtime, reverse=True)
 
-    return ScanResult(by_var, orphans_xlsx, orphans_json, orphans_other)
+    return ScanResult(by_var)
 
 
 # ---------------------------------------------------------------------------
@@ -497,8 +478,6 @@ def _initial_href(scan: ScanResult) -> str:
     for b in scan.by_variety.values():
         if b.edas:
             return b.edas[0].filename
-    if scan.orphans_other:
-        return scan.orphans_other[0].filename
     return ""
 
 
@@ -603,24 +582,6 @@ def render_dashboard(scan: ScanResult) -> str:
             return datetime.min
         ordered = sorted(scan.by_variety.values(), key=_sort_key, reverse=True)
         sidebar_body = "".join(_render_variety_block(b) for b in ordered)
-
-        # Orphans (sin variedad)
-        orph_html = ""
-        orph_html += _render_kind_block("Excel sin variedad", "&#x1F4D1;",
-                                        scan.orphans_excel)
-        orph_html += _render_kind_block("JSON / Metadata", "&#x1F5C2;",
-                                        scan.orphans_json)
-        orph_html += _render_kind_block("Otros", "&#x1F4C4;",
-                                        scan.orphans_other)
-        if orph_html:
-            sidebar_body += (
-                '<div class="variety-block" data-variety="_orphans_">'
-                '<div class="variety-header" '
-                'onclick="toggleVariety(this.parentElement)">'
-                '<span class="name">Sin variedad</span>'
-                '<span><span class="arrow">&#x25BC;</span></span></div>'
-                f'<div class="variety-body">{orph_html}</div></div>'
-            )
 
     js = _JS.replace("__INITIAL__", escape(initial)) if initial else _JS
 

@@ -359,7 +359,7 @@ export AWS_PROFILE="default"          # o el profile que uses
 # === ADICIONALES para Tramo II (AWS) ===
 export PROJECT="ml-training"
 export ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-export ACCOUNT_SUFFIX="${ACCOUNT_ID: -6}"
+export ACCOUNT_SUFFIX="${ACCOUNT_ID: -7}"
 ```
 
 | Variable | Valor | Tramo | Usada para |
@@ -368,7 +368,7 @@ export ACCOUNT_SUFFIX="${ACCOUNT_ID: -6}"
 | `$AWS_PROFILE` | `default` | I + II | Credenciales AWS (compose monta `~/.aws:ro`). |
 | `$PROJECT` | `ml-training` | II | Prefijo de todos los recursos AWS. |
 | `$ACCOUNT_ID` | 12 dígitos | II | tfstate bucket, ECR URIs, role ARNs. |
-| `$ACCOUNT_SUFFIX` | 6 dígitos | II | Sufijo de buckets, evita colisión cross-account. |
+| `$ACCOUNT_SUFFIX` | 7 dígitos | II | Sufijo de buckets, evita colisión cross-account. Coincide con `scripts/aws-suffix.sh` (fuente única). |
 
 > **Nota** — En Tramo II, estas variables las usan los bloques `bash`
 > manuales (Partes 1-2). Los Taskfiles (`tasks/*.yml`) las recalculan
@@ -376,7 +376,7 @@ export ACCOUNT_SUFFIX="${ACCOUNT_ID: -6}"
 
 > **🔄 Al re-ejecutar esta seccion**:
 > - **Verificar prereqs**: `docker --version && task --version && terraform version && aws --version` debe imprimir las 4 versiones sin error.
-> - **Verificar variables**: `echo "$ACCOUNT_ID $ACCOUNT_SUFFIX"` debe imprimir 12 digitos + 6 digitos (no vacio).
+> - **Verificar variables**: `echo "$ACCOUNT_ID $ACCOUNT_SUFFIX"` debe imprimir 12 digitos + 7 digitos (no vacio).
 > - **Pitfall tipico (host)**: WSL sin systemd o Docker Desktop sin WSL integration -> `docker` falla con `Cannot connect to the Docker daemon`.
 > - **Pitfall tipico (vars)**: si `aws sts get-caller-identity` falla, `AWS_PROFILE` no esta seteado o las credenciales expiraron -> re-correr `aws configure` o renovar token SSO.
 > - **Commit sugerido**: N/A (no genera archivos versionables).
@@ -864,11 +864,14 @@ services:
       S3_ARTIFACTS_PREFIX: artifacts
       S3_REPORTS_PREFIX: reports
       # Hydrate paritario con AWS Batch (opcional en Tramo Local).
-      # Si estas dos estan seteadas, el trainer baja el Excel desde S3
-      # al boot, replicando el flujo productivo. Si no, lee el bind-mount
-      # de ./data como hoy. Ver §G9/§4.13.
+      # Si estas dos estan seteadas, el trainer baja el Excel ACUMULADO
+      # desde S3 al boot y corre split_workbook() — replica el flujo
+      # productivo end-to-end. Si quedan vacias, lee ./data del bind-mount.
+      # El default de S3_DATA_KEY coincide con el del Lambda dispatcher
+      # (infra/lambdas/dispatcher.py): el archivo acumulado, no el split.
+      # Ver §G9/§4.13.
       S3_DATA_BUCKET: ${S3_DATA_BUCKET:-}
-      S3_DATA_KEY: ${S3_DATA_KEY:-training/DB-HISTORICA.xlsx}
+      S3_DATA_KEY: ${S3_DATA_KEY:-BD_HISTORICO_ACUMULADO.xlsx}
     volumes:
       - ~/.aws:/aws:ro
       - ./data:/app/data
@@ -1138,70 +1141,51 @@ task local:bucket-name KIND=artifacts
 # USO TIPICO:
 #   task local:ensure-buckets        crea data + artifacts S3 si no existen (idempotente)
 #                                    Reusa los nombres de prod ({project}-data-<suffix>),
-#                                    asi un sync local puede compartir bucket con AWS
-#                                    Batch o no, segun como exportes S3_ARTIFACTS_BUCKET.
-#   task local:bucket-name           imprime el nombre completo de un bucket
-#                                    (var: KIND=data|artifacts)
+#                                    asi un sync local puede compartir bucket con AWS Batch.
+#   task local:bucket-name KIND=X    imprime nombre completo (KIND=data|artifacts)
 # =============================================================================
 
 version: "3"
 
-vars:
-  SUFFIX:
-    sh: aws sts get-caller-identity --query Account --output text | tail -c 7
+# SUFFIX (ultimos 7 digitos del Account ID) se calcula via scripts/aws-suffix.sh.
+# NO se define a nivel archivo a proposito: si estuviera aqui, Task lo evaluaria
+# al cargar el namespace y dispararia `aws sts get-caller-identity` incluso para
+# `task` (sin args) o `task --list`. Por-tarea => solo corre cuando se invoca.
 
 tasks:
 
   ensure-buckets:
     desc: "Crea S3 buckets data + artifacts si no existen (idempotente). Misma cuenta+region que prod."
     silent: true
+    vars:
+      SUFFIX: { sh: bash scripts/aws-suffix.sh }
     cmds:
-      - task: _ensure-bucket
-        vars: { NAME: '{{.PROJECT}}-data-{{.SUFFIX}}' }
-      - task: _ensure-bucket
-        vars: { NAME: '{{.PROJECT}}-artifacts-{{.SUFFIX}}' }
-      - 'echo ""'
-      - 'echo "Listo. Para que el trainer local sincronice a estos buckets, exporta:"'
-      - 'echo "  export S3_DATA_BUCKET={{.PROJECT}}-data-{{.SUFFIX}}"'
-      - 'echo "  export S3_ARTIFACTS_BUCKET={{.PROJECT}}-artifacts-{{.SUFFIX}}"'
+      - for: [data, artifacts]
+        task: _ensure-bucket
+        vars: { NAME: '{{.PROJECT}}-{{.ITEM}}-{{.SUFFIX}}' }
+      - |
+        cat <<EOF
+
+        Listo. Para que el trainer local sincronice a estos buckets, exporta:
+          export S3_DATA_BUCKET={{.PROJECT}}-data-{{.SUFFIX}}
+          export S3_ARTIFACTS_BUCKET={{.PROJECT}}-artifacts-{{.SUFFIX}}
+        EOF
 
   bucket-name:
     desc: "Imprime el nombre del bucket. Var: KIND=data|artifacts (REQ)"
     silent: true
-    requires:
-      vars: [KIND]
+    requires: { vars: [KIND] }
+    vars:
+      SUFFIX: { sh: bash scripts/aws-suffix.sh }
     cmds:
       - echo "{{.PROJECT}}-{{.KIND}}-{{.SUFFIX}}"
 
   _ensure-bucket:
     internal: true
     silent: true
-    requires:
-      vars: [NAME]
+    requires: { vars: [NAME] }
     cmds:
-      - |
-        if aws s3api head-bucket --bucket "{{.NAME}}" 2>/dev/null; then
-          echo "  {{.NAME}}  EXISTE (reuso)"
-          exit 0
-        fi
-        echo "  {{.NAME}}  no existe -> creando..."
-        # us-east-1 NO acepta --create-bucket-configuration (es default y AWS lo rechaza)
-        if [ "{{.REGION}}" = "us-east-1" ]; then
-          aws s3api create-bucket --bucket "{{.NAME}}" --region {{.REGION}}
-        else
-          aws s3api create-bucket --bucket "{{.NAME}}" --region {{.REGION}} \
-            --create-bucket-configuration LocationConstraint={{.REGION}}
-        fi
-        # Hardening minimo (mismas defaults que el modulo storage de prod)
-        aws s3api put-bucket-versioning --bucket "{{.NAME}}" \
-          --versioning-configuration Status=Enabled
-        aws s3api put-bucket-encryption --bucket "{{.NAME}}" \
-          --server-side-encryption-configuration \
-          '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
-        aws s3api put-public-access-block --bucket "{{.NAME}}" \
-          --public-access-block-configuration \
-          'BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true'
-        echo "  {{.NAME}}  CREADO (versioning + AES256 + no public)"
+      - bash scripts/ensure-s3-bucket.sh "{{.NAME}}" "{{.REGION}}"
 ```
 
 > **Detalles de diseño** (informativo — no necesitás recordar nada para usarlo):
@@ -1299,11 +1283,19 @@ S3_ARTIFACTS_BUCKET=ml-training-artifacts-XXXXXX
 # MODEL_REGISTRY_PREFIX=rnd-forest-       # (consumida solo en Tramo II; Tramo Local no registra modelos)
 
 # Hydrate de data desde S3 (paridad con AWS Batch — OPCIONAL en Tramo Local)
-# Si estas dos estan seteadas, el trainer baja el Excel desde S3 al boot
-# (replicando el flujo de Batch). Si quedan vacias, lee ./data del bind-mount.
-# Util para validar el contrato `s3_hydrate` antes de Tramo II.
+# Si estas dos estan seteadas, el trainer baja el Excel ACUMULADO desde S3
+# al boot y corre split_workbook() (replicando el flujo de Batch).
+# Si quedan vacias, lee ./data/BD_HISTORICO_ACUMULADO.xlsx del bind-mount.
+#
+# OJO con S3_DATA_KEY: apunta al Excel ACUMULADO (input de
+# scripts/prepare_data.split_workbook), NO al split DB-HISTORICA.xlsx.
+# `main.py::_hydrate_data_from_s3` baja S3_DATA_KEY -> ACCUMULATED_FILE
+# y luego split_workbook genera TRAINING_FILE. El default coincide con
+# el del Lambda dispatcher (infra/lambdas/dispatcher.py L5112).
+#
+# Util para validar el contrato `s3_hydrate` antes de Tramo II (ver §4.5.3).
 # S3_DATA_BUCKET=ml-training-data-XXXXXX
-# S3_DATA_KEY=training/DB-HISTORICA.xlsx
+# S3_DATA_KEY=BD_HISTORICO_ACUMULADO.xlsx
 
 # Reporte gerencial (opcional)
 # REPORT_PLOTLY_OFFLINE=1
@@ -1351,18 +1343,37 @@ task local:ensure-buckets
 Completar `.env` con los nombres reales:
 
 ```bash
-SUFFIX=$(aws sts get-caller-identity --query Account --output text | tail -c 7)
+SUFFIX=$(bash scripts/aws-suffix.sh)
 sed -i "s|S3_MLFLOW_BUCKET=.*|S3_MLFLOW_BUCKET=ml-training-artifacts-${SUFFIX}|"     .env
 sed -i "s|S3_ARTIFACTS_BUCKET=.*|S3_ARTIFACTS_BUCKET=ml-training-artifacts-${SUFFIX}|" .env
 ```
 
+> **Por qué `scripts/aws-suffix.sh` y no `tail -c 7`** — `tail -c 7`
+> incluye el `\n` final del `aws` CLI (devuelve 6 dígitos en Linux) y
+> peor en Windows con CRLF (devuelve 5 dígitos, suffix inválido). El
+> script POSIX `${acct#?????}` extrae los 7 dígitos correctos de forma
+> portable y es la fuente única usada también por `tasks/local.yml`.
+
 **Verificación**
 
 ```bash
-SUFFIX=$(aws sts get-caller-identity --query Account --output text | tail -c 7)
+SUFFIX=$(bash scripts/aws-suffix.sh)
 aws s3api get-bucket-versioning --bucket "ml-training-artifacts-${SUFFIX}"
 # { "Status": "Enabled" }
 ```
+
+> **Los dos buckets quedan vacíos — es lo esperado.** `task
+> local:ensure-buckets` solo **crea** los buckets; no sube ningún
+> dato. En el flujo normal del Tramo Local:
+>
+> - `{project}-artifacts-<suffix>` lo puebla el trainer al final de
+>   `task train` ([scripts/s3_sync.py](scripts/s3_sync.py)) y el server
+>   MLflow durante el run (`--default-artifact-root`).
+> - `{project}-data-<suffix>` queda **vacío** todo Tramo I. La data se
+>   lee del bind-mount `./data → /app/data`. Sólo se puebla si optás
+>   por validar el contrato `s3_hydrate` antes de Batch (procedimiento
+>   manual con `aws s3 cp`, ver el callout de §4.5.3); en Tramo II §4.2
+>   se sube el Excel al bucket productivo (mismo nombre por SUFFIX).
 
 > *Para verificar / re-ejecutar esta sección, ver §4.A.*
 
@@ -1436,7 +1447,7 @@ docker compose exec postgres psql -U mlflow -d mlflow -c \
 # POP | 2
 
 # 3) joblib del campeón en S3
-SUFFIX=$(aws sts get-caller-identity --query Account --output text | tail -c 7)
+SUFFIX=$(bash scripts/aws-suffix.sh)
 aws s3 ls "s3://ml-training-artifacts-${SUFFIX}/artifacts/" --recursive \
   | grep -E "final_pipeline_POP_.*\.joblib$"
 # Al menos un match con timestamp reciente
@@ -1632,10 +1643,34 @@ Lo que **sí cambia**, y es el alcance entero del Tramo II:
 > origen del dataset es la única ruta donde "mismo binario" se
 > rompe sutilmente: en local lee un bind-mount, en Batch baja desde
 > S3. Si nunca probaste el path S3 en local, lo descubrís recién en
-> el primer `task batch:smoke`. Para validarlo sin AWS Batch, seteá
-> `S3_DATA_BUCKET` y `S3_DATA_KEY` en tu `.env` y volvé a correr
-> `task train`: el trainer detecta esas vars y hace el `aws s3 cp`
-> al boot, idéntico al flujo productivo (ver §4.5.3 y §4.7.1).
+> el primer `task batch:smoke`. Para validarlo sin AWS Batch son
+> 3 pasos (asumiendo que ya corriste `task local:ensure-buckets` en
+> §4.8 — el bucket `data` existe pero está vacío):
+>
+> ```bash
+> # 1) Subir el Excel ACUMULADO al bucket sandbox de data.
+> #    `task local:ensure-buckets` solo crea el bucket; este `cp` lo puebla.
+> SUFFIX=$(bash scripts/aws-suffix.sh)
+> aws s3 cp data/BD_HISTORICO_ACUMULADO.xlsx \
+>     "s3://ml-training-data-${SUFFIX}/BD_HISTORICO_ACUMULADO.xlsx"
+>
+> # 2) Activar el hydrate en .env (descomentar las dos lineas de §4.7.1).
+> #    OJO: S3_DATA_KEY apunta al ACUMULADO, no al split DB-HISTORICA.xlsx.
+> cat >> .env <<EOF
+> S3_DATA_BUCKET=ml-training-data-${SUFFIX}
+> S3_DATA_KEY=BD_HISTORICO_ACUMULADO.xlsx
+> EOF
+>
+> # 3) Re-correr el training — main.py::_hydrate_data_from_s3 detecta
+> #    las vars y baja el Excel al boot, idéntico al flujo de Batch.
+> task train VARIETIES=POP TUNING=smoke
+> ```
+>
+> Si el run termina OK, el contrato `s3_hydrate` está validado:
+> en Tramo II §4.2 sólo cambian los nombres de bucket (sandbox →
+> productivos por SUFFIX), no la lógica del trainer. Para volver al
+> modo bind-mount comentá las dos líneas de `.env`. Ver §4.5.3
+> (docker-compose) y §4.7.1 (.env).
 
 > **Nota — el modo híbrido.** Existe un workflow intermedio que no es
 > ni "todo local" ni "todo AWS": entrenar **desde tu laptop** pero
@@ -1843,7 +1878,7 @@ REGION="${AWS_DEFAULT_REGION:-us-east-1}"
 # Mismas convenciones que Capítulo 3.5 (ACCOUNT_ID / ACCOUNT_SUFFIX) — si el
 # usuario ya las exporto en su sesion, las reusamos; sino las calculamos.
 ACCOUNT_ID="${ACCOUNT_ID:-$(aws sts get-caller-identity --query Account --output text)}"
-ACCOUNT_SUFFIX="${ACCOUNT_SUFFIX:-${ACCOUNT_ID: -6}}"
+ACCOUNT_SUFFIX="${ACCOUNT_SUFFIX:-${ACCOUNT_ID: -7}}"
 TFSTATE_BUCKET="${PROJECT}-tfstate-${ACCOUNT_SUFFIX}"
 LOCK_TABLE="${PROJECT}-tflock"
 
@@ -1948,7 +1983,7 @@ Despues de que el script termine, valida que TODO quedo bien:
 # Variables (recreadas para que esta seccion sea standalone)
 export PROJECT="ml-training"
 export ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-export ACCOUNT_SUFFIX="${ACCOUNT_ID: -6}"
+export ACCOUNT_SUFFIX="${ACCOUNT_ID: -7}"
 TFSTATE_BUCKET="${PROJECT}-tfstate-${ACCOUNT_SUFFIX}"
 LOCK_TABLE="${PROJECT}-tflock"
 
@@ -2872,28 +2907,31 @@ bloques.
 
 #### 3.4.2.a — Header: account suffix discovery
 
-Calcula el sufijo de 6 chars que comparten todos los buckets (data,
+Calcula el sufijo de 7 chars que comparten todos los buckets (data,
 artifacts) y el bucket de tfstate creado a mano por `bootstrap.sh`.
-Equivalente bash: `${ACCOUNT: -6}`. Asi un mismo `account_id` produce
-el mismo sufijo en todos los buckets — operativamente no te confundis
-entre "cual era el bucket de este proyecto".
+Equivalente bash: `${ACCOUNT: -7}` (idéntico a `scripts/aws-suffix.sh`,
+fuente única usada por `task local:ensure-buckets`). Asi un mismo
+`account_id` produce el mismo sufijo en todos los buckets — local y
+prod comparten nombre, y operativamente no te confundis entre "cual
+era el bucket de este proyecto".
 
 > **Equivalente en AWS Console**:
 >
 > | Recurso Terraform | Servicio | Que harias click-a-click |
 > |---|---|---|
 > | `data "aws_caller_identity"` | **IAM / STS** | `IAM > Dashboard` muestra arriba a la derecha tu **Account ID** de 12 digitos. El `data` es read-only — no crea nada, solo "pregunta a AWS quien soy" via STS (`sts:GetCallerIdentity`). |
-> | `locals.account_suffix` | — | No tiene UI: es compute puro de Terraform. Toma los ultimos 6 chars del account_id para usarlos de sufijo de bucket. |
+> | `locals.account_suffix` | — | No tiene UI: es compute puro de Terraform. Toma los ultimos 7 chars del account_id para usarlos de sufijo de bucket. |
 >
-> **Conceptualmente — por que un sufijo y no el nombre crudo**: los nombres de bucket S3 son **globalmente unicos** (no por cuenta, ni por region — globalmente, en TODO S3). Si dos personas hicieran `terraform apply` con `project=ml-training`, el segundo `terraform apply` fallaria con "bucket already exists". El sufijo de 6 chars del account_id hace que el bucket sea **practicamente unico** sin tener que pensar en nombres creativos, y al mismo tiempo te queda **deterministico** dentro de una misma cuenta (no random).
+> **Conceptualmente — por que un sufijo y no el nombre crudo**: los nombres de bucket S3 son **globalmente unicos** (no por cuenta, ni por region — globalmente, en TODO S3). Si dos personas hicieran `terraform apply` con `project=ml-training`, el segundo `terraform apply` fallaria con "bucket already exists". El sufijo de 7 chars del account_id hace que el bucket sea **practicamente unico** sin tener que pensar en nombres creativos, y al mismo tiempo te queda **deterministico** dentro de una misma cuenta (no random).
 
 ```hcl
 data "aws_caller_identity" "current" {}
 
 locals {
-  # ${ACCOUNT: -6} en bash. substr(...,6,6) toma chars 6-11 (indices 0-based)
-  # = los ultimos 6 chars de un account_id estandar de 12 digitos.
-  account_suffix = substr(data.aws_caller_identity.current.account_id, 6, 6)
+  # ${ACCOUNT: -7} en bash. substr(...,5,7) toma chars 5-11 (indices 0-based)
+  # = los ultimos 7 chars de un account_id estandar de 12 digitos.
+  # Coincide con scripts/aws-suffix.sh (POSIX `${acct#?????}`).
+  account_suffix = substr(data.aws_caller_identity.current.account_id, 5, 7)
 }
 ```
 
@@ -6267,10 +6305,11 @@ version: "3"
 
 vars:
   TF_DIR:  '{{.TF_DIR | default "infra/envs/prod"}}'
-  # Ultimos 6 chars del account ID (sufijo de buckets para evitar colisiones).
+  # Ultimos 7 chars del account ID (sufijo de buckets para evitar colisiones).
+  # Misma fuente que tasks/local.yml -> coherencia local/prod en nombres de bucket.
   # Resuelto una vez por invocacion del include.
   SUFFIX:
-    sh: aws sts get-caller-identity --query Account --output text | tail -c 7
+    sh: bash scripts/aws-suffix.sh
 
 tasks:
 
@@ -7188,7 +7227,7 @@ version: "3"
 
 vars:
   SUFFIX:
-    sh: aws sts get-caller-identity --query Account --output text | tail -c 7
+    sh: bash scripts/aws-suffix.sh
 
 tasks:
 
@@ -7536,7 +7575,7 @@ Crea los 2 buckets S3 + 3 repos ECR. Tiempo: ~1 min.
 export AWS_DEFAULT_REGION="us-east-1"
 export PROJECT="ml-training"
 export ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
-export ACCOUNT_SUFFIX="${ACCOUNT_ID: -6}"
+export ACCOUNT_SUFFIX="${ACCOUNT_ID: -7}"
 
 # Apply solo el modulo storage
 task infra:apply TARGET=module.storage
@@ -7581,7 +7620,7 @@ aws s3 ls "s3://${DATA_BUCKET}/" --human-readable
 
 > **🔄 Al re-ejecutar esta seccion**:
 > - **Verificar**: `aws s3 ls | grep ml-training` debe mostrar 2 buckets (`data` + `artifacts`) y `aws ecr describe-repositories --query 'repositories[].repositoryName' --output text | tr '\t' '\n' | grep ml-training` debe listar 3 repos.
-> - **Pitfall tipico**: si la Ola A falla con `BucketAlreadyExists`, el `ACCOUNT_SUFFIX` colisiona con otra cuenta o un bucket previamente borrado todavia retiene el nombre; revisar §3.5 (calculo del suffix) y re-exportar con `export ACCOUNT_SUFFIX="${ACCOUNT_ID: -6}"`.
+> - **Pitfall tipico**: si la Ola A falla con `BucketAlreadyExists`, el `ACCOUNT_SUFFIX` colisiona con otra cuenta o un bucket previamente borrado todavia retiene el nombre; revisar §3.5 (calculo del suffix) y re-exportar con `export ACCOUNT_SUFFIX="${ACCOUNT_ID: -7}"`.
 > - **Tiempo esperado**: ~2 min.
 > - **Commit sugerido**: N/A (es apply de Terraform, no cambios en archivos).
 
@@ -12150,7 +12189,7 @@ Y en tu `.env` local agregar (sacando el ALB DNS de Terraform):
 
 ```bash
 echo "MLFLOW_ALB_DNS=$(terraform -chdir=infra/envs/prod output -raw alb_dns)" >> .env
-echo "ACCOUNT_SUFFIX=$(aws sts get-caller-identity --query Account --output text | tail -c 7)" >> .env
+echo "ACCOUNT_SUFFIX=$(bash scripts/aws-suffix.sh)" >> .env
 ```
 
 Resultado: corres `docker compose up trainer` desde tu laptop, el run
