@@ -1,0 +1,145 @@
+version: "3"
+
+# `.env` es opcional. Si no existe, los defaults de config.py aplican.
+dotenv: [ ".env" ]
+
+# Tramo I: solo importamos el namespace `local:` (buckets sandbox S3).
+# Los namespaces AWS se agregan en Tramo II Parte 4 §4.1.10.
+includes:
+  local:
+    taskfile: ./tasks/local.yml
+    vars:
+      PROJECT: '{{.PROJECT}}'
+      REGION: '{{.REGION}}'
+
+vars:
+  TUNING:    '{{.TUNING    | default "prod"}}'
+  VARIETIES: '{{.VARIETIES | default "POP"}}'
+  PARALLEL:  '{{.PARALLEL  | default "1"}}'
+  PROJECT:   '{{.PROJECT   | default "ml-training"}}'
+  REGION:    '{{.AWS_DEFAULT_REGION | default "us-east-1"}}'
+  # Patron reutilizado: correr un modulo Python en el container trainer sin
+  # levantar mlflow/postgres. Lo usan data:split y eda.
+  DC_PY: docker compose run --rm --no-deps --entrypoint python trainer
+
+tasks:
+
+  default:
+    desc: "Lista comandos del pipeline + ejemplos TUNING/VARIETIES"
+    silent: true
+    cmds:
+      - |
+        cat <<'EOF'
+
+        ml_training — predice productividad de cosecha (KG/JR_H)
+        ─────────────────────────────────────────────────────────
+
+        Pipeline (correr en orden):
+          task build              1ª vez o tras cambiar codigo/Dockerfile
+          task data:split         genera data/training/DB-HISTORICA.xlsx
+          task eda VARIETIES=POP|ANY  (opcional) analisis exploratorio
+          task train              entrena + genera HTML en reports/
+          task down               apaga servicios al terminar
+
+        Ejemplos de entrenamiento (TUNING × VARIETIES × PARALLEL):
+          task train VARIETIES=POP TUNING=smoke      sanity check    ~1 min
+          task train VARIETIES=POP TUNING=dev        baseline        ~20 min
+          task train VARIETIES=POP TUNING=prod       produccion      ~2 h
+          task train VARIETIES=POP TUNING=prod_xl    overnight       ~6 h
+          task train VARIETIES=POP|ANY               one | many variedades
+
+        Variables (override por CLI, formato VAR=valor):
+          VARIETIES   POP (default) | POP,VENTURA,... | all
+          TUNING      smoke ~1m | dev ~20m | prod ~2h (default) | prod_xl ~6h
+          PARALLEL    1 (default) | N variedades en paralelo
+          SEED        42 (default) | reproducibilidad
+
+        URLs (servicios up):
+          http://localhost:5000             MLflow UI (tracking + runs)
+          http://localhost:8080/reports/    dashboards HTML por variedad
+          http://localhost:8080/artifacts/  joblib + best_params
+
+        Mas info:  task --list   GUIA_MLOPS_AWS_V2.md
+        EOF
+
+  build:
+    desc: "1ª vez o al cambiar codigo/Dockerfile: rebuild imagen trainer + levanta servicios"
+    cmds:
+      - task: _ensure_dirs
+      - docker compose build trainer
+      - docker compose up -d postgres mlflow reports
+      - task: _print_urls
+
+  data:split:
+    desc: "Paso 1: genera data/training/DB-HISTORICA.xlsx desde el Excel historico"
+    cmds:
+      - >-
+        {{.DC_PY}} -m scripts.prepare_data
+        --input  data/BD_HISTORICO_ACUMULADO.xlsx
+        --output data/training/DB-HISTORICA.xlsx
+        --min-rows 100
+
+  eda:
+    desc: "Paso 2 (opcional): EDA estadistico standalone. Args: VARIETIES=POP"
+    cmds:
+      - "{{.DC_PY}} -m src.diagnostics.eda --variety {{.VARIETIES}}"
+
+  train:
+    desc: "Paso 3: entrena + genera HTML estatico en reports/. Vars: VARIETIES TUNING PARALLEL SEED"
+    deps: [_up]
+    vars:
+      GIT_SHA:   { sh: bash scripts/metadata.sh git-sha }
+      GIT_DIRTY: { sh: bash scripts/metadata.sh git-dirty }
+      DATA_SHA:  { sh: bash scripts/metadata.sh data-sha }
+      SEED: '{{.SEED | default "42"}}'
+    cmds:
+      - |
+        if [ "{{.DATA_SHA}}" = "missing" ]; then
+          echo "ERROR: data/training/DB-HISTORICA.xlsx no existe. Correr 'task data:split' primero."
+          exit 1
+        fi
+      - >-
+        docker compose run --rm
+        -e GIT_SHA={{.GIT_SHA}}
+        -e GIT_DIRTY={{.GIT_DIRTY}}
+        -e DATA_SHA={{.DATA_SHA}}
+        -e SEED={{.SEED}}
+        trainer
+        --varieties {{.VARIETIES}}
+        --tuning {{.TUNING}}
+        --parallel-varieties {{.PARALLEL}}
+      - task: _print_urls
+
+  down:
+    desc: "Detiene servicios. Preserva volumen Postgres"
+    cmds:
+      - docker compose down
+
+  _up:
+    internal: true
+    cmds:
+      - task: _ensure_dirs
+      - docker compose up -d postgres mlflow reports
+      - task: _print_urls
+
+  _ensure_dirs:
+    internal: true
+    silent: true
+    cmds:
+      - mkdir -p artifacts reports logs data/training
+
+  _print_urls:
+    internal: true
+    silent: true
+    cmds:
+      - |
+        cat <<EOF
+
+        ===============================================================
+         Servicios listos:
+           MLflow UI       http://localhost:5000
+           Reports / HTML  http://localhost:8080/reports/
+           Artifacts       http://localhost:8080/artifacts/
+           S3 backend      s3://${S3_MLFLOW_BUCKET}/
+        ===============================================================
+        EOF

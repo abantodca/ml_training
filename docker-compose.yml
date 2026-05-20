@@ -1,0 +1,97 @@
+# Logging con rotación. Sin esto json-file crece sin bound.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: mlflow
+      POSTGRES_USER: mlflow
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mlflow}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mlflow -d mlflow"]
+      interval: 5s
+      retries: 10
+    logging: *default-logging
+
+  mlflow:
+    build:
+      context: .
+      dockerfile: docker/mlflow/Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      AWS_SHARED_CREDENTIALS_FILE: /aws/credentials
+      AWS_CONFIG_FILE: /aws/config
+      AWS_PROFILE: ${AWS_PROFILE:-default}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-mlflow}
+    volumes:
+      - ~/.aws:/aws:ro
+    command: >
+      sh -c "mlflow server
+      --host 0.0.0.0 --port 5000
+      --allowed-hosts mlflow,mlflow:*,localhost,localhost:*,127.0.0.1,127.0.0.1:*
+      --backend-store-uri postgresql://mlflow:$${POSTGRES_PASSWORD}@postgres:5432/mlflow
+      --default-artifact-root s3://${S3_MLFLOW_BUCKET:?Set S3_MLFLOW_BUCKET in .env}/artifacts"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:5000/health',timeout=3).status==200 else 1)"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    ports:
+      - "127.0.0.1:5000:5000"
+    logging: *default-logging
+
+  reports:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    volumes:
+      - ./reports:/usr/share/nginx/html/reports:ro
+      - ./artifacts:/usr/share/nginx/html/artifacts:ro
+      - ./docker/nginx-reports.conf:/etc/nginx/conf.d/default.conf:ro
+    ports:
+      - "127.0.0.1:8080:80"
+    logging: *default-logging
+
+  trainer:
+    build: .
+    depends_on:
+      mlflow: { condition: service_healthy }
+    environment:
+      MLFLOW_TRACKING_URI: ${MLFLOW_TRACKING_URI:-http://mlflow:5000}
+      AWS_SHARED_CREDENTIALS_FILE: /aws/credentials
+      AWS_CONFIG_FILE: /aws/config
+      AWS_PROFILE: ${AWS_PROFILE:-default}
+      AWS_DEFAULT_REGION: ${AWS_DEFAULT_REGION:-us-east-1}
+      S3_ARTIFACTS_BUCKET: ${S3_ARTIFACTS_BUCKET:?Set S3_ARTIFACTS_BUCKET in .env}
+      S3_ARTIFACTS_PREFIX: artifacts
+      S3_REPORTS_PREFIX: reports
+      # Hydrate paritario con AWS Batch (opcional en Tramo Local).
+      # Si estas dos estan seteadas, el trainer baja el Excel desde S3
+      # al boot, replicando el flujo productivo. Si no, lee el bind-mount
+      # de ./data como hoy. Ver §G9/§4.13.
+      S3_DATA_BUCKET: ${S3_DATA_BUCKET:-}
+      S3_DATA_KEY: ${S3_DATA_KEY:-training/DB-HISTORICA.xlsx}
+    volumes:
+      - ~/.aws:/aws:ro
+      - ./data:/app/data
+      - ./logs:/app/logs
+      - ./artifacts:/app/artifacts
+      - ./reports:/app/reports
+    mem_limit: ${TRAINER_MEM:-8g}
+    cpus: ${TRAINER_CPUS:-4}
+    command: ["--varieties", "${VARIETIES:-POP}", "--tuning", "${TUNING:-smoke}"]
+    logging: *default-logging
+
+volumes:
+  pg-data:

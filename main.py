@@ -36,7 +36,7 @@ from src.config import (
     S3_ARTIFACTS_PREFIX,
     S3_REPORTS_PREFIX,
     TRAINING_FILE,
-    init_dirs,
+    init_dirs
 )
 from src.orchestration.cli import (
     parse_args,

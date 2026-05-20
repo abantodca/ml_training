@@ -171,7 +171,7 @@ CRAMERS_V_STRONG: float = 0.3
 # ---------------------------------------------------------------------------
 # Hiperparametros de CV y tuning
 # ---------------------------------------------------------------------------
-RANDOM_STATE: int = 42
+RANDOM_STATE: int = int(os.environ.get("SEED", "42"))
 # El pipeline siempre entrena TODOS los backends del registry (XGB + LGB
 # hoy) cada uno con su Optuna study independiente, y `champion.select_champion`
 # elige el mejor por variedad usando lex-order (gap -> full_mape -> tiempo).
